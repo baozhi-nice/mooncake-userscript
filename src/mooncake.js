@@ -1,4 +1,3 @@
-
 /*
     此插件依赖 MWITools 的市场数据，请确保已安装 MWITools:
     This plugin depends on MWITools for market data. Please install MWITools:
@@ -1632,6 +1631,9 @@
                 mooncakeMarketPricingRevision++;
                 mooncakeClearEnhancementRouteCache();
                 try { mooncakeScheduleMyListingsTargetFilter(0); } catch (_) {}
+                try {
+                    if (mooncakeMyListingsManagementState?.undercut) mooncakeScheduleMyListingsManagement();
+                } catch (_) {}
             }
         } catch (e) {
             console.warn('[MoonCake] Failed to fetch market API:', e);
@@ -1860,6 +1862,41 @@
             })
             .filter(entry => entry.price > 0)
             .sort((left, right) => side === 'asks' ? left.price - right.price : right.price - left.price);
+    }
+
+    // The public quote cache only retains the first ask/bid price. Keep the
+    // corresponding order IDs for the currently filtered personal listings so
+    // their own orders can be excluded precisely when finding the next quote.
+    const MOONCAKE_MY_LISTINGS_LIVE_ORDER_BOOK_CACHE_LIMIT = 16;
+    const mooncakeMyListingsLiveOrderBookCache = new Map();
+
+    function mooncakeClearMyListingsLiveOrderBookCache() {
+        mooncakeMyListingsLiveOrderBookCache.clear();
+    }
+
+    function mooncakeCacheMyListingsLiveOrderBooks(itemHrid, orderBooks, receivedAt = Date.now()) {
+        if (!itemHrid || !orderBooks) return;
+        const levels = new Map();
+        for (let level = 0; level <= 20; level += 1) {
+            const book = orderBooks[level] ?? orderBooks[String(level)];
+            if (!book) continue;
+            levels.set(level, {
+                asks: mooncakeNormalizeOrderBookListings(book, 'asks'),
+                bids: mooncakeNormalizeOrderBookListings(book, 'bids')
+            });
+        }
+        mooncakeMyListingsLiveOrderBookCache.delete(itemHrid);
+        mooncakeMyListingsLiveOrderBookCache.set(itemHrid, { levels, receivedAt });
+        while (mooncakeMyListingsLiveOrderBookCache.size > MOONCAKE_MY_LISTINGS_LIVE_ORDER_BOOK_CACHE_LIMIT) {
+            const oldestItemHrid = mooncakeMyListingsLiveOrderBookCache.keys().next().value;
+            mooncakeMyListingsLiveOrderBookCache.delete(oldestItemHrid);
+        }
+    }
+
+    function mooncakeGetMyListingsLiveOrderBook(itemHrid, enhancementLevel) {
+        const level = Number(enhancementLevel);
+        if (!itemHrid || !Number.isInteger(level)) return null;
+        return mooncakeMyListingsLiveOrderBookCache.get(itemHrid)?.levels?.get(level) || null;
     }
 
     const mooncakeQ7MarketOrderBookCache = new Map();
@@ -2486,15 +2523,22 @@
         const priceBandMins = marketItemOrderBooks.priceBandMins;
         const priceBandMaxs = marketItemOrderBooks.priceBandMaxs;
 
+        if (typeof mooncakeShouldCacheMyListingsLiveOrderBooks === 'function' &&
+            mooncakeShouldCacheMyListingsLiveOrderBooks(itemHrid)) {
+            mooncakeCacheMyListingsLiveOrderBooks(itemHrid, orderBooks, receivedAt);
+        }
+
         if (!marketDataCache) marketDataCache = {};
         if (!marketDataCache[itemHrid]) marketDataCache[itemHrid] = {};
 
         let priceChanged = false;
         const changedLevels = new Set();
+        const updatedLevels = new Set();
         let snapshotQuotesChanged = false;
         for (let level = 0; level <= 20; level++) {
             const book = orderBooks[level];
             if (!book) continue;
+            updatedLevels.add(level);
 
             const askPrice = mooncakeGetOrderBookBestPrice(book, 'asks');
             const bidPrice = mooncakeGetOrderBookBestPrice(book, 'bids');
@@ -2529,7 +2573,12 @@
                 mooncakeRefreshOrderModalEconomics();
             }
         }
-        if (!priceChanged && !snapshotQuotesChanged) return;
+        if (!priceChanged && !snapshotQuotesChanged) {
+            if (typeof mooncakeNotifyMyListingsManagementMarketUpdate === 'function') {
+                mooncakeNotifyMyListingsManagementMarketUpdate(itemHrid, updatedLevels);
+            }
+            return;
+        }
 
         // Only the visible item is re-rendered, and the scheduler coalesces a full
         // 0-20 order-book payload into one render on the next frame.
@@ -2541,6 +2590,9 @@
         }
         if (typeof mooncakeNotifyMyListingsTargetFilterMarketUpdate === 'function') {
             mooncakeNotifyMyListingsTargetFilterMarketUpdate(itemHrid, changedLevels);
+        }
+        if (typeof mooncakeNotifyMyListingsManagementMarketUpdate === 'function') {
+            mooncakeNotifyMyListingsManagementMarketUpdate(itemHrid, updatedLevels);
         }
     }
 
@@ -7264,6 +7316,9 @@
                             mooncakeLifeEssenceRelationIndex = null;
                             buildItemMaps();
                             try { mooncakeScheduleMyListingsTargetFilter(0); } catch (_) {}
+                            try {
+                                if (mooncakeMyListingsManagementState?.undercut) mooncakeScheduleMyListingsManagement();
+                            } catch (_) {}
                             try { scheduleMooncakeEnhanceProtectionBuyBox(120); } catch (_) {}
                             try { mooncakeRefreshOrderModalEconomics(); } catch (_) {}
                             if (currentMarketItem?.itemHrid) {
@@ -23108,6 +23163,33 @@
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
+    function mooncakeNextEnhanceFrame() {
+        return new Promise(resolve => {
+            if (typeof requestAnimationFrame === 'function') requestAnimationFrame(resolve);
+            else setTimeout(resolve, 16);
+        });
+    }
+
+    async function mooncakeWaitForEnhanceDomValue(readValue, isCurrent = () => true, timeout = 180) {
+        const deadline = Date.now() + Math.max(0, Number(timeout) || 0);
+        while (isCurrent()) {
+            const value = readValue();
+            if (value) return value;
+            if (Date.now() >= deadline) break;
+            await mooncakeNextEnhanceFrame();
+        }
+        return null;
+    }
+
+    async function mooncakeWaitForEnhanceFrames(isCurrent = () => true, frames = 1) {
+        const count = Math.max(0, Math.floor(Number(frames) || 0));
+        for (let index = 0; index < count; index += 1) {
+            if (!isCurrent()) return false;
+            await mooncakeNextEnhanceFrame();
+        }
+        return isCurrent();
+    }
+
     function mooncakeNormalizeEnhanceItemHrid(value) {
         const raw = String(value || '').trim();
         if (!raw) return null;
@@ -23139,21 +23221,18 @@
             clickable?.click();
             return true;
         };
+        const findItemList = () => {
+            const visibleLists = mooncakeGetVisibleEnhanceItemSelectorLists();
+            return visibleLists.find(list => !before.has(list)) || visibleLists[visibleLists.length - 1] || null;
+        };
         if (!clickSlot()) return null;
-        await mooncakeDelay(100);
-        if (!isCurrent()) return null;
-
-        let visibleLists = mooncakeGetVisibleEnhanceItemSelectorLists();
-        let itemList = visibleLists.find(list => !before.has(list)) || visibleLists[visibleLists.length - 1] || null;
+        let itemList = await mooncakeWaitForEnhanceDomValue(findItemList, isCurrent, 180);
         if (itemList) return itemList;
 
         // React can replace the protection slot when the enhancement input changes.
         slot = mooncakeGetEnhanceProtectionSlot(panel);
         if (!clickSlot()) return null;
-        await mooncakeDelay(110);
-        if (!isCurrent()) return null;
-        visibleLists = mooncakeGetVisibleEnhanceItemSelectorLists();
-        return visibleLists.find(list => !before.has(list)) || visibleLists[visibleLists.length - 1] || null;
+        return mooncakeWaitForEnhanceDomValue(findItemList, isCurrent, 200);
     }
 
     async function mooncakeSelectEnhanceProtectionMaterial(panel, targetHrid, isCurrent = () => true) {
@@ -23179,9 +23258,11 @@
         }
         if (!isCurrent()) return false;
         (item.querySelector('[class*="Item_clickable"]') || item).click();
-        await mooncakeDelay(110);
-        if (!isCurrent()) return false;
-        if (mooncakeEnhanceHridsMatch(mooncakeGetEnhanceProtectionHrid(panel), target)) return true;
+        if (await mooncakeWaitForEnhanceDomValue(
+            () => mooncakeEnhanceHridsMatch(mooncakeGetEnhanceProtectionHrid(panel), target),
+            isCurrent,
+            180
+        )) return true;
 
         // One retry handles the selector reopening after an item-list rebuild.
         itemList = await mooncakeOpenEnhanceProtectionSelector(panel, isCurrent);
@@ -23194,9 +23275,11 @@
         if (!retryItem) return false;
         if (!isCurrent()) return false;
         (retryItem.querySelector('[class*="Item_clickable"]') || retryItem).click();
-        await mooncakeDelay(110);
-        if (!isCurrent()) return false;
-        return mooncakeEnhanceHridsMatch(mooncakeGetEnhanceProtectionHrid(panel), target);
+        return !!await mooncakeWaitForEnhanceDomValue(
+            () => mooncakeEnhanceHridsMatch(mooncakeGetEnhanceProtectionHrid(panel), target),
+            isCurrent,
+            200
+        );
     }
 
     async function mooncakeClearEnhanceProtectionMaterial(panel, isCurrent = () => true) {
@@ -23213,9 +23296,11 @@
         if (!action) return false;
         if (!isCurrent()) return false;
         action.click();
-        await mooncakeDelay(110);
-        if (!isCurrent()) return false;
-        return !mooncakeGetEnhanceProtectionHrid(panel);
+        return !!await mooncakeWaitForEnhanceDomValue(
+            () => !mooncakeGetEnhanceProtectionHrid(panel),
+            isCurrent,
+            180
+        );
     }
 
     function mooncakeSetEnhanceMarketPlanApplying(active) {
@@ -23294,9 +23379,10 @@
             return { applied: false, message: isZH ? '目标等级写入失败' : 'Could not set target level' };
         }
         // The game may mount or replace an empty protection selector after the
-        // target changes. Set the target first, then select its protection item.
-        await mooncakeDelay(110);
-        if (!isStillCurrent()) {
+        // target changes. Let React commit for two frames instead of always
+        // delaying a fixed 110 ms; the selector helper still waits longer when
+        // a slow client genuinely needs it.
+        if (!await mooncakeWaitForEnhanceFrames(isStillCurrent, 2)) {
             return { applied: false, message: isZH ? '装备已切换，已取消旧方案' : 'Item changed; cancelled the previous strategy' };
         }
 
@@ -23321,31 +23407,39 @@
 
         // Selecting a material rebuilds the protection-level input in React.
         // Wait for the replacement to settle instead of writing to a stale input.
-        if (needsProtection && !await settleProtectionLevel()) {
-            if (!isStillCurrent()) return { applied: false, cancelled: true, message: '' };
-            return { applied: false, message: isZH ? '保护等级写入失败' : 'Could not set protection level' };
+        let protectionLevelSettled = !needsProtection;
+        if (needsProtection) {
+            protectionLevelSettled = await settleProtectionLevel();
+            if (!protectionLevelSettled) {
+                if (!isStillCurrent()) return { applied: false, cancelled: true, message: '' };
+                return { applied: false, message: isZH ? '保护等级写入失败' : 'Could not set protection level' };
+            }
         }
 
         // React may also rebuild the target input when it accepts the selection.
-        await mooncakeDelay(35);
-        if (!isStillCurrent()) {
+        if (!await mooncakeWaitForEnhanceFrames(isStillCurrent, 1)) {
             return { applied: false, message: isZH ? '装备已切换，已取消旧方案' : 'Item changed; cancelled the previous strategy' };
         }
         if (mooncakeGetEnhanceTargetLevel(panel, false) !== targetLevel) {
             const retryTarget = mooncakeFindEnhanceTargetLevelInput(panel);
             if (retryTarget) mooncakeSetEnhanceRepeatCount(retryTarget, targetLevel);
-            await mooncakeDelay(35);
-            if (!isStillCurrent()) return { applied: false, cancelled: true, message: '' };
+            if (!await mooncakeWaitForEnhanceFrames(isStillCurrent, 1)) {
+                return { applied: false, cancelled: true, message: '' };
+            }
         }
         if (needsProtection && !mooncakeEnhanceHridsMatch(mooncakeGetEnhanceProtectionHrid(panel), protectionItemHrid)) {
             if (!await mooncakeSelectEnhanceProtectionMaterial(panel, protectionItemHrid, isStillCurrent)) {
                 if (!isStillCurrent()) return { applied: false, cancelled: true, message: '' };
                 return { applied: false, message: isZH ? '保护材料未能写入' : 'Could not set protection material' };
             }
+            protectionLevelSettled = false;
         }
-        if (needsProtection && !await settleProtectionLevel()) {
-            if (!isStillCurrent()) return { applied: false, cancelled: true, message: '' };
-            return { applied: false, message: isZH ? '保护等级写入失败' : 'Could not set protection level' };
+        if (needsProtection && (!protectionLevelSettled ||
+            mooncakeGetEnhanceProtectLevel(panel, targetLevel, false, protectionItemHrid) !== protectAt)) {
+            if (!await settleProtectionLevel()) {
+                if (!isStillCurrent()) return { applied: false, cancelled: true, message: '' };
+                return { applied: false, message: isZH ? '保护等级写入失败' : 'Could not set protection level' };
+            }
         }
 
         if (!isStillCurrent()) return { applied: false, cancelled: true, message: '' };
@@ -23570,6 +23664,23 @@
     function mooncakeFindLazyEnhancementPreset(itemHrid) {
         return mooncakeGetLazyEnhancementPresetsForItem(itemHrid)
             .find(preset => preset.isDefault) || null;
+    }
+
+    function mooncakeFindLazyEnhancementAutoFillPreset(itemHrid, startLevel) {
+        const defaultPreset = mooncakeFindLazyEnhancementPreset(itemHrid);
+        const currentLevel = Number(startLevel);
+        if (!Number.isInteger(currentLevel) || currentLevel < 0 || currentLevel > 20) return defaultPreset;
+
+        // A default remains the user's first choice while it can still advance
+        // the item. Once it is complete, continue with the nearest saved target.
+        if (defaultPreset?.targetLevel > currentLevel) return defaultPreset;
+
+        return mooncakeGetLazyEnhancementPresetsForItem(itemHrid)
+            .filter(preset => preset.targetLevel > currentLevel)
+            .sort((left, right) => {
+                if (left.targetLevel !== right.targetLevel) return left.targetLevel - right.targetLevel;
+                return Number(right.updatedAt || 0) - Number(left.updatedAt || 0);
+            })[0] || defaultPreset;
     }
 
     function mooncakeFindLazyEnhancementPresetById(itemHrid, presetId) {
@@ -24331,13 +24442,6 @@
         group.replaceChildren();
         group.hidden = presets.length === 0;
         if (!presets.length) return;
-        const label = document.createElement('span');
-        label.textContent = isZH ? '方案' : 'Plans';
-        label.setAttribute('aria-hidden', 'true');
-        Object.assign(label.style, {
-            padding: '0 1px', color: 'rgba(215,222,240,.66)', fontSize: '10px', fontWeight: '700', whiteSpace: 'nowrap'
-        });
-        group.appendChild(label);
         presets.forEach(preset => {
             const button = mooncakeCreateLazyEnhancementButton(
                 `${preset.isDefault ? '★ ' : ''}${mooncakeFormatLazyEnhancementPresetShortcutLabel(preset)}`,
@@ -24852,7 +24956,7 @@
         const bar = mooncakeMountLazyEnhancementBar(panel, contextKey);
         mooncakeUpdateLazyEnhancementBar(bar, panel, itemHrid, startLevel);
 
-        const preset = mooncakeFindLazyEnhancementPreset(itemHrid);
+        const preset = mooncakeFindLazyEnhancementAutoFillPreset(itemHrid, startLevel);
         if (!preset || mooncakeLazyEnhancementManualOverrideKey === contextKey || mooncakeLazyEnhancementApplyingKey) return;
         const signature = mooncakeGetLazyEnhancementPresetSignature(preset);
         if (mooncakeLazyEnhancementAutoFillAttemptSignature !== signature) {
@@ -24897,12 +25001,12 @@
                 mooncakeLazyEnhancementAutoFillSignature = '';
                 mooncakeScheduleLazyEnhancement();
             }
-            mooncakeSetLazyEnhancementBarStatus(
-                result.applied
-                    ? (isZH ? '已自动回填' : 'Auto-filled')
-                    : (result.message || (isZH ? '自动回填失败' : 'Auto-fill failed')),
-                result.applied ? 'success' : 'error'
-            );
+            if (!result.applied) {
+                mooncakeSetLazyEnhancementBarStatus(
+                    result.message || (isZH ? '自动回填失败' : 'Auto-fill failed'),
+                    'error'
+                );
+            }
         });
     }
 
@@ -29381,6 +29485,12 @@
         return null;
     }
 
+    function mooncakeNormalizeMyListingId(value) {
+        if (value === undefined || value === null || value === '') return null;
+        const numeric = Number(value);
+        return Number.isSafeInteger(numeric) ? numeric : String(value);
+    }
+
     function mooncakeReadMyListingFromFiber(row) {
         try {
             const fiberKey = mooncakeGetFiberKey(row);
@@ -29392,6 +29502,7 @@
                     const level = Number(listing.enhancementLevel ?? listing.enhanceLevel);
                     const price = Number(listing.price ?? listing.orderPrice ?? listing.listingPrice ?? listing.marketListingPrice ?? listing.unitPrice);
                     return {
+                        listingId: mooncakeNormalizeMyListingId(listing.id ?? listing.listingId ?? listing.marketListingId),
                         itemHrid: typeof listing.itemHrid === 'string' ? listing.itemHrid : null,
                         enhancementLevel: Number.isFinite(level) ? level : NaN,
                         isSell: mooncakeResolveMyListingSellSide(listing),
@@ -29469,7 +29580,7 @@
         const priceNode = row.querySelector('[class*="MarketplacePanel_price"], [class*="price"]') || row.children?.[3] || null;
         const priceText = priceNode?.firstChild?.textContent || priceNode?.textContent || '';
         const price = parsePriceText(priceText);
-        return { itemHrid, enhancementLevel, isSell, isActive, price };
+        return { listingId: null, itemHrid, enhancementLevel, isSell, isActive, price };
     }
 
     function mooncakeGetMyListingRowDescriptor(row) {
@@ -29478,6 +29589,7 @@
         if (!fromFiber && !fromDom) return null;
         const pickNumber = (primary, fallback) => Number.isFinite(Number(primary)) ? Number(primary) : Number(fallback);
         return {
+            listingId: mooncakeNormalizeMyListingId(fromFiber?.listingId ?? fromDom?.listingId),
             itemHrid: fromFiber?.itemHrid || fromDom?.itemHrid || null,
             enhancementLevel: pickNumber(fromFiber?.enhancementLevel, fromDom?.enhancementLevel),
             isSell: typeof fromFiber?.isSell === 'boolean' ? fromFiber.isSell : fromDom?.isSell,
@@ -29534,6 +29646,97 @@
             prices.add(price);
         });
         return { descriptors, activeSellPricesByGroup };
+    }
+
+    function mooncakeIsMyListingActiveForUndercut(listing) {
+        if (!listing || typeof listing.isSell !== 'boolean') return false;
+        if (listing.isActive === false) return false;
+        // The personal-listings table normally contains active entries only.
+        // Some game builds do not expose a readable status in each row.
+        return listing.isActive === true || listing.isActive === null || listing.isActive === undefined;
+    }
+
+    function mooncakeGetMyListingSidePriceGroupKey(listing) {
+        const groupKey = mooncakeGetMyListingPriceGroupKey(listing);
+        if (!groupKey || typeof listing?.isSell !== 'boolean') return '';
+        return `${listing.isSell ? 'sell' : 'buy'}\u0000${groupKey}`;
+    }
+
+    // Track both IDs and prices for each direction. The ID map permits exact
+    // self-exclusion; the price map remains a conservative fallback for game
+    // builds that omit an ID in a personal-listing row.
+    function mooncakeBuildMyListingsActiveSidePriceGroups(rows) {
+        const descriptors = new Map();
+        const activePricesBySideAndGroup = new Map();
+        const activeListingIdsBySideAndGroup = new Map();
+        rows.forEach(row => {
+            let listing = null;
+            try {
+                listing = mooncakeGetMyListingRowDescriptor(row);
+            } catch (_) {}
+            descriptors.set(row, listing);
+            if (!mooncakeIsMyListingActiveForUndercut(listing)) return;
+            const groupKey = mooncakeGetMyListingSidePriceGroupKey(listing);
+            const price = mooncakeNormalizeMyListingComparablePrice(listing.price);
+            if (!groupKey || !(price > 0)) return;
+            let prices = activePricesBySideAndGroup.get(groupKey);
+            if (!prices) {
+                prices = new Set();
+                activePricesBySideAndGroup.set(groupKey, prices);
+            }
+            prices.add(price);
+            const listingId = mooncakeNormalizeMyListingId(listing.listingId);
+            if (listingId === null) return;
+            let listingIds = activeListingIdsBySideAndGroup.get(groupKey);
+            if (!listingIds) {
+                listingIds = new Set();
+                activeListingIdsBySideAndGroup.set(groupKey, listingIds);
+            }
+            listingIds.add(listingId);
+        });
+        return { descriptors, activePricesBySideAndGroup, activeListingIdsBySideAndGroup };
+    }
+
+    function mooncakeGetMyListingBestOtherOrderPrice(listing, undercutContext) {
+        const groupKey = mooncakeGetMyListingSidePriceGroupKey(listing);
+        const level = Number(listing?.enhancementLevel);
+        const book = mooncakeGetMyListingsLiveOrderBook(listing?.itemHrid, level);
+        if (!book || !groupKey) return { available: false, price: NaN };
+        const orders = listing.isSell ? book.asks : book.bids;
+        const ownListingIds = undercutContext?.activeListingIdsBySideAndGroup?.get(groupKey);
+        const ownPrices = undercutContext?.activePricesBySideAndGroup?.get(groupKey);
+        for (const order of orders) {
+            const price = mooncakeNormalizeMyListingComparablePrice(order?.price);
+            if (!(price > 0)) continue;
+            const listingId = mooncakeNormalizeMyListingId(order?.listingId);
+            if (listingId !== null && ownListingIds?.has(listingId)) continue;
+            // An ID-less order at one of our known prices could be ours. Skip
+            // it rather than ever treating the player's own order as pressure.
+            if (listingId === null && ownPrices?.has(price)) continue;
+            return { available: true, price };
+        }
+        return { available: true, price: NaN };
+    }
+
+    function mooncakeIsMyListingUndercutByAnotherPlayer(listing, marketData, undercutContext) {
+        if (!mooncakeIsMyListingActiveForUndercut(listing)) return false;
+        const groupKey = mooncakeGetMyListingSidePriceGroupKey(listing);
+        const listingPrice = mooncakeNormalizeMyListingComparablePrice(listing.price);
+        const level = Number(listing.enhancementLevel);
+        if (!groupKey || !(listingPrice > 0) || !listing.itemHrid || !Number.isInteger(level)) return false;
+        const otherOrder = mooncakeGetMyListingBestOtherOrderPrice(listing, undercutContext);
+        if (otherOrder.available) {
+            return otherOrder.price > 0 && (listing.isSell ? otherOrder.price < listingPrice : otherOrder.price > listingPrice);
+        }
+
+        // No full order book is available yet. Fall back to the public quote,
+        // but never match when that quote can be one of our own same-side rows.
+        const levelMarket = marketData?.marketData?.[listing.itemHrid]?.[String(level)] ||
+            marketData?.marketData?.[listing.itemHrid]?.[level];
+        const bestPrice = mooncakeNormalizeMyListingComparablePrice(listing.isSell ? levelMarket?.a : levelMarket?.b);
+        if (!(bestPrice > 0)) return false;
+        if (undercutContext?.activePricesBySideAndGroup?.get(groupKey)?.has(bestPrice)) return false;
+        return listing.isSell ? bestPrice < listingPrice : bestPrice > listingPrice;
     }
 
     function mooncakeMyListingMatchesTargetHourly(row, marketData, targetHourlyWage, listingContext = null) {
@@ -29987,12 +30190,14 @@
     const MOONCAKE_MY_LISTINGS_MANAGEMENT_CLEAR_ATTR = 'data-mooncake-my-listings-management-clear';
     const MOONCAKE_MY_LISTINGS_MANAGEMENT_SIDE_ATTR = 'data-mooncake-my-listings-management-side';
     const MOONCAKE_MY_LISTINGS_MANAGEMENT_COLLECTABLE_ATTR = 'data-mooncake-my-listings-management-collectable';
+    const MOONCAKE_MY_LISTINGS_MANAGEMENT_UNDERCUT_ATTR = 'data-mooncake-my-listings-management-undercut';
     const MOONCAKE_MY_LISTINGS_MANAGEMENT_HIDDEN_ATTR = 'data-mooncake-my-listings-management-hidden';
     const MOONCAKE_MY_LISTINGS_MANAGEMENT_STYLE_ID = 'MooncakeMyListingsManagementStyle';
     const mooncakeMyListingsManagementState = {
         query: '',
         side: 'all',
-        collectable: false
+        collectable: false,
+        undercut: false
     };
     let mooncakeMyListingsManagementHooked = false;
     let mooncakeMyListingsManagementRaf = null;
@@ -30001,6 +30206,16 @@
 
     function mooncakeIsMyListingsManagementEnabled() {
         return config.features?.myListingsManagement !== false;
+    }
+
+    function mooncakeShouldCacheMyListingsLiveOrderBooks(itemHrid) {
+        if (!mooncakeMyListingsManagementState.undercut || !itemHrid) return false;
+        const table = mooncakeGetVisibleMyListingsTable();
+        if (!table) return false;
+        return Array.from(table.querySelectorAll('tbody tr')).some(row => {
+            const listing = mooncakeGetMyListingRowDescriptor(row);
+            return mooncakeIsMyListingActiveForUndercut(listing) && listing.itemHrid === itemHrid;
+        });
     }
 
     function mooncakeClearMyListingsManagementRows(root = document) {
@@ -30025,9 +30240,11 @@
         mooncakeClearMyListingsManagementRows();
         document.querySelectorAll(`[${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"]`).forEach(control => control.remove());
         if (resetState) {
+            mooncakeClearMyListingsLiveOrderBookCache();
             mooncakeMyListingsManagementState.query = '';
             mooncakeMyListingsManagementState.side = 'all';
             mooncakeMyListingsManagementState.collectable = false;
+            mooncakeMyListingsManagementState.undercut = false;
         }
     }
 
@@ -30149,10 +30366,11 @@
         return /收集|collect/i.test(label);
     }
 
-    function mooncakeMyListingMatchesManagement(row, descriptor, query, side, collectableOnly) {
+    function mooncakeMyListingMatchesManagement(row, descriptor, query, side, collectableOnly, undercutOnly, marketData, undercutContext) {
         if (side === 'sell' && descriptor?.isSell !== true) return false;
         if (side === 'buy' && descriptor?.isSell !== false) return false;
         if (collectableOnly && !mooncakeIsMyListingCollectable(row)) return false;
+        if (undercutOnly && !mooncakeIsMyListingUndercutByAnotherPlayer(descriptor, marketData, undercutContext)) return false;
         return !query || mooncakeGetMyListingManagementSearchText(row, descriptor).includes(query);
     }
 
@@ -30169,6 +30387,8 @@
         });
         const collectable = control.querySelector(`[${MOONCAKE_MY_LISTINGS_MANAGEMENT_COLLECTABLE_ATTR}="1"]`);
         collectable?.setAttribute('aria-pressed', String(mooncakeMyListingsManagementState.collectable));
+        const undercut = control.querySelector(`[${MOONCAKE_MY_LISTINGS_MANAGEMENT_UNDERCUT_ATTR}="1"]`);
+        undercut?.setAttribute('aria-pressed', String(mooncakeMyListingsManagementState.undercut));
     }
 
     function mooncakeScheduleMyListingsManagementCollectableReset(table) {
@@ -30245,6 +30465,15 @@
         collectable.textContent = isZH ? '可收集' : 'Collectable';
         collectable.setAttribute(MOONCAKE_MY_LISTINGS_MANAGEMENT_COLLECTABLE_ATTR, '1');
         collectable.setAttribute('aria-pressed', String(mooncakeMyListingsManagementState.collectable));
+        const undercut = document.createElement('button');
+        undercut.type = 'button';
+        undercut.textContent = isZH ? '被压价' : 'Undercut';
+        undercut.title = isZH
+            ? '仅显示被其他玩家压价的出售或收购挂单'
+            : 'Show listings undercut by another player';
+        undercut.setAttribute('aria-label', undercut.title);
+        undercut.setAttribute(MOONCAKE_MY_LISTINGS_MANAGEMENT_UNDERCUT_ATTR, '1');
+        undercut.setAttribute('aria-pressed', String(mooncakeMyListingsManagementState.undercut));
 
         search.addEventListener('input', () => {
             if (mooncakeMyListingsManagementSearchTimer) clearTimeout(mooncakeMyListingsManagementSearchTimer);
@@ -30287,7 +30516,15 @@
             mooncakeSyncMyListingsManagementControl(control);
             mooncakeScheduleMyListingsManagement();
         });
-        control.append(searchWrap, ...sideButtons, collectable);
+        undercut.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            mooncakeMyListingsManagementState.undercut = !mooncakeMyListingsManagementState.undercut;
+            if (!mooncakeMyListingsManagementState.undercut) mooncakeClearMyListingsLiveOrderBookCache();
+            mooncakeSyncMyListingsManagementControl(control);
+            mooncakeScheduleMyListingsManagement();
+        });
+        control.append(searchWrap, ...sideButtons, collectable, undercut);
 
         const listingCount = root.querySelector('[class*="MarketplacePanel_listingCount"]');
         const buttonHost = root.querySelector('[class*="MarketplacePanel_buttonContainer"]');
@@ -30314,9 +30551,24 @@
         const query = mooncakeNormalizeMyListingsManagementText(mooncakeMyListingsManagementState.query);
         const side = mooncakeMyListingsManagementState.side;
         const collectableOnly = mooncakeMyListingsManagementState.collectable;
-        const results = Array.from(table.querySelectorAll('tbody tr'), row => {
-            const descriptor = mooncakeGetMyListingRowDescriptor(row);
-            const visible = mooncakeMyListingMatchesManagement(row, descriptor, query, side, collectableOnly);
+        const undercutOnly = mooncakeMyListingsManagementState.undercut;
+        const rows = Array.from(table.querySelectorAll('tbody tr'));
+        const undercutContext = undercutOnly ? mooncakeBuildMyListingsActiveSidePriceGroups(rows) : null;
+        const marketData = undercutOnly ? getMarketData() : null;
+        const results = rows.map(row => {
+            const descriptor = undercutContext?.descriptors?.has(row)
+                ? undercutContext.descriptors.get(row)
+                : mooncakeGetMyListingRowDescriptor(row);
+            const visible = mooncakeMyListingMatchesManagement(
+                row,
+                descriptor,
+                query,
+                side,
+                collectableOnly,
+                undercutOnly,
+                marketData,
+                undercutContext
+            );
             return [row, visible];
         });
         results.forEach(([row, visible]) => mooncakeSetMyListingsManagementRowVisible(row, visible));
@@ -30327,6 +30579,24 @@
             mooncakeMyListingsManagementCollectableResetTimer = 0;
         }
         mooncakeSyncMyListingsManagementControl(control);
+    }
+
+    // Refresh only when a quote that belongs to a visible personal listing
+    // changes. This keeps the undercut filter current without reacting to
+    // every unrelated marketplace update.
+    function mooncakeNotifyMyListingsManagementMarketUpdate(itemHrid, changedLevels) {
+        if (!mooncakeIsMyListingsManagementEnabled() || !mooncakeMyListingsManagementState.undercut) return;
+        if (!itemHrid || !(changedLevels instanceof Set) || !changedLevels.size) return;
+        const table = mooncakeGetVisibleMyListingsTable();
+        if (!table) return;
+        const affectsVisibleListing = Array.from(table.querySelectorAll('tbody tr')).some(row => {
+            const listing = mooncakeGetMyListingRowDescriptor(row);
+            const level = Number(listing?.enhancementLevel);
+            return mooncakeIsMyListingActiveForUndercut(listing) &&
+                listing.itemHrid === itemHrid &&
+                Number.isInteger(level) && changedLevels.has(level);
+        });
+        if (affectsVisibleListing) mooncakeScheduleMyListingsManagement();
     }
 
     function mooncakeScheduleMyListingsManagement() {
@@ -31741,6 +32011,7 @@
 
                 buildItemMaps();
                 mooncakeScheduleMyListingsTargetFilter(0);
+                if (mooncakeMyListingsManagementState?.undercut) mooncakeScheduleMyListingsManagement();
                 setupObserver();
                 refreshMooncakeChatLabor();
                 // Rebuild material shortcuts after shop metadata becomes available,
