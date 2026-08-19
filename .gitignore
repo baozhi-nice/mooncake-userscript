@@ -1,0 +1,12 @@
+# Local dependency installation
+node_modules/
+
+# Original extracted builds are retained locally as reference material.
+main.*.chunk.js
+mooncake-build-*/
+
+# Package-manager and editor noise
+pnpm-debug.log*
+npm-debug.log*
+.DS_Store
+Thumbs.db
