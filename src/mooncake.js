@@ -2467,13 +2467,24 @@
         mooncakeOpenEnhancementSettingsPanel(trigger, 'archive');
     }
 
+    function mooncakeGetOrderBookPriceBandValue(source, level) {
+        const value = Array.isArray(source)
+            ? source[level]
+            : source?.[level] ?? source?.[String(level)];
+        const numeric = Number(value);
+        return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+    }
+
     function updateMarketCacheFromWS(marketItemOrderBooks) {
         if (!marketItemOrderBooks?.itemHrid || !marketItemOrderBooks?.orderBooks) return;
         mooncakeCacheQ7MarketOrderBooks(marketItemOrderBooks);
         mooncakeScheduleOrderBookArchiveCapture(marketItemOrderBooks);
         const itemHrid = marketItemOrderBooks.itemHrid;
         const orderBooks = marketItemOrderBooks.orderBooks;
-        const snapshotTime = Math.floor(Date.now() / 1000);
+        const receivedAt = Date.now();
+        const snapshotTime = Math.floor(receivedAt / 1000);
+        const priceBandMins = marketItemOrderBooks.priceBandMins;
+        const priceBandMaxs = marketItemOrderBooks.priceBandMaxs;
 
         if (!marketDataCache) marketDataCache = {};
         if (!marketDataCache[itemHrid]) marketDataCache[itemHrid] = {};
@@ -2489,6 +2500,9 @@
             const bidPrice = mooncakeGetOrderBookBestPrice(book, 'bids');
             const previous = marketDataCache[itemHrid][level];
             const previousSnapshot = marketDetailSnapshotCache[`${itemHrid}:${level}`];
+            const priceBandMin = mooncakeGetOrderBookPriceBandValue(priceBandMins, level);
+            const priceBandMax = mooncakeGetOrderBookPriceBandValue(priceBandMaxs, level);
+            const hasPriceBand = priceBandMin !== null && priceBandMax !== null && priceBandMin <= priceBandMax;
             if (!previous || previous.a !== askPrice || previous.b !== bidPrice) {
                 priceChanged = true;
                 changedLevels.add(level);
@@ -2500,7 +2514,11 @@
             marketDetailSnapshotCache[`${itemHrid}:${level}`] = {
                 bid: bidPrice,
                 ask: askPrice,
-                time: snapshotTime
+                time: snapshotTime,
+                // Preserve a prior valid band if this particular payload only
+                // contains order-book quotes.
+                priceBandMin: hasPriceBand ? priceBandMin : previousSnapshot?.priceBandMin,
+                priceBandMax: hasPriceBand ? priceBandMax : previousSnapshot?.priceBandMax
             };
         }
 
@@ -3999,68 +4017,55 @@
         return result;
     }
 
-    // Market +0 rows have two different economic perspectives. A sell listing
-    // is taxed on settlement, while accepting a buy listing is an untaxed
-    // purchase, so it should compare the bid directly with the craft cost.
-    // Keep the older manufacture-profit helpers above intact for chat output.
+    // For +0 equipment, the actionable question on either order-book side is
+    // whether buying at the displayed quote beats making the item. Keep the
+    // tax-adjusted manufacture profit as supporting tooltip detail instead of
+    // letting it replace the purchase-saving value on sale rows.
     function mooncakeCalculateLevelZeroMarketComparison(itemHrid, side, price, marketData) {
         const quotePrice = Number(price);
         if (!itemHrid || !(quotePrice > 0) || !marketData) return null;
 
-        let manufacturingCost = 0;
-        try {
-            manufacturingCost = Number(getCraftingCost(itemHrid, marketData));
-        } catch (err) {
-            console.warn('[MoonCake] +0 market comparison calculation failed:', itemHrid, err);
-            return null;
-        }
-        if (!(manufacturingCost > 0)) return null;
-
+        const manufacture = mooncakeCalculateLevelZeroManufactureProfit(itemHrid, quotePrice, marketData);
+        if (!manufacture) return null;
         const normalizedSide = side === 'buy' ? 'buy' : 'sell';
-        const afterTaxRevenue = normalizedSide === 'sell'
-            ? quotePrice * MOONCAKE_MARKET_SELL_NET_FACTOR
-            : null;
-        const comparisonValue = normalizedSide === 'buy'
-            ? manufacturingCost - quotePrice
-            : afterTaxRevenue - manufacturingCost;
+        const purchaseSavings = manufacture.manufacturingCost - quotePrice;
 
         return {
             side: normalizedSide,
             quotePrice,
-            afterTaxRevenue,
-            manufacturingCost,
-            comparisonValue
+            afterTaxRevenue: normalizedSide === 'sell' ? manufacture.afterTaxRevenue : null,
+            manufacturingCost: manufacture.manufacturingCost,
+            purchaseSavings,
+            manufactureProfit: normalizedSide === 'sell' ? manufacture.profit : null,
+            comparisonValue: purchaseSavings
         };
     }
 
     function mooncakeBuildLevelZeroMarketComparisonTooltip(itemHrid, result) {
         if (!result) return '';
         const isBuy = result.side === 'buy';
-        const title = isBuy
-            ? (isZH ? '+0 购买节省 · 收购报价' : '+0 Purchase savings · Buy listing')
-            : (isZH ? '+0 制造利润 · 出售报价' : '+0 Manufacturing profit · Sell listing');
-        const comparisonLabel = isBuy
-            ? (isZH ? '购买节省:' : 'Purchase savings:')
-            : (isZH ? '制造利润:' : 'Manufacturing profit:');
+        const title = isZH ? '+0 购买节省' : '+0 Purchase savings';
+        const comparisonLabel = isZH ? '购买节省:' : 'Purchase savings:';
         const comparisonColor = result.comparisonValue > 0
+            ? '#7DFFB3'
+            : 'var(--color-disabled, #9aa0ad)';
+        const manufactureProfitColor = result.manufactureProfit >= 0
             ? '#7DFFB3'
             : 'var(--color-disabled, #9aa0ad)';
         const quoteLabel = isBuy
             ? (isZH ? '收购报价:' : 'Buy bid:')
             : (isZH ? '出售报价:' : 'Sell quote:');
-        const settlementLine = isBuy
-            ? ''
-            : `<span class="tt-label">${isZH ? `成交后（扣 ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% 市场税）` : `After ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% market tax`}:</span> <span class="tt-value">${formatMoney(result.afterTaxRevenue)}</span>\n`;
-        const contextLine = isBuy
-            ? `<span class="tt-label">${isZH ? '计算口径:' : 'Basis:'}</span> <span class="tt-value">${isZH ? '制造成本 - 收购报价（收购不扣税）' : 'Craft cost - buy bid (untaxed)'}</span>\n`
-            : `<span class="tt-label">${isZH ? '计算口径:' : 'Basis:'}</span> <span class="tt-value">${isZH ? '税后成交额 - 制造成本' : 'After-tax revenue - craft cost'}</span>\n`;
+        const manufactureDetail = !isBuy && Number.isFinite(result.manufactureProfit)
+            ? `<span class="tt-label">${isZH ? `成交后（扣 ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% 市场税）` : `After ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% market tax`}:</span> <span class="tt-value">${formatMoney(result.afterTaxRevenue)}</span>\n`
+                + `<span class="tt-label">${isZH ? '制造利润:' : 'Manufacturing profit:'}</span> <span class="tt-value" style="color:${manufactureProfitColor};font-weight:bold;">${mooncakeFormatSignedMoney(result.manufactureProfit)}</span>`
+            : '';
         return `<div class="tt-header">${title}</div>`
             + `<span class="tt-label">${isZH ? '装备:' : 'Item:'}</span> <span class="tt-value">${getItemName(itemHrid) || itemHrid} +0</span>\n`
             + `<span class="tt-label">${quoteLabel}</span> <span class="tt-value">${formatMoney(result.quotePrice)}</span>\n`
-            + settlementLine
             + `<span class="tt-label">${isZH ? '制造成本:' : 'Craft cost:'}</span> <span class="tt-value">${formatMoney(result.manufacturingCost)}</span>\n`
-            + contextLine
-            + `<span class="tt-label">${comparisonLabel}</span> <span class="tt-value" style="color:${comparisonColor};font-weight:bold;">${mooncakeFormatSignedMoney(result.comparisonValue)}</span>`;
+            + `<span class="tt-label">${isZH ? '计算口径:' : 'Basis:'}</span> <span class="tt-value">${isZH ? '制造成本 - 当前报价' : 'Craft cost - current quote'}</span>\n`
+            + `<span class="tt-label">${comparisonLabel}</span> <span class="tt-value" style="color:${comparisonColor};font-weight:bold;">${mooncakeFormatSignedMoney(result.purchaseSavings)}</span>\n`
+            + manufactureDetail;
     }
 
     function mooncakeRenderLevelZeroMarketComparisonCell(cell, itemHrid, side, price, marketData) {
@@ -11802,7 +11807,7 @@
     const MOONCAKE_MARKET_LEVEL_JUMPS = [0, 5, 7, 10, 12];
     const MOONCAKE_MARKET_CHARM_LEVEL_JUMPS = [0, 3, 5, 7, 10];
     // Layout only: additional level buttons wrap onto a new row.
-    const MOONCAKE_MARKET_LEVEL_BUTTONS_PER_ROW = 5;
+    const MOONCAKE_MARKET_LEVEL_BUTTONS_PER_ROW = 10;
     const MOONCAKE_LEVEL_BAR_ID = 'MooncakeMarketEnhLevelJumpBar';
     const MOONCAKE_RECIPE_BAR_ID = 'MooncakeMarketRecipeJumpBar';
     const MOONCAKE_STOCK_NAV_BAR_ID = 'MooncakeMarketStockNavigationBar';
@@ -29718,7 +29723,6 @@
         status.setAttribute(MOONCAKE_MY_LISTINGS_TARGET_STATUS_ATTR, '1');
         status.hidden = true;
         Object.assign(status.style, { maxWidth: '110px', overflow: 'hidden', textOverflow: 'ellipsis', fontSize: '11px', whiteSpace: 'nowrap' });
-
         const applyTargetInput = (showError = false) => {
             const value = String(input.value || '').trim();
             if (value && mooncakeSetMyListingsTargetHourlyM(value)) return true;
@@ -30753,18 +30757,19 @@
 
     function mooncakeGetMarketplaceInlineMetricLabel(enhancementLevel, side) {
         if (Number(enhancementLevel) !== 0) return isZH ? '工时' : 'Hourly';
-        return side === 'buy'
-            ? (isZH ? '节省' : 'Savings')
-            : (isZH ? '利润' : 'Profit');
+        return isZH ? '购买节省' : 'Purchase savings';
     }
 
     function mooncakeGetMarketplaceInlineMetricTitle(enhancementLevel, side) {
         if (Number(enhancementLevel) !== 0) {
             return isZH ? '工时费（每小时）' : 'Hourly wage';
         }
-        return side === 'buy'
-            ? (isZH ? '购买节省（制造成本 - 收购报价）' : 'Purchase savings (craft cost - buy bid)')
-            : (isZH ? `制造利润（税后成交额 - 制造成本，扣 ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% 市场税）` : `Manufacturing profit (after ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% market tax)`);
+        const purchaseSavingTitle = isZH
+            ? '购买节省（制造成本 - 当前报价）'
+            : 'Purchase savings (craft cost - current quote)';
+        return side === 'sell'
+            ? (isZH ? `${purchaseSavingTitle}；制造利润见提示` : `${purchaseSavingTitle}; manufacturing profit in tooltip`)
+            : purchaseSavingTitle;
     }
 
     function mooncakeRenderMarketplaceInlineLevelZeroMetric(metric, itemHrid, side, price, marketData) {
@@ -30934,13 +30939,15 @@
         enhancementLevel = normalizedEnhancementLevel;
         const normalizedSide = side === 'buy' ? 'buy' : 'sell';
         const isLevelZeroEconomics = enhancementLevel === 0;
-        const levelZeroMetricLabel = normalizedSide === 'buy'
-            ? (isZH ? '购买节省' : 'Purchase savings')
-            : (isZH ? '制造利润' : 'Manufacturing profit');
+        const levelZeroMetricLabel = isZH ? '购买节省' : 'Purchase savings';
         const hourlyWageHeaderTitle = isLevelZeroEconomics
-            ? (normalizedSide === 'buy'
-                ? (isZH ? '+0 收购显示购买节省（制造成本 - 收购报价，不扣税）' : '+0 buy orders show purchase savings (craft cost - bid, untaxed)')
-                : (isZH ? '+0 出售显示制造利润（税后成交额 - 制造成本）' : '+0 sell orders show manufacturing profit (after-tax revenue - craft cost)'))
+            ? (normalizedSide === 'sell'
+                ? (isZH
+                    ? '+0 显示购买节省（制造成本 - 当前报价）；制造利润见提示'
+                    : '+0 shows purchase savings (craft cost - current quote); manufacturing profit is in the tooltip')
+                : (isZH
+                    ? '+0 显示购买节省（制造成本 - 当前报价）'
+                    : '+0 shows purchase savings (craft cost - current quote)'))
             : (isZH ? '+1 及以上显示工时费' : '+1 and above: hourly wage');
         const renderGeneration = mooncakeBeginOrderBookRender(orderBookTable);
 
@@ -31378,8 +31385,8 @@
         const sellHourlyWageHeader = document.createElement('th');
         sellHourlyWageHeader.className = 'sell-hourly-wage-header';
         sellHourlyWageHeader.title = isZH
-            ? '+1 及以上显示工时费；+0 出售显示制造利润（税后成交额 - 制造成本）'
-            : '+1 and above: hourly wage; +0 sell shows manufacturing profit (after-tax revenue - craft cost)';
+            ? '+1 及以上显示工时费；+0 显示购买节省（制造成本 - 当前报价），制造利润见提示'
+            : '+1 and above: hourly wage; +0 shows purchase savings (craft cost - current quote), with manufacturing profit in the tooltip';
         sellHourlyWageHeader.textContent = isZH ? '工时费' : 'Hourly Wage';
         sellHourlyWageHeader.style.cssText = 'padding: 8px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums;';
 
@@ -31387,8 +31394,8 @@
         const buyHourlyWageHeader = document.createElement('th');
         buyHourlyWageHeader.className = 'buy-hourly-wage-header';
         buyHourlyWageHeader.title = isZH
-            ? '+1 及以上显示工时费；+0 收购显示购买节省（制造成本 - 收购报价，不扣税）'
-            : '+1 and above: hourly wage; +0 buy shows purchase savings (craft cost - bid, untaxed)';
+            ? '+1 及以上显示工时费；+0 显示购买节省（制造成本 - 当前报价）'
+            : '+1 and above: hourly wage; +0 shows purchase savings (craft cost - current quote)';
         buyHourlyWageHeader.textContent = isZH ? '工时费' : 'Hourly Wage';
         buyHourlyWageHeader.style.cssText = 'padding: 8px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums;';
 
