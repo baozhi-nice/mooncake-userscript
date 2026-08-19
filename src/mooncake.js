@@ -22130,8 +22130,12 @@
         mooncakeProtectionAssistantTimer = 0;
         mooncakeRestoreProtectionAssistantOptions();
         if (!mooncakeIsProtectionAssistantEnabled()) return;
+        // Only the protection-material picker is in scope. The game's primary
+        // equipment picker uses the same ItemSelector component and must never
+        // have its equipment options filtered.
+        if (Date.now() > mooncakeProtectionAssistantArmedUntil) return;
         const panel = mooncakeFindEnhancingPanel();
-        const baseHrid = mooncakeGetEnhanceBaseItemHrid(panel) || mooncakeEnhanceSnapshot?.itemHrid;
+        const baseHrid = mooncakeGetEnhanceBaseItemHrid(panel);
         if (!baseHrid) return;
         const allowed = new Set((getProtectionItems(baseHrid) || []).filter(Boolean));
         if (!allowed.size) return;
@@ -22143,8 +22147,7 @@
                 availableCount: mooncakeGetProtectionAssistantOptionCount(element)
             })).filter(option => option.itemHrid);
             const allowedOptions = options.filter(option => allowed.has(option.itemHrid));
-            const hasMirror = allowedOptions.some(option => option.itemHrid === '/items/mirror_of_protection');
-            if (!allowedOptions.length || (!hasMirror && Date.now() > mooncakeProtectionAssistantArmedUntil)) continue;
+            if (!allowedOptions.length) continue;
 
             // The active primary item is normally removed from inventory by the
             // game, but its zero-count self-protection entry can remain in the
@@ -22215,10 +22218,18 @@
             if (protectionSlot?.contains?.(event.target)) {
                 mooncakeProtectionAssistantArmedUntil = Date.now() + 5000;
                 mooncakeScheduleProtectionAssistant(80);
+                return;
+            }
+            // A primary-equipment click must cancel a prior protection-picker
+            // arm window. Keep the window while users search or choose within
+            // the already-open protection list, which is rendered in a portal.
+            if (!event.target?.closest?.('[class*="ItemSelector_itemList"]')) {
+                mooncakeProtectionAssistantArmedUntil = 0;
+                mooncakeRestoreProtectionAssistantOptions();
             }
         }, true);
         subscribeDocumentMutations('protection-assistant', mutations => {
-            if (!mooncakeIsProtectionAssistantEnabled()) return;
+            if (!mooncakeIsProtectionAssistantEnabled() || Date.now() > mooncakeProtectionAssistantArmedUntil) return;
             const relevant = mutations.some(mutation => [...mutation.addedNodes].some(node =>
                 node instanceof Element && (node.matches?.('[class*="ItemSelector"]') || node.querySelector?.('[class*="ItemSelector"]'))
             ));
@@ -22518,7 +22529,9 @@
         if (slots.length >= 2) return slots[1];
         const emptySlots = [...panel.querySelectorAll('[class*="ItemSelector_empty"]')]
             .filter(slot => !slot.closest?.(MOONCAKE_ENH_PREVIEW_EXCLUDE_SEL));
-        return emptySlots[1] || emptySlots[0] || null;
+        // With no selected primary item the only empty selector is the
+        // equipment slot itself, not a protection slot.
+        return emptySlots[1] || null;
     }
 
     function mooncakeGetEnhanceBaseItemSlot(panel) {
@@ -22541,6 +22554,7 @@
         const uses = panel.querySelectorAll('use');
         for (const use of uses) {
             if (use.closest?.(MOONCAKE_ENH_PREVIEW_EXCLUDE_SEL)) continue;
+            if (use.closest?.('[class*="ItemSelector_itemList"]')) continue;
             if (protSlot?.contains?.(use)) continue;
             const hrid = mooncakeHridFromUseNode(use);
             if (mooncakeIsEnhanceableItem(hrid)) return hrid;
