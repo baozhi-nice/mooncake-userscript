@@ -364,6 +364,18 @@
         })
     });
     const MOONCAKE_HOURLY_WAGE_COLOR_PROFILE_MAX_M = 1000000;
+    // Whiteboard cost uses two independent ordered fallback chains. A source
+    // is only considered when its own market side exists; there is never an
+    // implicit cross-side fallback inside an individual source.
+    const MOONCAKE_BASE_ITEM_COST_PRICE_SOURCE_KEYS = Object.freeze([
+        'ask', 'askMinusOne', 'bidPlusOne', 'bid'
+    ]);
+    const MOONCAKE_DEFAULT_BASE_ITEM_COST_PRICE_POLICY = Object.freeze({
+        material: Object.freeze(['ask', 'bid']),
+        product: Object.freeze(['ask', 'bid'])
+    });
+    const MOONCAKE_BASE_ITEM_COST_RESOLUTION_CACHE_LIMIT = 128;
+    const mooncakeBaseItemCostResolutionCaches = new WeakMap();
 
     const DEFAULT_PREFERENCES = {
         preferenceLevels: '',
@@ -378,6 +390,9 @@
         // Shared by marketplace, chat, order modal, and enhancement views.
         // Store breakpoints in M/h to keep the settings input human-readable.
         hourlyWageColorProfile: MOONCAKE_DEFAULT_HOURLY_WAGE_COLOR_PROFILE,
+        // Whiteboard acquisition cost: material inputs and the finished +0
+        // item each have an independently ordered price fallback chain.
+        baseItemCostPricePolicy: MOONCAKE_DEFAULT_BASE_ITEM_COST_PRICE_POLICY,
         myListingsTargetHourlyIndependent: true,
         myListingsTargetHourlyM: 15,
         enhancementReminderLevel: 0,
@@ -1186,6 +1201,84 @@
         return true;
     }
 
+    function mooncakeNormalizeBaseItemCostPriceSourceList(value, fallback = []) {
+        if (!Array.isArray(value)) return [...fallback];
+        const seen = new Set();
+        const normalized = [];
+        for (const source of value) {
+            if (!MOONCAKE_BASE_ITEM_COST_PRICE_SOURCE_KEYS.includes(source) || seen.has(source)) continue;
+            seen.add(source);
+            normalized.push(source);
+        }
+        // An empty list is an intentional user choice that disables a route.
+        // A non-empty list with no recognized source is corrupted old data,
+        // so restore the supplied safe default instead of disabling it.
+        if (value.length && !normalized.length) return [...fallback];
+        return normalized;
+    }
+
+    function mooncakeNormalizeBaseItemCostPricePolicy(value) {
+        const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+        return {
+            material: mooncakeNormalizeBaseItemCostPriceSourceList(
+                source.material,
+                MOONCAKE_DEFAULT_BASE_ITEM_COST_PRICE_POLICY.material
+            ),
+            product: mooncakeNormalizeBaseItemCostPriceSourceList(
+                source.product,
+                MOONCAKE_DEFAULT_BASE_ITEM_COST_PRICE_POLICY.product
+            )
+        };
+    }
+
+    function mooncakeGetBaseItemCostPricePolicy() {
+        return mooncakeNormalizeBaseItemCostPricePolicy(config.preferences?.baseItemCostPricePolicy);
+    }
+
+    function mooncakeGetBaseItemCostPriceSources(kind) {
+        const policy = mooncakeGetBaseItemCostPricePolicy();
+        return kind === 'product' ? policy.product : policy.material;
+    }
+
+    function mooncakeBaseItemCostPriceSourceListsMatch(left, right) {
+        return left.length === right.length && left.every((source, index) => source === right[index]);
+    }
+
+    function mooncakeRefreshBaseItemCostPricePolicySurfaces() {
+        // Quote policy affects derived whiteboard costs even when live market
+        // data has not changed, so give every price-keyed renderer a new
+        // revision and invalidate its route caches.
+        mooncakeMarketPricingRevision += 1;
+        try { mooncakeClearEnhancementRouteCache(); } catch (_) {}
+        try { mooncakeEnhanceQuickRecommendationCache.clear(); } catch (_) {}
+        try { mooncakeRefreshEnhancementRouteObjectiveSurfaces(); } catch (_) {}
+        try {
+            if (mooncakeMyListingsTargetFilterActive) {
+                mooncakeScheduleMyListingsTargetFilter(0, { showProgress: false });
+            }
+        } catch (_) {}
+        try {
+            if (mooncakeMyListingsManagementState?.undercut) {
+                mooncakeScheduleMyListingsManagement();
+            }
+        } catch (_) {}
+        try { mooncakeRefreshEnhancementSettingsPanel(); } catch (_) {}
+    }
+
+    function mooncakeSetBaseItemCostPriceSources(kind, value) {
+        const group = kind === 'product' ? 'product' : 'material';
+        const current = mooncakeGetBaseItemCostPricePolicy();
+        // An explicit empty list is meaningful: it disables that whole route.
+        const nextSources = mooncakeNormalizeBaseItemCostPriceSourceList(value);
+        if (mooncakeBaseItemCostPriceSourceListsMatch(current[group], nextSources)) return true;
+        current[group] = nextSources;
+        if (!config.preferences) config.preferences = {};
+        config.preferences.baseItemCostPricePolicy = current;
+        saveConfig();
+        mooncakeRefreshBaseItemCostPricePolicySurfaces();
+        return true;
+    }
+
     function mooncakeIsMyListingsTargetHourlyIndependent() {
         return config.preferences?.myListingsTargetHourlyIndependent !== false;
     }
@@ -1845,13 +1938,63 @@
         return mooncakeOrderBookArchiveDbPromise;
     }
 
+    function mooncakeNormalizeMarketListingId(value) {
+        if (value === undefined || value === null || value === '') return null;
+        const numeric = Number(value);
+        return Number.isSafeInteger(numeric) ? numeric : String(value);
+    }
+
+    function mooncakeGetMarketListingIdKey(value) {
+        const listingId = mooncakeNormalizeMarketListingId(value);
+        return listingId === null ? '' : String(listingId);
+    }
+
+    function mooncakeGetMyMarketListingIds() {
+        const listingIds = new Set();
+        try {
+            const listingMap = mooncakeFindGameStateNode()?.state?.myMarketListingMap;
+            if (listingMap instanceof Map) {
+                listingMap.forEach((listing, mapKey) => {
+                    // The native order book checks this Map with listingId, so
+                    // its key is authoritative. Some game builds also expose
+                    // the ID on the listing value; retain both representations.
+                    [mapKey, listing?.id, listing?.listingId, listing?.marketListingId].forEach(value => {
+                        const key = mooncakeGetMarketListingIdKey(value);
+                        if (key) listingIds.add(key);
+                    });
+                });
+            }
+        } catch (_) {}
+
+        // The state map is normally available even while viewing an order book.
+        // Keep a DOM fallback for game builds that do not expose it on the root
+        // component, so currently visible personal listings remain recognizable.
+        if (!listingIds.size) {
+            const table = typeof mooncakeGetVisibleMyListingsTable === 'function'
+                ? mooncakeGetVisibleMyListingsTable()
+                : null;
+            table?.querySelectorAll?.('tbody tr').forEach(row => {
+                const listingId = mooncakeGetMyListingRowDescriptor?.(row)?.listingId;
+                const key = mooncakeGetMarketListingIdKey(listingId);
+                if (key) listingIds.add(key);
+            });
+        }
+        return listingIds;
+    }
+
+    function mooncakeMarkOwnOrderBookListings(rows, ownListingIds) {
+        if (!ownListingIds?.size) return rows;
+        return rows.map(row => {
+            const isMine = ownListingIds.has(mooncakeGetMarketListingIdKey(row?.listingId));
+            return isMine ? { ...row, isMine: true } : row;
+        });
+    }
+
     function mooncakeNormalizeOrderBookListings(book, side) {
         return (Array.isArray(book?.[side]) ? book[side] : [])
             .map(entry => {
                 const rawListingId = Array.isArray(entry) ? entry[2] : (entry?.listingId ?? entry?.id);
-                const listingId = rawListingId === undefined || rawListingId === null || rawListingId === ''
-                    ? null
-                    : (Number.isSafeInteger(Number(rawListingId)) ? Number(rawListingId) : String(rawListingId));
+                const listingId = mooncakeNormalizeMarketListingId(rawListingId);
                 return {
                     price: Math.max(0, Number(Array.isArray(entry) ? entry[0] : (entry?.price ?? entry?.p)) || 0),
                     quantity: Math.max(0, Number(Array.isArray(entry)
@@ -2180,12 +2323,19 @@
         const levels = Number.isFinite(panelLevel)
             ? [Math.max(0, Math.min(20, Math.floor(panelLevel)))]
             : [0];
+        const ownListingIds = mooncakeGetMyMarketListingIds();
         const rows = [];
         for (const level of levels) {
             const book = orderBooks[level];
             if (!book) continue;
-            const asks = mooncakeNormalizeOrderBookListings(book, 'asks');
-            const bids = mooncakeNormalizeOrderBookListings(book, 'bids');
+            const asks = mooncakeMarkOwnOrderBookListings(
+                mooncakeNormalizeOrderBookListings(book, 'asks'),
+                ownListingIds
+            );
+            const bids = mooncakeMarkOwnOrderBookListings(
+                mooncakeNormalizeOrderBookListings(book, 'bids'),
+                ownListingIds
+            );
             if (!asks.length && !bids.length) continue;
             const itemLevel = `${itemHrid}#${level}`;
             const signature = JSON.stringify([asks, bids]);
@@ -2200,6 +2350,7 @@
                 itemHrid,
                 level,
                 timestamp,
+                ownerCharacterId: mooncakeCharacterId == null ? '' : String(mooncakeCharacterId),
                 asks,
                 bids
             });
@@ -2317,14 +2468,23 @@
         return `${(numeric / 1024 / 1024).toFixed(2)} MB`;
     }
 
-    function mooncakeRenderOrderBookArchiveSide(title, rows, color) {
+    function mooncakeRenderOrderBookArchiveSide(title, rows, color, ownListingIds = new Set()) {
         const body = rows.length
             ? rows.map(row => {
                 const listingId = row?.listingId === undefined || row?.listingId === null || row?.listingId === ''
                     ? '-'
                     : String(row.listingId);
                 const listingIdHtml = mooncakeEscapeHtml(listingId);
-                return `<div style="display:grid;grid-template-columns:minmax(54px,.75fr) minmax(70px,1fr) minmax(76px,1.15fr);gap:6px;min-height:21px;padding:2px 0;border-bottom:1px solid rgba(255,255,255,.045);text-align:center;font-size:12px;line-height:17px;"><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(226,232,255,.78);font-variant-numeric:tabular-nums;">${mooncakeEscapeHtml(mooncakeFormatArchiveExactNumber(row.quantity))}</span><b style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${color};font-variant-numeric:tabular-nums;">${mooncakeEscapeHtml(mooncakeFormatArchiveExactNumber(row.price))}</b><span title="${listingIdHtml}" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(205,216,244,.68);font-variant-numeric:tabular-nums;">${listingIdHtml}</span></div>`;
+                const currentCharacterId = mooncakeCharacterId == null ? '' : String(mooncakeCharacterId);
+                const wasMineForCurrentCharacter = row?.isMine === true &&
+                    !!row?.ownerCharacterId &&
+                    !!currentCharacterId &&
+                    String(row.ownerCharacterId) === currentCharacterId;
+                const isMine = wasMineForCurrentCharacter || ownListingIds.has(mooncakeGetMarketListingIdKey(row?.listingId));
+                const mineTag = isMine
+                    ? `<span title="${isZH ? '我的挂单' : 'My listing'}" aria-label="${isZH ? '我的挂单' : 'My listing'}" style="display:inline-block;margin-right:3px;color:#ffd56e;font-size:12px;filter:drop-shadow(0 0 2px rgba(255,191,70,.48));vertical-align:1px;">🏷️</span>`
+                    : '';
+                return `<div style="display:grid;grid-template-columns:minmax(54px,.75fr) minmax(70px,1fr) minmax(76px,1.15fr);gap:6px;min-height:21px;padding:2px 0;border-bottom:1px solid rgba(255,255,255,.045);text-align:center;font-size:12px;line-height:17px;"><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(226,232,255,.78);font-variant-numeric:tabular-nums;">${mineTag}${mooncakeEscapeHtml(mooncakeFormatArchiveExactNumber(row.quantity))}</span><b style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${color};font-variant-numeric:tabular-nums;">${mooncakeEscapeHtml(mooncakeFormatArchiveExactNumber(row.price))}</b><span title="${listingIdHtml}" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(205,216,244,.68);font-variant-numeric:tabular-nums;">${listingIdHtml}</span></div>`;
             }).join('')
             : `<div style="padding:12px 0;text-align:center;color:rgba(220,226,240,.45);font-size:12px;">-</div>`;
         return `<section style="min-width:0;font-size:12px;"><div style="margin-bottom:2px;color:rgba(214,224,255,.82);font-size:12px;font-weight:800;text-align:center;line-height:18px;">${title}</div><div style="display:grid;grid-template-columns:minmax(54px,.75fr) minmax(70px,1fr) minmax(76px,1.15fr);gap:6px;padding:2px 0;border-bottom:1px solid rgba(125,151,219,.22);text-align:center;color:rgba(205,216,244,.58);font-size:10px;line-height:15px;"><span>${isZH ? '数量' : 'Quantity'}</span><span>${isZH ? '价格' : 'Price'}</span><span>${isZH ? '订单 ID' : 'Order ID'}</span></div>${body}</section>`;
@@ -2334,11 +2494,12 @@
         const detail = panel?.querySelector?.('[data-mooncake-order-archive-detail]');
         if (!detail || !row) return;
         const time = new Date(row.timestamp).toLocaleString();
+        const ownListingIds = mooncakeGetMyMarketListingIds();
         detail.innerHTML = `
-            <div style="display:flex;justify-content:space-between;gap:10px;margin-bottom:8px;color:rgba(222,231,255,.66);font-size:11px;"><span>${mooncakeEscapeHtml(time)}</span><span>${isZH ? '数量 / 价格 / 订单 ID' : 'Qty / Price / Order ID'}</span></div>
+            <div style="display:flex;justify-content:space-between;gap:10px;margin-bottom:8px;color:rgba(222,231,255,.66);font-size:11px;"><span>${mooncakeEscapeHtml(time)}</span><span>${isZH ? '🏷️ 我的挂单 · 数量 / 价格 / 订单 ID' : '🏷️ My listing · Qty / Price / Order ID'}</span></div>
             <div data-mooncake-order-archive-sides style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
-                ${mooncakeRenderOrderBookArchiveSide(isZH ? '卖单' : 'Asks', row.asks || [], '#ffd66f')}
-                ${mooncakeRenderOrderBookArchiveSide(isZH ? '买单' : 'Bids', row.bids || [], '#9ddfff')}
+                ${mooncakeRenderOrderBookArchiveSide(isZH ? '卖单' : 'Asks', row.asks || [], '#ffd66f', ownListingIds)}
+                ${mooncakeRenderOrderBookArchiveSide(isZH ? '买单' : 'Bids', row.bids || [], '#9ddfff', ownListingIds)}
             </div>`;
     }
 
@@ -3599,9 +3760,13 @@
             : quantity.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
     }
 
-    function mooncakeBuildCharmCraftingTooltipLines(itemHrid, marketData) {
+    function mooncakeBuildCharmCraftingTooltipLines(itemHrid, marketData, costContext = null) {
         if (!itemHrid || !mooncakeIsCharmTier(itemHrid)) return '';
-        const plan = mooncakeBuildCharmCraftingPlan(itemHrid, marketData);
+        const plan = mooncakeBuildCharmCraftingPlan(
+            itemHrid,
+            marketData,
+            costContext || mooncakeCreateBaseItemCostCraftingContext()
+        );
         const pureCost = Number(plan?.pureCost) || 0;
         if (!(pureCost > 0)) return '';
 
@@ -4021,12 +4186,14 @@
         }
     }
 
-    function mooncakeCalculateLevelZeroManufactureProfit(itemHrid, price, marketData) {
+    function mooncakeCalculateLevelZeroManufactureProfit(itemHrid, price, marketData, knownManufacturingCost) {
         const grossPrice = Number(price);
         if (!itemHrid || !(grossPrice > 0) || !marketData) return null;
         let manufacturingCost = 0;
         try {
-            manufacturingCost = Number(getCraftingCost(itemHrid, marketData));
+            manufacturingCost = knownManufacturingCost === undefined
+                ? Number(mooncakeGetConfiguredBaseItemCraftingCost(itemHrid, marketData))
+                : Number(knownManufacturingCost);
         } catch (err) {
             console.warn('[MoonCake] +0 manufacture-profit calculation failed:', itemHrid, err);
             return null;
@@ -4077,18 +4244,31 @@
         const quotePrice = Number(price);
         if (!itemHrid || !(quotePrice > 0) || !marketData) return null;
 
-        const manufacture = mooncakeCalculateLevelZeroManufactureProfit(itemHrid, quotePrice, marketData);
-        if (!manufacture) return null;
         const normalizedSide = side === 'buy' ? 'buy' : 'sell';
-        const purchaseSavings = manufacture.manufacturingCost - quotePrice;
+        const baseResolution = mooncakeResolveGenericBaseItemPrice(itemHrid, marketData);
+        const baseCost = Number(baseResolution?.price) || 0;
+        if (!(baseCost > 0)) return null;
+        const manufacture = normalizedSide === 'sell'
+            ? mooncakeCalculateLevelZeroManufactureProfit(
+                itemHrid,
+                quotePrice,
+                marketData,
+                baseResolution?.craftingCost
+            )
+            : null;
+        const purchaseSavings = baseCost - quotePrice;
 
         return {
             side: normalizedSide,
             quotePrice,
-            afterTaxRevenue: normalizedSide === 'sell' ? manufacture.afterTaxRevenue : null,
-            manufacturingCost: manufacture.manufacturingCost,
+            afterTaxRevenue: normalizedSide === 'sell' ? manufacture?.afterTaxRevenue ?? null : null,
+            // Keep the established field name for existing renderers, while
+            // making it the configurable +0 acquisition baseline.
+            manufacturingCost: baseCost,
+            baseItemSource: baseResolution?.source || null,
+            directManufacturingCost: manufacture?.manufacturingCost ?? null,
             purchaseSavings,
-            manufactureProfit: normalizedSide === 'sell' ? manufacture.profit : null,
+            manufactureProfit: normalizedSide === 'sell' ? manufacture?.profit ?? null : null,
             comparisonValue: purchaseSavings
         };
     }
@@ -4108,14 +4288,15 @@
             ? (isZH ? '收购报价:' : 'Buy bid:')
             : (isZH ? '出售报价:' : 'Sell quote:');
         const manufactureDetail = !isBuy && Number.isFinite(result.manufactureProfit)
-            ? `<span class="tt-label">${isZH ? `成交后（扣 ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% 市场税）` : `After ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% market tax`}:</span> <span class="tt-value">${formatMoney(result.afterTaxRevenue)}</span>\n`
+            ? `<span class="tt-label">${isZH ? '制造材料成本:' : 'Manufacturing material cost:'}</span> <span class="tt-value">${formatMoney(result.directManufacturingCost)}</span>\n`
+                + `<span class="tt-label">${isZH ? `成交后（扣 ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% 市场税）` : `After ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% market tax`}:</span> <span class="tt-value">${formatMoney(result.afterTaxRevenue)}</span>\n`
                 + `<span class="tt-label">${isZH ? '制造利润:' : 'Manufacturing profit:'}</span> <span class="tt-value" style="color:${manufactureProfitColor};font-weight:bold;">${mooncakeFormatSignedMoney(result.manufactureProfit)}</span>`
             : '';
         return `<div class="tt-header">${title}</div>`
             + `<span class="tt-label">${isZH ? '装备:' : 'Item:'}</span> <span class="tt-value">${getItemName(itemHrid) || itemHrid} +0</span>\n`
             + `<span class="tt-label">${quoteLabel}</span> <span class="tt-value">${formatMoney(result.quotePrice)}</span>\n`
-            + `<span class="tt-label">${isZH ? '制造成本:' : 'Craft cost:'}</span> <span class="tt-value">${formatMoney(result.manufacturingCost)}</span>\n`
-            + `<span class="tt-label">${isZH ? '计算口径:' : 'Basis:'}</span> <span class="tt-value">${isZH ? '制造成本 - 当前报价' : 'Craft cost - current quote'}</span>\n`
+            + `<span class="tt-label">${isZH ? '白板成本:' : 'Base-item cost:'}</span> <span class="tt-value">${formatMoney(result.manufacturingCost)}</span>\n`
+            + `<span class="tt-label">${isZH ? '计算口径:' : 'Basis:'}</span> <span class="tt-value">${isZH ? '白板成本 - 当前报价' : 'Base-item cost - current quote'}</span>\n`
             + `<span class="tt-label">${comparisonLabel}</span> <span class="tt-value" style="color:${comparisonColor};font-weight:bold;">${mooncakeFormatSignedMoney(result.purchaseSavings)}</span>\n`
             + manufactureDetail;
     }
@@ -4177,6 +4358,100 @@
         const ask = mooncakeGetMarketAskPrice(itemHRID, marketData);
         const bid = mooncakeGetMarketBidPrice(itemHRID, marketData);
         return side === 'bid' ? (bid || ask) : (ask || bid);
+    }
+
+    function mooncakeIsFixedBaseItemCostPrice(itemHrid) {
+        return itemHrid === '/items/coin' || itemHrid === '/items/coins' || mooncakeIsTraineeCharm(itemHrid);
+    }
+
+    function mooncakeGetBaseItemCostPolicyQuote(itemHrid, marketData, source) {
+        const normalizedSource = MOONCAKE_BASE_ITEM_COST_PRICE_SOURCE_KEYS.includes(source) ? source : null;
+        if (!normalizedSource) return 0;
+
+        // Coins and trainee charms already have an intentional fixed-cost
+        // model. They can use either concrete market side, but not an invented
+        // one-tick price above or below that fixed amount.
+        if (mooncakeIsFixedBaseItemCostPrice(itemHrid) &&
+            (normalizedSource === 'askMinusOne' || normalizedSource === 'bidPlusOne')) {
+            return 0;
+        }
+
+        const ask = mooncakeGetMarketAskPrice(itemHrid, marketData);
+        const bid = mooncakeGetMarketBidPrice(itemHrid, marketData);
+        if (normalizedSource === 'ask') return ask;
+        if (normalizedSource === 'bid') return bid;
+        if (normalizedSource === 'askMinusOne') {
+            if (!(ask > 0)) return 0;
+            const stepped = getPriceTier(ask, 'down');
+            return stepped > 0 && stepped < ask ? stepped : 0;
+        }
+        if (!(bid > 0)) return 0;
+        const stepped = getPriceTier(bid, 'up');
+        return stepped > bid ? stepped : 0;
+    }
+
+    function mooncakeResolveMarketQuoteByPolicy(itemHrid, marketData, sourceOrder) {
+        const orderedSources = mooncakeNormalizeBaseItemCostPriceSourceList(sourceOrder);
+        for (const source of orderedSources) {
+            const quote = mooncakeGetBaseItemCostPolicyQuote(itemHrid, marketData, source);
+            if (quote > 0) return quote;
+        }
+        return 0;
+    }
+
+    function mooncakeResolveCraftingContextMarketPrice(context, itemHrid, marketData, legacySide = 'market') {
+        // The charm planner's market-base/fixed-upgrade branches have a
+        // deliberate strict-left-one rule. Keep that existing special case;
+        // normal recipe inputs below are governed by the selected policy.
+        if (legacySide === 'ask') return mooncakeGetMarketAskPrice(itemHrid, marketData);
+        if (typeof context?.resolveMaterialMarketPrice === 'function') {
+            return context.resolveMaterialMarketPrice(itemHrid, marketData);
+        }
+        return getMarketPrice(itemHrid, marketData);
+    }
+
+    function mooncakeCreateBaseItemCostCraftingContext(policy = mooncakeGetBaseItemCostPricePolicy()) {
+        const materialSources = mooncakeNormalizeBaseItemCostPriceSourceList(policy?.material);
+        return {
+            memo: new Map(),
+            artisanMultiplier: mooncakeGetArtisanMaterialMultiplier(),
+            materialPriceSources: materialSources,
+            resolveMaterialMarketPrice: (itemHrid, marketData) =>
+                mooncakeResolveMarketQuoteByPolicy(itemHrid, marketData, materialSources)
+        };
+    }
+
+    function mooncakeGetConfiguredBaseItemCraftingCost(itemHrid, marketData, policy = mooncakeGetBaseItemCostPricePolicy()) {
+        const materialSources = mooncakeNormalizeBaseItemCostPriceSourceList(policy?.material);
+        if (!materialSources.length) return 0;
+        return getCraftingCost(
+            itemHrid,
+            marketData,
+            new Set(),
+            mooncakeCreateBaseItemCostCraftingContext({ ...policy, material: materialSources })
+        );
+    }
+
+    function mooncakeGetBaseItemCostResolutionCacheKey(itemHrid, policy) {
+        const artisanMultiplier = mooncakeGetArtisanMaterialMultiplier();
+        return [
+            mooncakeMarketPricingRevision,
+            mooncakeCharacterCalcSignature || 'live',
+            Number.isFinite(artisanMultiplier) ? artisanMultiplier.toFixed(12) : 'default',
+            policy.material.join(','),
+            policy.product.join(','),
+            itemHrid
+        ].join('|');
+    }
+
+    function mooncakeGetBaseItemCostResolutionCache(marketData) {
+        if (!marketData || (typeof marketData !== 'object' && typeof marketData !== 'function')) return null;
+        let cache = mooncakeBaseItemCostResolutionCaches.get(marketData);
+        if (!cache) {
+            cache = new Map();
+            mooncakeBaseItemCostResolutionCaches.set(marketData, cache);
+        }
+        return cache;
     }
 
     function mooncakeGetArtisanMaterialMultiplier() {
@@ -4335,9 +4610,9 @@
                         nextProcessedItems,
                         context
                     )
-                    : mooncakeGetMarketAskPrice(inputHrid, marketData);
+                    : mooncakeResolveCraftingContextMarketPrice(context, inputHrid, marketData, 'ask');
             } else {
-                const marketPrice = getMarketPrice(inputHrid, marketData);
+                const marketPrice = mooncakeResolveCraftingContextMarketPrice(context, inputHrid, marketData);
                 const needsCraftComparison = itemHrid.includes('_refined') || !(marketPrice > 0);
                 const craftingCost = needsCraftComparison
                     ? getCraftingCost(inputHrid, marketData, nextProcessedItems, context)
@@ -4431,7 +4706,7 @@
                     continue;
                 }
                 if (!mooncakeIsCraftableCharmTier(candidateHrid, context)) {
-                    const marketAsk = mooncakeGetMarketAskPrice(candidateHrid, marketData);
+                    const marketAsk = mooncakeResolveCraftingContextMarketPrice(context, candidateHrid, marketData, 'ask');
                     if (marketAsk > 0) {
                         marketBasePurchases.push({
                             itemHrid: candidateHrid,
@@ -4443,7 +4718,7 @@
                 }
                 const pureUnitCost = mooncakeGetPureCharmCraftCost(candidateHrid, marketData, new Set(), context);
                 pureCostsByHrid.set(candidateHrid, pureUnitCost);
-                const marketAsk = mooncakeGetMarketAskPrice(candidateHrid, marketData);
+                const marketAsk = mooncakeResolveCraftingContextMarketPrice(context, candidateHrid, marketData, 'ask');
                 if (marketAsk > 0 && pureUnitCost > 0 && marketAsk < pureUnitCost) {
                     candidates.push({
                         itemHrid: candidateHrid,
@@ -4535,13 +4810,13 @@
         const isFixedUpgradeItem = input?.isFixedUpgradeItem === true;
         const hasCraftingRecipe = mooncakeIsCraftableCharmTier(inputHrid, context);
         const isMarketBaseCharm = mooncakeIsMarketBaseCharm(inputHrid, context);
-        const marketAsk = mooncakeGetMarketAskPrice(inputHrid, marketData);
+        const marketAsk = mooncakeResolveCraftingContextMarketPrice(context, inputHrid, marketData, 'ask');
         const craftingCost = hasCraftingRecipe
             ? mooncakeGetPureCharmCraftCost(inputHrid, marketData, processedItems, context)
             : (isMarketBaseCharm
                 ? marketAsk
                 : (mooncakeIsTraineeCharm(inputHrid)
-                ? mooncakeGetMarketAskPrice(inputHrid, marketData)
+                ? marketAsk
                 : getCraftingCost(inputHrid, marketData, processedItems, context)));
         const plan = mooncakeIsCraftableCharmTier(itemHrid, context)
             ? mooncakeBuildCharmCraftingPlan(itemHrid, marketData, context)
@@ -4680,7 +4955,7 @@
                 if (charmUpgradeCost) {
                     price = charmUpgradeCost.price;
                 } else {
-                    const marketPrice = getMarketPrice(input.itemHrid, marketData);
+                    const marketPrice = mooncakeResolveCraftingContextMarketPrice(context, input.itemHrid, marketData);
                     const needsCraftComparison = itemHrid.includes('_refined') || !(marketPrice > 0);
                     const craftingCost = needsCraftComparison
                         ? getCraftingCost(input.itemHrid, marketData, nextProcessedItems, context)
@@ -9171,8 +9446,8 @@
         if (minProtectCost === Infinity) minProtectCost = 0;
 
         const marketRoot = marketData?.marketData?.[itemHrid];
-        // Whiteboard replacement cost may only come from crafting or the +0 ask.
-        // A bid is a liquidation quote, never an acquisition cost.
+        // Whiteboard replacement cost follows the configured material/product
+        // acquisition chains, then keeps the cheaper complete route.
         const baseResolution = mooncakeResolveGenericBaseItemPrice(itemHrid, marketData);
         const baseItemPrice = Number(baseResolution?.price) || 0;
         const baseItemSource = baseResolution?.source || null;
@@ -9352,18 +9627,37 @@
     }
 
     function mooncakeResolveGenericBaseItemPrice(itemHrid, marketData) {
-        const basePriceObject = marketData?.marketData?.[itemHrid]?.['0'];
-        const leftPrice = Number(basePriceObject?.a) || 0;
-        const craftingCost = getCraftingCost(itemHrid, marketData);
-
-        if (craftingCost > 0 && leftPrice > 0) {
-            return craftingCost < leftPrice
-                ? { price: craftingCost, source: 'craft' }
-                : { price: leftPrice, source: 'market' };
+        const policy = mooncakeGetBaseItemCostPricePolicy();
+        const cache = mooncakeGetBaseItemCostResolutionCache(marketData);
+        const cacheKey = cache ? mooncakeGetBaseItemCostResolutionCacheKey(itemHrid, policy) : '';
+        const cached = cache?.get(cacheKey);
+        if (cached) {
+            cache.delete(cacheKey);
+            cache.set(cacheKey, cached);
+            return cached;
         }
-        if (craftingCost > 0) return { price: craftingCost, source: 'craft' };
-        if (leftPrice > 0) return { price: leftPrice, source: 'market' };
-        return { price: 0, source: null };
+        const craftingCost = mooncakeGetConfiguredBaseItemCraftingCost(itemHrid, marketData, policy);
+        const productPrice = mooncakeResolveMarketQuoteByPolicy(itemHrid, marketData, policy.product);
+
+        // Only these two completed routes compete: material-route crafting and
+        // a +0 finished-product quote. Every route itself stops at the first
+        // enabled, available quote in its user-defined fallback order.
+        const resolution = craftingCost > 0 && productPrice > 0
+            ? (craftingCost < productPrice
+                ? { price: craftingCost, source: 'craft', craftingCost, productPrice }
+                : { price: productPrice, source: 'market', craftingCost, productPrice })
+            : (craftingCost > 0
+                ? { price: craftingCost, source: 'craft', craftingCost, productPrice }
+                : (productPrice > 0
+                    ? { price: productPrice, source: 'market', craftingCost, productPrice }
+                    : { price: 0, source: null, craftingCost, productPrice }));
+        if (cache) {
+            cache.set(cacheKey, resolution);
+            while (cache.size > MOONCAKE_BASE_ITEM_COST_RESOLUTION_CACHE_LIMIT) {
+                cache.delete(cache.keys().next().value);
+            }
+        }
+        return resolution;
     }
 
     function mooncakeResolveEnhancementStartItemPrice(itemHrid, startLevel, marketData) {
@@ -13264,7 +13558,39 @@
     }
 
     function mooncakeFormatMarketHistoryPrice(value) {
-        return Number(value) > 0 ? mooncakeFormatMarketPrice(value) : '-';
+        const price = Number(value);
+        if (!Number.isFinite(price) || price <= 0) return '-';
+
+        // Match the game's Marketplace formatter: exact integer prices below
+        // 100K, then truncated K/M/B/T values with its native precision.
+        const abs = Math.abs(price);
+        let display = price;
+        let unit = '';
+        if (abs < 100 * 1e3) {
+            display = Math.floor(abs);
+        } else if (abs < 10 * 1e6) {
+            display = price / 1e3;
+            unit = 'K';
+        } else if (abs < 10 * 1e9) {
+            display = price / 1e6;
+            unit = 'M';
+        } else if (abs < 10 * 1e12) {
+            display = price / 1e9;
+            unit = 'B';
+        } else if (abs <= 1e15) {
+            display = price / 1e12;
+            unit = 'T';
+        } else {
+            return 'Lots!';
+        }
+
+        if (unit) {
+            const scaledAbs = Math.abs(display);
+            const decimals = scaledAbs < 100 ? 2 : scaledAbs < 1e3 ? 1 : 0;
+            const factor = Math.pow(10, decimals);
+            display = Math.floor((scaledAbs + 1e-9) * factor) / factor;
+        }
+        return `${display}${unit}`;
     }
 
     function mooncakeFormatSignedCompactNumber(value) {
@@ -15628,10 +15954,18 @@
         return true;
     }
 
+    function mooncakeIsMarketplaceModalDescendant(node) {
+        // The compact marketplace is rendered in a MainPanel modal while the
+        // background marketplace can remain mounted and visible underneath it.
+        // Prefer this real top-layer content over the background panel.
+        return !!node?.closest?.('[class*="MainPanel_marketplaceModalContent"]');
+    }
+
     function mooncakeFindCurrentMarketItemNode() {
         const selectors = '.MarketplacePanel_currentItem__3ercC, [class*="MarketplacePanel_currentItem"]';
-        const candidates = Array.from(document.querySelectorAll(selectors));
-        return candidates.find(mooncakeIsCurrentMarketItemDetailNode) || null;
+        const candidates = Array.from(document.querySelectorAll(selectors))
+            .filter(mooncakeIsCurrentMarketItemDetailNode);
+        return candidates.find(mooncakeIsMarketplaceModalDescendant) || candidates[0] || null;
     }
 
     function mooncakeParseItemHridFromPanel(currentItemNode = null) {
@@ -15801,9 +16135,10 @@
     }
 
     function mooncakeFindMarketplacePanelStateNode() {
-        const panels = document.querySelectorAll('[class*="MarketplacePanel_marketplacePanel"], [class*="MarketplacePanel"]');
+        const panels = Array.from(document.querySelectorAll('[class*="MarketplacePanel_marketplacePanel"], [class*="MarketplacePanel"]'))
+            .filter(mooncakeIsVisibleElement)
+            .sort((left, right) => Number(mooncakeIsMarketplaceModalDescendant(right)) - Number(mooncakeIsMarketplaceModalDescendant(left)));
         for (const element of panels) {
-            if (!mooncakeIsVisibleElement(element)) continue;
             const fiberKey = mooncakeGetFiberKey(element);
             if (!fiberKey) continue;
             let fiber = element[fiberKey];
@@ -20351,12 +20686,10 @@
     }
 
     function mooncakeIsAllLevelsMarketView() {
-        const panels = document.querySelectorAll('[class*="MarketplacePanel_marketplacePanel"], [class*="MarketplacePanel"]');
-        for (const panel of panels) {
-            if (!mooncakeIsVisibleElement(panel)) continue;
-            if (panel.querySelector('[class*="MarketplacePanel_itemSummaryTable"]')) return true;
-        }
-        return false;
+        const panels = Array.from(document.querySelectorAll('[class*="MarketplacePanel_marketplacePanel"], [class*="MarketplacePanel"]'))
+            .filter(mooncakeIsVisibleElement);
+        const activePanel = panels.find(mooncakeIsMarketplaceModalDescendant) || panels[0] || null;
+        return !!activePanel?.querySelector('[class*="MarketplacePanel_itemSummaryTable"]');
     }
 
     async function mooncakeClickAllLevelsButton(expectedItemHrid = '') {
@@ -29090,11 +29423,11 @@
                     const basePriceObject = marketRoot?.["0"];
                     const leftPrice = basePriceObject?.a || 0;
                     const rightPrice = basePriceObject?.b || 0;
-                    const craftingCostContext = {
-                        memo: new Map(),
-                        artisanMultiplier: mooncakeGetArtisanMaterialMultiplier()
-                    };
-                    const craftingCost = getCraftingCost(itemHrid, marketData, new Set(), craftingCostContext);
+                    const baseCostPolicy = mooncakeGetBaseItemCostPricePolicy();
+                    const craftingCostContext = mooncakeCreateBaseItemCostCraftingContext(baseCostPolicy);
+                    const craftingCost = baseCostPolicy.material.length
+                        ? getCraftingCost(itemHrid, marketData, new Set(), craftingCostContext)
+                        : 0;
                     const basePriceResolution = mooncakeResolveGenericBaseItemPrice(itemHrid, marketData);
                     const baseItemPrice = Number(basePriceResolution?.price) || 0;
                     const baseItemSource = basePriceResolution?.source || null;
@@ -29126,7 +29459,11 @@
                             );
                             const marketPrice = charmUpgradeCost
                                 ? (Number(charmUpgradeCost.marketAsk) || 0)
-                                : getMarketPrice(input.itemHrid, marketData);
+                                : mooncakeResolveCraftingContextMarketPrice(
+                                    craftingCostContext,
+                                    input.itemHrid,
+                                    marketData
+                                );
                             const needsCraftComparison = !charmUpgradeCost &&
                                 (itemHrid.includes('_refined') || !(marketPrice > 0));
                             const craftingCost = charmUpgradeCost
@@ -29170,9 +29507,9 @@
                                         ? (isZH ? '市场底材' : 'Market base')
                                         : (usesCraftedInput ? (isZH ? '需自制' : 'Craft it') : '')));
                             const sourceTitle = usesCheapMarketIntermediate
-                                ? (isZH ? '左一价格低于自制成本：这一件固定升级材料已计为市场购买' : 'The lower ask price is used for this one fixed upgrade item.')
+                                ? (isZH ? '已选市场报价低于自制成本：这一件固定升级材料已计为市场购买' : 'The selected market quote is lower than craft cost for this fixed upgrade item.')
                                 : (usesMarketBaseCharm
-                                    ? (isZH ? '此护符没有制作配方，按左一价格作为必要市场底材计入' : 'This charm has no recipe and is priced from the current ask as a required market base.')
+                                    ? (isZH ? '此护符没有制作配方，按已选市场报价作为必要市场底材计入' : 'This charm has no recipe and uses the selected market quote as a required market base.')
                                     : (usesCraftedInput
                                         ? (isZH ? '此项按自制成本计算，需要自行制作' : 'This input is priced as self-crafted.')
                                         : ''));
@@ -31049,8 +31386,8 @@
             return isZH ? '工时费（每小时）' : 'Hourly wage';
         }
         const purchaseSavingTitle = isZH
-            ? '购买节省（制造成本 - 当前报价）'
-            : 'Purchase savings (craft cost - current quote)';
+            ? '购买节省（白板成本 - 当前报价）'
+            : 'Purchase savings (base-item cost - current quote)';
         return side === 'sell'
             ? (isZH ? `${purchaseSavingTitle}；制造利润见提示` : `${purchaseSavingTitle}; manufacturing profit in tooltip`)
             : purchaseSavingTitle;
@@ -31227,11 +31564,11 @@
         const hourlyWageHeaderTitle = isLevelZeroEconomics
             ? (normalizedSide === 'sell'
                 ? (isZH
-                    ? '+0 显示购买节省（制造成本 - 当前报价）；制造利润见提示'
-                    : '+0 shows purchase savings (craft cost - current quote); manufacturing profit is in the tooltip')
+                    ? '+0 显示购买节省（白板成本 - 当前报价）；制造利润见提示'
+                    : '+0 shows purchase savings (base-item cost - current quote); manufacturing profit is in the tooltip')
                 : (isZH
-                    ? '+0 显示购买节省（制造成本 - 当前报价）'
-                    : '+0 shows purchase savings (craft cost - current quote)'))
+                    ? '+0 显示购买节省（白板成本 - 当前报价）'
+                    : '+0 shows purchase savings (base-item cost - current quote)'))
             : (isZH ? '+1 及以上显示工时费' : '+1 and above: hourly wage');
         const renderGeneration = mooncakeBeginOrderBookRender(orderBookTable);
 
@@ -31669,8 +32006,8 @@
         const sellHourlyWageHeader = document.createElement('th');
         sellHourlyWageHeader.className = 'sell-hourly-wage-header';
         sellHourlyWageHeader.title = isZH
-            ? '+1 及以上显示工时费；+0 显示购买节省（制造成本 - 当前报价），制造利润见提示'
-            : '+1 and above: hourly wage; +0 shows purchase savings (craft cost - current quote), with manufacturing profit in the tooltip';
+            ? '+1 及以上显示工时费；+0 显示购买节省（白板成本 - 当前报价），制造利润见提示'
+            : '+1 and above: hourly wage; +0 shows purchase savings (base-item cost - current quote), with manufacturing profit in the tooltip';
         sellHourlyWageHeader.textContent = isZH ? '工时费' : 'Hourly Wage';
         sellHourlyWageHeader.style.cssText = 'padding: 8px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums;';
 
@@ -31678,8 +32015,8 @@
         const buyHourlyWageHeader = document.createElement('th');
         buyHourlyWageHeader.className = 'buy-hourly-wage-header';
         buyHourlyWageHeader.title = isZH
-            ? '+1 及以上显示工时费；+0 显示购买节省（制造成本 - 当前报价）'
-            : '+1 and above: hourly wage; +0 shows purchase savings (craft cost - current quote)';
+            ? '+1 及以上显示工时费；+0 显示购买节省（白板成本 - 当前报价）'
+            : '+1 and above: hourly wage; +0 shows purchase savings (base-item cost - current quote)';
         buyHourlyWageHeader.textContent = isZH ? '工时费' : 'Hourly Wage';
         buyHourlyWageHeader.style.cssText = 'padding: 8px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums;';
 
@@ -32067,7 +32404,7 @@
     // 添加全局函数查看制造成本
     window.getCraftingCost = function(itemHrid) {
         const marketData = getMarketData();
-        const cost = getCraftingCost(itemHrid, marketData);
+        const cost = mooncakeGetConfiguredBaseItemCraftingCost(itemHrid, marketData);
         return cost;
     };
 
@@ -32245,6 +32582,197 @@
         });
         control.append(input, unit);
         row.append(text, control);
+        return row;
+    }
+
+    const MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_ATTR = 'data-mooncake-base-item-cost-price-policy';
+    const MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_GROUP_ATTR = 'data-mooncake-base-item-cost-price-policy-group';
+    const MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_OPTIONS_ATTR = 'data-mooncake-base-item-cost-price-policy-options';
+    const MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_SOURCE_ATTR = 'data-mooncake-base-item-cost-price-policy-source';
+    let mooncakeBaseItemCostPricePolicyDragging = null;
+
+    function mooncakeGetBaseItemCostPriceSourceLabel(source) {
+        const zh = {
+            ask: '左价',
+            askMinusOne: '左价-1',
+            bidPlusOne: '右价+1',
+            bid: '右价'
+        };
+        const en = {
+            ask: 'Ask',
+            askMinusOne: 'Ask -1',
+            bidPlusOne: 'Bid +1',
+            bid: 'Bid'
+        };
+        return (isZH ? zh : en)[source] || source;
+    }
+
+    function mooncakeGetBaseItemCostPriceSourceHint(source) {
+        const zh = {
+            ask: '使用当前左一报价',
+            askMinusOne: '使用当前左一减一档的合法报价',
+            bidPlusOne: '使用当前右一加一档的合法报价',
+            bid: '使用当前右一报价'
+        };
+        const en = {
+            ask: 'Use the current best ask',
+            askMinusOne: 'Use one valid price tier below the best ask',
+            bidPlusOne: 'Use one valid price tier above the best bid',
+            bid: 'Use the current best bid'
+        };
+        return (isZH ? zh : en)[source] || '';
+    }
+
+    function mooncakeSyncBaseItemCostPricePolicyControls(panel = null) {
+        const root = panel || ui.configPanel || document.getElementById('better-loot-tracker-config-panel');
+        if (!root?.querySelectorAll) return;
+        const policy = mooncakeGetBaseItemCostPricePolicy();
+        root.querySelectorAll(`[${MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_GROUP_ATTR}]`).forEach(groupNode => {
+            const kind = groupNode.getAttribute(MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_GROUP_ATTR) === 'product'
+                ? 'product'
+                : 'material';
+            const activeSources = policy[kind];
+            const activeSet = new Set(activeSources);
+            const options = groupNode.querySelector(`[${MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_OPTIONS_ATTR}]`);
+            if (!options) return;
+            const buttonsBySource = new Map(
+                [...options.querySelectorAll(`[${MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_SOURCE_ATTR}]`)]
+                    .map(button => [button.getAttribute(MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_SOURCE_ATTR), button])
+            );
+            const displayOrder = [
+                ...activeSources,
+                ...MOONCAKE_BASE_ITEM_COST_PRICE_SOURCE_KEYS.filter(source => !activeSet.has(source))
+            ];
+            for (const source of displayOrder) {
+                const button = buttonsBySource.get(source);
+                if (!button) continue;
+                const active = activeSet.has(source);
+                button.setAttribute('aria-pressed', String(active));
+                button.draggable = active;
+                button.title = active
+                    ? `${mooncakeGetBaseItemCostPriceSourceHint(source)}${isZH ? '；可拖拽调整兜底顺序' : '; drag to reorder fallback priority'}`
+                    : mooncakeGetBaseItemCostPriceSourceHint(source);
+                options.appendChild(button);
+            }
+        });
+    }
+
+    function mooncakeToggleBaseItemCostPriceSource(kind, source) {
+        if (!MOONCAKE_BASE_ITEM_COST_PRICE_SOURCE_KEYS.includes(source)) return;
+        const activeSources = mooncakeGetBaseItemCostPriceSources(kind);
+        const nextSources = activeSources.includes(source)
+            ? activeSources.filter(candidate => candidate !== source)
+            : [...activeSources, source];
+        mooncakeSetBaseItemCostPriceSources(kind, nextSources);
+    }
+
+    function mooncakeReorderBaseItemCostPriceSource(kind, source, target, insertAfter = false) {
+        const current = mooncakeGetBaseItemCostPriceSources(kind);
+        if (!current.includes(source) || !current.includes(target) || source === target) return;
+        const next = current.filter(candidate => candidate !== source);
+        let targetIndex = next.indexOf(target);
+        if (targetIndex < 0) return;
+        if (insertAfter) targetIndex += 1;
+        next.splice(targetIndex, 0, source);
+        mooncakeSetBaseItemCostPriceSources(kind, next);
+    }
+
+    function mooncakeCreateBaseItemCostPricePolicyControl() {
+        const row = document.createElement('div');
+        row.setAttribute(MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_ATTR, '1');
+        row.setAttribute('role', 'group');
+        row.setAttribute('aria-label', isZH ? '白板成本报价策略' : 'Base item cost quote policy');
+
+        const title = document.createElement('strong');
+        title.setAttribute('data-mooncake-base-item-cost-price-policy-title', '1');
+        title.textContent = isZH ? '白板成本' : 'Base cost';
+        const formula = document.createElement('span');
+        formula.setAttribute('data-mooncake-base-item-cost-price-policy-formula', '1');
+        formula.textContent = 'min {';
+        const groups = document.createElement('div');
+        groups.setAttribute('data-mooncake-base-item-cost-price-policy-groups', '1');
+
+        for (const [kind, label] of [
+            ['material', isZH ? '自制' : 'Craft'],
+            ['product', isZH ? '现成' : 'Ready-made']
+        ]) {
+            const group = document.createElement('div');
+            group.setAttribute(MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_GROUP_ATTR, kind);
+            const groupLabel = document.createElement('span');
+            groupLabel.setAttribute('data-mooncake-base-item-cost-price-policy-group-label', '1');
+            groupLabel.textContent = label;
+            const options = document.createElement('div');
+            options.setAttribute(MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_OPTIONS_ATTR, '1');
+            for (const source of MOONCAKE_BASE_ITEM_COST_PRICE_SOURCE_KEYS) {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.textContent = mooncakeGetBaseItemCostPriceSourceLabel(source);
+                button.setAttribute(MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_SOURCE_ATTR, source);
+                button.setAttribute('aria-pressed', 'false');
+                button.addEventListener('click', event => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    mooncakeToggleBaseItemCostPriceSource(kind, source);
+                });
+                button.addEventListener('dragstart', event => {
+                    if (button.getAttribute('aria-pressed') !== 'true') {
+                        event.preventDefault();
+                        return;
+                    }
+                    mooncakeBaseItemCostPricePolicyDragging = { kind, source };
+                    button.setAttribute('data-mooncake-base-item-cost-price-policy-dragging', '1');
+                    if (event.dataTransfer) {
+                        event.dataTransfer.effectAllowed = 'move';
+                        event.dataTransfer.setData('text/plain', `${kind}:${source}`);
+                    }
+                });
+                button.addEventListener('dragover', event => {
+                    const dragging = mooncakeBaseItemCostPricePolicyDragging;
+                    if (!dragging || dragging.kind !== kind || dragging.source === source ||
+                        button.getAttribute('aria-pressed') !== 'true') return;
+                    event.preventDefault();
+                    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+                    button.setAttribute('data-mooncake-base-item-cost-price-policy-drop-target', '1');
+                });
+                button.addEventListener('dragleave', () => {
+                    button.removeAttribute('data-mooncake-base-item-cost-price-policy-drop-target');
+                });
+                button.addEventListener('drop', event => {
+                    const dragging = mooncakeBaseItemCostPricePolicyDragging;
+                    button.removeAttribute('data-mooncake-base-item-cost-price-policy-drop-target');
+                    if (!dragging || dragging.kind !== kind || dragging.source === source ||
+                        button.getAttribute('aria-pressed') !== 'true') return;
+                    event.preventDefault();
+                    const bounds = button.getBoundingClientRect();
+                    mooncakeReorderBaseItemCostPriceSource(
+                        kind,
+                        dragging.source,
+                        source,
+                        event.clientX > bounds.left + bounds.width / 2
+                    );
+                });
+                button.addEventListener('dragend', () => {
+                    mooncakeBaseItemCostPricePolicyDragging = null;
+                    row.querySelectorAll('[data-mooncake-base-item-cost-price-policy-dragging], [data-mooncake-base-item-cost-price-policy-drop-target]').forEach(node => {
+                        node.removeAttribute('data-mooncake-base-item-cost-price-policy-dragging');
+                        node.removeAttribute('data-mooncake-base-item-cost-price-policy-drop-target');
+                    });
+                });
+                options.appendChild(button);
+            }
+            group.append(groupLabel, options);
+            groups.appendChild(group);
+        }
+        const formulaEnd = document.createElement('span');
+        formulaEnd.setAttribute('data-mooncake-base-item-cost-price-policy-formula-end', '1');
+        formulaEnd.textContent = '}';
+        const note = document.createElement('small');
+        note.setAttribute('data-mooncake-base-item-cost-price-policy-note', '1');
+        note.textContent = isZH
+            ? '亮起即启用，按拖拽的顺序进行优先级，最终两条路径取最低'
+            : 'Enabled options follow drag order; the lower result from both paths wins.';
+        row.append(title, formula, groups, formulaEnd, note);
+        mooncakeSyncBaseItemCostPricePolicyControls(row);
         return row;
     }
 
@@ -32902,6 +33430,7 @@
         if (jumpLevel) jumpLevel.value = String(getMaterialEquipmentJumpLevel());
         const marketLevelJumpSequence = panel.querySelector('[data-mooncake-market-level-jump-sequence]');
         if (marketLevelJumpSequence) marketLevelJumpSequence.value = mooncakeGetMarketLevelJumpSequenceText();
+        mooncakeSyncBaseItemCostPricePolicyControls(panel);
         mooncakeSyncHourlyWageColorProfileControls(panel);
         const columns = mooncakeGetMarketHistoryMobileColumns();
         panel.querySelectorAll('[data-mooncake-history-mobile-column]').forEach(input => {
@@ -32957,6 +33486,19 @@
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-copy] strong { color:rgba(242,246,255,.96); font-size:13px; line-height:1.25; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-copy] small { color:rgba(220,228,248,.60); font-size:11px; line-height:1.36; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-control] { display:inline-flex; align-items:center; gap:8px; flex:0 0 auto; }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy] { min-width:0; display:grid; grid-template-columns:auto auto minmax(0,1fr) auto; align-items:center; gap:6px; min-height:58px; padding:7px 0; box-sizing:border-box; border-top:1px solid rgba(151,166,217,.10); }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-title] { color:rgba(242,246,255,.96); font-size:13px; font-weight:800; white-space:nowrap; }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-formula], #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-formula-end] { color:rgba(170,190,245,.82); font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:12px; font-weight:800; white-space:nowrap; }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-groups] { min-width:0; display:grid; gap:4px; }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-group] { min-width:0; display:grid; grid-template-columns:max-content minmax(0,1fr); align-items:center; gap:5px; }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-group-label] { color:rgba(209,220,247,.68); font-size:11px; font-weight:750; white-space:nowrap; }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-note] { grid-column:1 / -1; min-width:0; color:rgba(202,215,245,.60); font-size:10px; font-weight:650; line-height:1.35; overflow-wrap:anywhere; }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-options] { min-width:0; display:flex; flex-wrap:wrap; align-items:center; gap:4px; }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-source] { min-width:0; min-height:26px; box-sizing:border-box; cursor:pointer; border:1px solid rgba(142,158,202,.25); border-radius:4px; background:rgba(25,30,45,.72); color:rgba(198,209,235,.50); padding:3px 6px; font:inherit; font-size:11px; font-weight:800; line-height:1; white-space:nowrap; transition:background .12s ease,border-color .12s ease,color .12s ease,transform .12s ease; }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-source][aria-pressed="true"] { cursor:grab; border-color:rgba(127,154,245,.76); background:rgba(72,94,180,.86); color:#f4f7ff; box-shadow:0 0 0 1px rgba(109,138,239,.16) inset; }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-source][aria-pressed="true"]:active { cursor:grabbing; }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-source][data-mooncake-base-item-cost-price-policy-dragging="1"] { opacity:.46; transform:scale(.96); }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-source][data-mooncake-base-item-cost-price-policy-drop-target="1"] { border-color:#b7cafb; box-shadow:0 0 0 2px rgba(127,154,245,.28); }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-toggle-state] { color:rgba(219,228,250,.63); font-size:10px; font-weight:700; white-space:nowrap; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-toggle] { appearance:none; width:42px; height:24px; margin:0; border:1px solid rgba(190,199,226,.24); border-radius:999px; background:#5a6070; cursor:pointer; position:relative; transition:background .14s ease,border-color .14s ease; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-toggle]::after { content:''; position:absolute; width:18px; height:18px; left:2px; top:2px; border-radius:50%; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.36); transition:transform .14s ease; }
@@ -33107,8 +33649,18 @@
             }
             @media (min-width:1180px) {
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-dialog] { width:min(1220px,100%); }
-                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="settings"] { grid-template-columns:repeat(3,minmax(0,1fr)); grid-template-areas:"market listings chat" "enhance enhance enhance" "quote quote quote"; column-gap:18px; }
-                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-group="enhance"] [data-mooncake-enhancement-settings-rows] { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); column-gap:18px; }
+                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="settings"] { grid-template-columns:repeat(3,minmax(0,1fr)); grid-template-areas:"market listings chat" "market enhance enhance" "quote quote quote"; column-gap:18px; }
+                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-group="enhance"] [data-mooncake-enhancement-settings-rows] { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); grid-template-areas:"lazy inventory" "route protection" "buff style" "reminder reminder-level"; column-gap:18px; }
+                #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="lazy"] { grid-area:lazy; border-top:0; }
+                #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="inventory"] { grid-area:inventory; border-top:0; }
+                #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="route"] { grid-area:route; border-top:0; }
+                #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="protection"] { grid-area:protection; }
+                #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="buff"] { grid-area:buff; }
+                #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="style"] { grid-area:style; }
+                #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="reminder"] { grid-area:reminder; }
+                #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="reminder-level"] { grid-area:reminder-level; }
+                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-group="enhance"] [data-mooncake-enhancement-settings-row-control] { min-width:0; gap:6px; }
+                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-group="enhance"] [data-mooncake-enhancement-settings-command] { flex:0 0 78px; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-section] { padding:10px 0; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-section-heading] p { margin:3px 0 6px; line-height:1.32; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row] { min-height:40px; padding:5px 0; gap:8px; }
@@ -33340,6 +33892,7 @@
             marketHistoryRow,
             columnBlock,
             marketHourlyRow,
+            mooncakeCreateBaseItemCostPricePolicyControl(),
             mooncakeCreateEnhancementSettingsToggle('dungeon-token-listing-guide', isZH ? '地下城代币提示' : 'Dungeon token guide', isZH ? '收购挂牌时标记当前每代币买一最优的地下城兑换物。' : 'Mark dungeon redemptions that currently have the best bid value per token.'),
             mooncakeCreateEnhancementSettingsToggle('market-jump', isZH ? '快捷导航' : 'Quick navigation', isZH ? '显示等级与上下游入口。' : 'Show level and related-item shortcuts.'),
             marketLevelJumpSequenceRow,
@@ -33436,7 +33989,8 @@
 
         const enhance = mooncakeCreateEnhancementSettingsSection(isZH ? '强化' : 'Enhancement', isZH ? '方案、计算与界面辅助。' : 'Strategy, calculations, and interface helpers.');
         enhance.section.setAttribute('data-mooncake-enhancement-settings-group', 'enhance');
-        const lazyEnhancementRow = mooncakeCreateEnhancementSettingsToggle('lazy-enhancement', isZH ? '懒鬼按钮' : 'Lazy controls', isZH ? '保存多组方案，自动填入默认方案。' : 'Save multiple plans and auto-fill the default.');
+        const lazyEnhancementRow = mooncakeCreateEnhancementSettingsToggle('lazy-enhancement', isZH ? '懒鬼按钮' : 'Lazy controls', isZH ? '保存多组方案，自动填入默认方案。' : 'Save multiple plans and auto-fill the default.', '', 'div');
+        lazyEnhancementRow.setAttribute('data-mooncake-settings-enhance-row', 'lazy');
         const lazyEnhancementManagerRow = mooncakeCreateEnhancementSettingsCommand(
             isZH ? '方案管理' : 'Plan manager',
             isZH ? '查看收藏、设默认或删除组合。' : 'View saved plans, choose a default, or delete one.',
@@ -33446,13 +34000,19 @@
         const lazyEnhancementManagerButton = lazyEnhancementManagerRow.querySelector('[data-mooncake-lazy-enhancement-open-manager]');
         lazyEnhancementManagerButton?.setAttribute('data-mooncake-lazy-enhancement-manager-count', '1');
         lazyEnhancementManagerButton?.setAttribute('data-mooncake-lazy-enhancement-manager-label', isZH ? '管理' : 'Manage');
+        lazyEnhancementManagerButton?.setAttribute('aria-label', isZH ? '方案管理' : 'Plan manager');
+        lazyEnhancementManagerButton?.setAttribute('title', isZH ? '方案管理' : 'Plan manager');
         lazyEnhancementManagerButton?.addEventListener('click', event => {
             event.preventDefault();
             event.stopPropagation();
             mooncakeOpenLazyEnhancementSettingsManager(lazyEnhancementManagerButton, 'presets');
         });
+        const lazyEnhancementControl = lazyEnhancementRow.querySelector('[data-mooncake-enhancement-settings-row-control]');
+        if (lazyEnhancementControl && lazyEnhancementManagerButton) lazyEnhancementControl.appendChild(lazyEnhancementManagerButton);
         const protectionAssistantRow = mooncakeCreateEnhancementSettingsToggle('protection-assistant', isZH ? '保护助手' : 'Protection assistant', isZH ? '隐藏高风险保护选项。' : 'Hide risky protection options.');
-        const inventoryWarehouseRow = mooncakeCreateEnhancementSettingsToggle('inventory-warehouse', isZH ? '背包管理' : 'Inventory management', isZH ? '按用途整理强化背包。' : 'Organize enhancement inventory by use.');
+        protectionAssistantRow.setAttribute('data-mooncake-settings-enhance-row', 'protection');
+        const inventoryWarehouseRow = mooncakeCreateEnhancementSettingsToggle('inventory-warehouse', isZH ? '背包管理' : 'Inventory management', isZH ? '按用途整理强化背包。' : 'Organize enhancement inventory by use.', '', 'div');
+        inventoryWarehouseRow.setAttribute('data-mooncake-settings-enhance-row', 'inventory');
         const inventoryWarehouseManagerRow = mooncakeCreateEnhancementSettingsCommand(
             isZH ? '分区管理' : 'Section manager',
             isZH ? '创建、排序或隐藏背包分区。' : 'Create, order, or hide inventory sections.',
@@ -33460,6 +34020,8 @@
             isZH ? '管理' : 'Manage'
         );
         const inventoryWarehouseManagerButton = inventoryWarehouseManagerRow.querySelector('[data-mooncake-inventory-warehouse-open-manager]');
+        inventoryWarehouseManagerButton?.setAttribute('aria-label', isZH ? '分区管理' : 'Section manager');
+        inventoryWarehouseManagerButton?.setAttribute('title', isZH ? '分区管理' : 'Section manager');
         const refreshInventoryWarehouseManagerButton = () => {
             if (!inventoryWarehouseManagerButton) return;
             const count = mooncakeWarehouseEnsureState().categories.length;
@@ -33474,9 +34036,14 @@
                 onClose: refreshInventoryWarehouseManagerButton
             });
         });
+        const inventoryWarehouseControl = inventoryWarehouseRow.querySelector('[data-mooncake-enhancement-settings-row-control]');
+        if (inventoryWarehouseControl && inventoryWarehouseManagerButton) inventoryWarehouseControl.appendChild(inventoryWarehouseManagerButton);
         const communityBuffRow = mooncakeCreateEnhancementSettingsToggle('enhancing-community-buff', isZH ? '强化buff' : 'Enhancement buff', isZH ? '计入实时强化速度。' : 'Include the live enhancement-speed buff.');
+        communityBuffRow.setAttribute('data-mooncake-settings-enhance-row', 'buff');
         const enhancementLevelStyleRow = mooncakeCreateEnhancementSettingsToggle('enhancement-level-style', isZH ? '强化等级美化' : 'Enhancement level styling', isZH ? '按等级分级着色。' : 'Color enhancement levels by tier.');
+        enhancementLevelStyleRow.setAttribute('data-mooncake-settings-enhance-row', 'style');
         const enhancementStopReminderRow = mooncakeCreateEnhancementSettingsToggle('enhancement-stop-reminder', isZH ? '强化等级提醒' : 'Enhancement level alert', isZH ? '低于阈值时放大停止按钮。' : 'Enlarge the stop button below the threshold.');
+        enhancementStopReminderRow.setAttribute('data-mooncake-settings-enhance-row', 'reminder');
         const reminderLevelInput = document.createElement('input');
         reminderLevelInput.type = 'number';
         reminderLevelInput.min = '0';
@@ -33491,6 +34058,7 @@
         reminderLevelRow.setAttribute('data-mooncake-enhancement-settings-row', '1');
         reminderLevelRow.setAttribute('data-mooncake-enhancement-settings-row-kind', 'level-input');
         reminderLevelRow.setAttribute('data-mooncake-enhancement-stop-dependent', '1');
+        reminderLevelRow.setAttribute('data-mooncake-settings-enhance-row', 'reminder-level');
         const reminderLevelCopy = document.createElement('span');
         reminderLevelCopy.setAttribute('data-mooncake-enhancement-settings-row-copy', '1');
         const reminderLevelTitle = document.createElement('strong');
@@ -33546,14 +34114,13 @@
             route
         );
         routeRow.title = routeTitle;
+        routeRow.setAttribute('data-mooncake-settings-enhance-row', 'route');
         enhance.rows.append(
             lazyEnhancementRow,
-            lazyEnhancementManagerRow,
-            protectionAssistantRow,
             inventoryWarehouseRow,
-            inventoryWarehouseManagerRow,
-            communityBuffRow,
             routeRow,
+            protectionAssistantRow,
+            communityBuffRow,
             enhancementLevelStyleRow,
             enhancementStopReminderRow,
             reminderLevelRow
