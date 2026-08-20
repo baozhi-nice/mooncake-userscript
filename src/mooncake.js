@@ -28906,13 +28906,6 @@
         const enhancementRouteObjectiveTitle = isZH
             ? '强化路线选择会同步影响包子页签、市场挂单和聊天工时费。最高工时与最高利润分别按纯期望工时费和单件利润选择；综合策略会比较两个不同的保护等级，当其中一条路线的单件利润或工时费任一高出另一条至少 25% 时采用该路线。'
             : 'This route objective is shared by the enhancement tab, marketplace listings, and chat hourly wage. Highest hourly and highest profit remain pure objectives; balanced compares two different protection levels and uses a route only when either profit/item or hourly is at least 25% higher than the other.';
-        const hourlyWageColorProfile = mooncakeGetHourlyWageColorProfile();
-        const hourlyWageColorLegend = MOONCAKE_HOURLY_WAGE_TIER_KEYS.map(key =>
-            `<span style="color:${hourlyWageColorProfile.colors[key]};font-weight:bold;">●</span> ${mooncakeGetHourlyWageColorProfileTierLabel(key)}`
-        ).join(' &nbsp; ');
-        const hourlyWageThresholdLegend = hourlyWageColorProfile.thresholdsM
-            .map(value => `${mooncakeFormatHourlyWageColorProfileM(value)}M`)
-            .join(' / ');
         const contentHTML = `
             <div style="color: var(--color-text-dark-mode); padding: 10px;">
                 <div data-mooncake-enhancement-toolbar="1" style="display:flex;justify-content:flex-end;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px;">
@@ -29239,6 +29232,13 @@
                 }
             }
 
+        const hourlyWageColorProfile = mooncakeGetHourlyWageColorProfile();
+        const hourlyWageColorLegend = MOONCAKE_HOURLY_WAGE_TIER_KEYS.map(key =>
+            `<span style="color:${hourlyWageColorProfile.colors[key]};font-weight:bold;">●</span> ${mooncakeGetHourlyWageColorProfileTierLabel(key)}`
+        ).join(' &nbsp; ');
+        const hourlyWageThresholdLegend = hourlyWageColorProfile.thresholdsM
+            .map(value => `${mooncakeFormatHourlyWageColorProfileM(value)}M`)
+            .join(' / ');
         const contentHTML = `
             <div style="display: flex; flex-direction: column; gap: 10px;">
                 <div id="mooncake-item-title-container" style="padding: 8px; background: var(--color-midnight-700); border-radius: 4px; text-align: center; cursor: pointer;" title="${isZH ? '点击刷新数据' : 'Click to refresh data'}">
