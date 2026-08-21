@@ -16211,7 +16211,10 @@
 
         // 捕获阶段的事件委托能覆盖 React 重绘后的背包格子，也不会作用到市场、掉落记录等其他物品节点。
         document.addEventListener('contextmenu', event => {
-            if (mooncakeWarehouseHasSunnyConflict()) return;
+            if (mooncakeWarehouseHasSunnyConflict()) {
+                if (mooncakeIsEnhancementInventoryWarehouseEnabled()) mooncakeWarehouseSuspendForSunnyConflict();
+                return;
+            }
             const target = event.target;
             const container = target?.closest?.('[class*="Item_itemContainer"]');
             if (!container || !container.closest('[class*="Inventory_items"]')) return;
@@ -16265,6 +16268,14 @@
         'pointer-events', 'transform', 'transition', 'visibility'
     ];
     const MOONCAKE_WAREHOUSE_ROOT_STYLE_PROPS = ['position', 'padding-top'];
+    const MOONCAKE_WAREHOUSE_SUNNY_CONFLICT_SELECTOR = [
+        '#sunnyMwi-fav-bar',
+        '#sunnyMwi-fav-wrap',
+        '#sunnyMwi-fav-viewport',
+        '#sunnyMwi-fav-pinned-style',
+        '[data-sunnymwi-fav-pinned]',
+        '[data-sunnymwi-fav-surface]'
+    ].join(', ');
 
     let mooncakeWarehouseState = null;
     let mooncakeWarehouseLoadedCharacterId = null;
@@ -16274,6 +16285,7 @@
     let mooncakeWarehouseRootStyleSnapshot = null;
     let mooncakeWarehousePinnedNodes = new Set();
     const mooncakeWarehouseNodeStyleSnapshots = new WeakMap();
+    const mooncakeWarehouseOwnedInlineStyles = new WeakMap();
     let mooncakeWarehouseMutationUnsubscribe = null;
     let mooncakeWarehouseMenuTarget = null;
     let mooncakeWarehouseMenuSequence = 0;
@@ -16283,6 +16295,10 @@
     let mooncakeWarehouseObservedWidth = null;
     let mooncakeWarehouseObservedRootVisible = false;
     let mooncakeWarehouseSunnyConflictNotified = false;
+    // Sunny can briefly remove its inventory markers while reconciling. Once its
+    // favorites layout appears, do not let both plugins reclaim the same nodes.
+    let mooncakeWarehouseSunnyConflictLatched = false;
+    let mooncakeWarehouseSunnyConflictSuspended = false;
     let mooncakeWarehouseActiveDialogClose = null;
     let mooncakeWarehouseDialogSequence = 0;
     let mooncakeWarehousePanel = null;
@@ -16979,7 +16995,25 @@
     }
 
     function mooncakeWarehouseHasSunnyConflict() {
-        return !!document.querySelector('#sunnyMwi-fav-bar, .sunnyMwi-fav-wrap, [data-sunnymwi-fav-pinned]');
+        if (mooncakeWarehouseSunnyConflictLatched) return true;
+        if (!document.querySelector(MOONCAKE_WAREHOUSE_SUNNY_CONFLICT_SELECTOR)) return false;
+        mooncakeWarehouseSunnyConflictLatched = true;
+        return true;
+    }
+
+    function mooncakeWarehouseMutationsIntroduceSunnyConflict(mutations) {
+        if (mooncakeWarehouseSunnyConflictLatched) return false;
+        for (const mutation of mutations) {
+            for (const node of mutation.addedNodes) {
+                if (!(node instanceof Element)) continue;
+                if (node.matches?.(MOONCAKE_WAREHOUSE_SUNNY_CONFLICT_SELECTOR) ||
+                    node.querySelector?.(MOONCAKE_WAREHOUSE_SUNNY_CONFLICT_SELECTOR)) {
+                    mooncakeWarehouseSunnyConflictLatched = true;
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     function mooncakeWarehouseShowSunnyConflictNotice() {
@@ -17006,19 +17040,40 @@
 
     function mooncakeWarehouseRestoreInlineStyles(element, snapshot) {
         if (!element || !snapshot) return;
+        const ownedStyles = mooncakeWarehouseOwnedInlineStyles.get(element);
+        if (!ownedStyles) return;
         for (const [property, state] of Object.entries(snapshot)) {
+            const owned = ownedStyles.get(property);
+            if (!owned) continue;
+            const currentValue = element.style.getPropertyValue(property);
+            const currentPriority = element.style.getPropertyPriority(property);
+            // Another plugin may have taken ownership after Mooncake rendered.
+            // Restore only values that are still exactly the ones Mooncake wrote.
+            if (currentValue !== owned.value || currentPriority !== owned.priority) {
+                ownedStyles.delete(property);
+                continue;
+            }
             if (state?.value) element.style.setProperty(property, state.value, state.priority || '');
             else element.style.removeProperty(property);
+            ownedStyles.delete(property);
         }
+        if (!ownedStyles.size) mooncakeWarehouseOwnedInlineStyles.delete(element);
     }
 
     function mooncakeWarehouseSetInlineStyle(element, property, value, priority = '') {
         if (!element) return;
         const nextValue = String(value ?? '');
+        const nextPriority = String(priority || '');
         if (element.style.getPropertyValue(property) === nextValue &&
-            element.style.getPropertyPriority(property) === priority) return;
-        if (nextValue) element.style.setProperty(property, nextValue, priority);
+            element.style.getPropertyPriority(property) === nextPriority) return;
+        if (nextValue) element.style.setProperty(property, nextValue, nextPriority);
         else element.style.removeProperty(property);
+        let ownedStyles = mooncakeWarehouseOwnedInlineStyles.get(element);
+        if (!ownedStyles) {
+            ownedStyles = new Map();
+            mooncakeWarehouseOwnedInlineStyles.set(element, ownedStyles);
+        }
+        ownedStyles.set(property, { value: nextValue, priority: nextPriority });
     }
 
     function mooncakeWarehouseRestorePinnedNode(node) {
@@ -17045,6 +17100,23 @@
         mooncakeWarehouseLayoutSignature = '';
         mooncakeWarehouseLayoutMetrics = null;
         mooncakeWarehouseGeometryDirty = true;
+    }
+
+    function mooncakeWarehouseSuspendForSunnyConflict() {
+        mooncakeWarehouseSunnyConflictLatched = true;
+        if (mooncakeWarehouseSunnyConflictSuspended) return;
+        mooncakeWarehouseSunnyConflictSuspended = true;
+        mooncakeWarehousePendingVisibleRender = false;
+        mooncakeWarehouseMenuTarget = null;
+        mooncakeWarehouseMenuSequence += 1;
+        if (mooncakeWarehouseRenderTimer) clearTimeout(mooncakeWarehouseRenderTimer);
+        if (mooncakeWarehouseRenderFrame) cancelAnimationFrame(mooncakeWarehouseRenderFrame);
+        mooncakeWarehouseRenderTimer = 0;
+        mooncakeWarehouseRenderFrame = 0;
+        document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_MENU_ATTR}]`).forEach(element => element.remove());
+        mooncakeWarehouseRestorePresentation();
+        mooncakeWarehouseStopObservingInventoryRoot();
+        mooncakeWarehouseShowSunnyConflictNotice();
     }
 
     function mooncakeWarehouseStopObservingInventoryRoot() {
@@ -17676,6 +17748,10 @@
             mooncakeWarehouseStopObservingInventoryRoot();
             return;
         }
+        if (mooncakeWarehouseHasSunnyConflict()) {
+            mooncakeWarehouseSuspendForSunnyConflict();
+            return;
+        }
         try {
             const root = mooncakeWarehouseFindInventoryRoot();
             if (!root) {
@@ -17694,12 +17770,6 @@
                 return;
             }
             mooncakeWarehousePendingVisibleRender = false;
-            if (mooncakeWarehouseHasSunnyConflict()) {
-                mooncakeWarehouseRestorePresentation();
-                mooncakeWarehouseStopObservingInventoryRoot();
-                mooncakeWarehouseShowSunnyConflictNotice();
-                return;
-            }
             mooncakeWarehouseSunnyConflictNotified = false;
 
             // Only a root replacement or real responsive-width change needs a
@@ -17735,6 +17805,10 @@
             if (mooncakeWarehouseRenderFrame) cancelAnimationFrame(mooncakeWarehouseRenderFrame);
             mooncakeWarehouseRenderTimer = 0;
             mooncakeWarehouseRenderFrame = 0;
+            return;
+        }
+        if (mooncakeWarehouseSunnyConflictLatched) {
+            mooncakeWarehouseSuspendForSunnyConflict();
             return;
         }
         if (reason === 'inventory-dom') mooncakeWarehouseGeometryDirty = true;
@@ -18348,7 +18422,7 @@
     }
 
     function mooncakeWarehouseInjectActionMenu(target) {
-        if (!mooncakeIsEnhancementInventoryWarehouseEnabled()) return;
+        if (!mooncakeIsEnhancementInventoryWarehouseEnabled() || mooncakeWarehouseSunnyConflictLatched) return;
         if (target !== mooncakeWarehouseMenuTarget) return;
         const menu = mooncakeWarehouseFindActionMenuForTarget(target);
         if (!menu) return;
@@ -18377,7 +18451,7 @@
     }
 
     function mooncakeWarehouseTrackItemMenu(event) {
-        if (!mooncakeIsEnhancementInventoryWarehouseEnabled()) return;
+        if (!mooncakeIsEnhancementInventoryWarehouseEnabled() || mooncakeWarehouseSunnyConflictLatched) return;
         if (!event.isTrusted || event.button !== 0 || event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) return;
         const container = event.target?.closest?.('[class*="Item_itemContainer"]');
         if (!container || !container.closest('[class*="Inventory_items"]')) return;
@@ -18428,6 +18502,11 @@
         });
         mooncakeWarehouseMutationUnsubscribe = subscribeDocumentMutations('mooncake-inventory-warehouse', mutations => {
             if (!mooncakeIsEnhancementInventoryWarehouseEnabled()) return;
+            if (mooncakeWarehouseSunnyConflictLatched) return;
+            if (mooncakeWarehouseMutationsIntroduceSunnyConflict(mutations)) {
+                mooncakeWarehouseSuspendForSunnyConflict();
+                return;
+            }
             if (document.hidden) {
                 mooncakeWarehousePendingVisibleRender = true;
                 mooncakeWarehouseGeometryDirty = true;
