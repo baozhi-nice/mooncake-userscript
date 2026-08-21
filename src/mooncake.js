@@ -425,6 +425,8 @@
             : null,
         features: {
             marketHourlyWage: true,
+            marketListingAge: true,
+            marketListingAgeUpload: true,
             enhancementInventoryWarehouse: true,
             lazyEnhancement: true,
             chatLabor: true,
@@ -1442,6 +1444,44 @@
         return config.features?.marketHourlyWage !== false;
     }
 
+    function mooncakeIsMarketListingAgeEnabled() {
+        return config.features?.marketListingAge !== false;
+    }
+
+    function mooncakeIsMarketListingAgeUploadEnabled() {
+        if (config.features?.marketListingAgeUpload === false) return false;
+        try {
+            const stored = JSON.parse(localStorage.getItem(CONFIG_KEY) || 'null');
+            return stored?.features?.marketListingAgeUpload !== false;
+        } catch (_) {
+            return true;
+        }
+    }
+
+    function mooncakeSetMarketListingAgeEnabled(value) {
+        if (!config.features) config.features = {};
+        config.features.marketListingAge = value !== false;
+        saveConfig();
+        if (config.features.marketListingAge) {
+            mooncakeTouchListingTimeMarket();
+            scheduleMarketplaceOrderBookHourlyWageRefresh();
+        } else {
+            mooncakeClearMarketListingAge();
+        }
+    }
+
+    function mooncakeSetMarketListingAgeUploadEnabled(value) {
+        if (!config.features) config.features = {};
+        config.features.marketListingAgeUpload = value !== false;
+        saveConfig();
+        if (config.features.marketListingAgeUpload) {
+            mooncakeTouchListingTimeMarket();
+            if (mooncakeListingTimeMarketTouched) mooncakeScheduleListingTimeUpload(2000, 7000);
+        } else {
+            mooncakeCancelListingTimeUploadTimer();
+        }
+    }
+
     function mooncakeIsDungeonTokenListingGuideEnabled() {
         return config.features?.dungeonTokenListingGuide !== false;
     }
@@ -2040,6 +2080,1056 @@
         const level = Number(enhancementLevel);
         if (!itemHrid || !Number.isInteger(level)) return null;
         return mooncakeMyListingsLiveOrderBookCache.get(itemHrid)?.levels?.get(level) || null;
+    }
+
+    const MOONCAKE_LISTING_TIME_API_URL = 'https://gitee.com/api/v5/repos/baozhibaozhi/mooncake-data/contents/listing-time-anchors-v1.json?ref=master';
+    // Use a dedicated Gitee account whose repository access is limited to
+    // mooncake-data; every userscript user can inspect this client-side token.
+    const MOONCAKE_LISTING_TIME_GITEE_TOKEN = 'f3b333fee9643e25cc81c09a8e8cf229';
+    const MOONCAKE_LISTING_TIME_DB_NAME = 'MooncakeListingTime';
+    const MOONCAKE_LISTING_TIME_DB_STORE = 'state';
+    const MOONCAKE_LISTING_TIME_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+    const MOONCAKE_LISTING_TIME_ACCEPT_AGE_MS = 35 * 24 * 60 * 60 * 1000;
+    const MOONCAKE_LISTING_TIME_CACHE_TTL_MS = 30 * 60 * 1000;
+    const MOONCAKE_LISTING_TIME_MAINTENANCE_INTERVAL_MS = 12 * 60 * 60 * 1000;
+    const MOONCAKE_LISTING_TIME_ACCURACY_WINDOW_MS = 12 * 60 * 60 * 1000;
+    const MOONCAKE_LISTING_TIME_FUTURE_TOLERANCE_MS = 24 * 60 * 60 * 1000;
+    const MOONCAKE_LISTING_TIME_MAX_ANCHORS = 120000;
+    const MOONCAKE_LISTING_TIME_MAX_BASE64_CHARS = 8 * 1024 * 1024;
+    const MOONCAKE_LISTING_TIME_NODE_SELECTOR = '.mooncake-listing-age-cell:not(.mooncake-listing-age-separator), .mooncake-market-inline-listing-age';
+    const MOONCAKE_LISTING_TIME_LOCK_NAME = 'mooncake-listing-time-upload-v1';
+    const MOONCAKE_LISTING_TIME_LEASE_KEY = 'Mooncake_listingTimeUploadLease_v1';
+    const mooncakeListingTimePending = new Map();
+    const mooncakeListingTimeEstimateCache = new Map();
+    let mooncakeListingTimeRemote = { anchors: [], sha: '', updatedAtMs: 0, fetchedAt: 0 };
+    let mooncakeListingTimeAnchors = [];
+    let mooncakeListingTimeRevision = 0;
+    let mooncakeListingTimeDbPromise = null;
+    let mooncakeListingTimeDbUnavailable = false;
+    let mooncakeListingTimeReadyPromise = null;
+    let mooncakeListingTimeRequest = null;
+    let mooncakeListingTimeUploadPromise = null;
+    let mooncakeListingTimeUploadTimer = 0;
+    let mooncakeListingTimeUploadDueAt = 0;
+    let mooncakeListingTimeMinuteTimer = 0;
+    let mooncakeListingTimeLastMaintenanceAt = 0;
+    let mooncakeListingTimeUploadBlockedUntil = 0;
+    let mooncakeListingTimeUploadFailureCount = 0;
+    let mooncakeListingTimeMarketTouched = false;
+    let mooncakeListingTimeStarted = false;
+    let mooncakeListingTimeChannel = null;
+    let mooncakeListingTimePendingWrite = Promise.resolve(true);
+    let mooncakeListingAgeTooltip = null;
+    let mooncakeListingAgeTooltipTarget = null;
+    let mooncakeListingAgeTooltipListenersBound = false;
+
+    function mooncakeCancelListingTimeUploadTimer() {
+        if (!mooncakeListingTimeUploadTimer) return;
+        clearTimeout(mooncakeListingTimeUploadTimer);
+        mooncakeListingTimeUploadTimer = 0;
+        mooncakeListingTimeUploadDueAt = 0;
+    }
+
+    function mooncakeQueueListingTimePendingWrite(upsert = [], remove = []) {
+        const nextUpsert = upsert.map(entry => [...entry]);
+        const nextRemove = [...remove];
+        const operation = mooncakeListingTimePendingWrite
+            .catch(() => false)
+            .then(() => mooncakePersistListingTimePending(nextUpsert, nextRemove));
+        mooncakeListingTimePendingWrite = operation;
+        return operation;
+    }
+
+    function mooncakeNormalizeListingTimeId(value) {
+        const text = String(value ?? '').trim();
+        return /^[1-9]\d{0,23}$/.test(text) ? text : '';
+    }
+
+    function mooncakeCompareListingTimeIds(left, right) {
+        if (left.length !== right.length) return left.length - right.length;
+        return left === right ? 0 : (left < right ? -1 : 1);
+    }
+
+    function mooncakeNormalizeListingTimeTimestamp(value, now = Date.now()) {
+        const text = String(value ?? '').trim();
+        const timestamp = typeof value === 'number'
+            ? value
+            : (/^\d{12,16}$/.test(text) ? Number(text) : Date.parse(text));
+        if (!Number.isFinite(timestamp)) return 0;
+        const normalized = Math.trunc(timestamp);
+        if (!Number.isSafeInteger(normalized) || normalized < now - MOONCAKE_LISTING_TIME_ACCEPT_AGE_MS ||
+            normalized > now + MOONCAKE_LISTING_TIME_FUTURE_TOLERANCE_MS) return 0;
+        return normalized;
+    }
+
+    function mooncakeNormalizeListingTimeAnchors(value) {
+        if (!Array.isArray(value) || value.length > MOONCAKE_LISTING_TIME_MAX_ANCHORS) return null;
+        const unique = new Map();
+        for (const entry of value) {
+            if (!Array.isArray(entry) || entry.length !== 2) return null;
+            const id = mooncakeNormalizeListingTimeId(entry[0]);
+            const timestamp = Number(entry[1]);
+            if (!id || !Number.isSafeInteger(timestamp) || timestamp <= 0) return null;
+            const previous = unique.get(id);
+            if (previous !== undefined && previous !== timestamp) return null;
+            unique.set(id, timestamp);
+        }
+        const anchors = [...unique.entries()].sort((left, right) => mooncakeCompareListingTimeIds(left[0], right[0]));
+        for (let index = 1; index < anchors.length; index += 1) {
+            if (anchors[index][1] < anchors[index - 1][1]) return null;
+        }
+        return anchors;
+    }
+
+    function mooncakeNormalizeListingTimePendingEntries(value) {
+        if (!Array.isArray(value)) return [];
+        const unique = new Map();
+        const conflicted = new Set();
+        value.slice(0, MOONCAKE_LISTING_TIME_MAX_ANCHORS).forEach(entry => {
+            if (!Array.isArray(entry) || entry.length !== 2) return;
+            const id = mooncakeNormalizeListingTimeId(entry[0]);
+            const timestamp = Number(entry[1]);
+            if (!id || !Number.isSafeInteger(timestamp) || timestamp <= 0 ||
+                timestamp > Date.now() + MOONCAKE_LISTING_TIME_FUTURE_TOLERANCE_MS || conflicted.has(id)) return;
+            const previous = unique.get(id);
+            if (previous !== undefined && previous !== timestamp) {
+                unique.delete(id);
+                conflicted.add(id);
+                return;
+            }
+            unique.set(id, timestamp);
+        });
+        return [...unique.entries()].sort((left, right) => mooncakeCompareListingTimeIds(left[0], right[0]));
+    }
+
+    function mooncakeFindListingTimeAnchorIndex(anchors, id) {
+        let low = 0;
+        let high = anchors.length;
+        while (low < high) {
+            const middle = (low + high) >> 1;
+            if (mooncakeCompareListingTimeIds(anchors[middle][0], id) < 0) low = middle + 1;
+            else high = middle;
+        }
+        return low;
+    }
+
+    function mooncakeCanInsertListingTimeAnchor(anchors, index, timestamp) {
+        return (index === 0 || anchors[index - 1][1] <= timestamp) &&
+            (index === anchors.length || timestamp <= anchors[index][1]);
+    }
+
+    function mooncakeRebuildListingTimeAnchors() {
+        const anchors = mooncakeListingTimeRemote.anchors.map(anchor => [...anchor]);
+        const remoteIds = new Set(anchors.map(anchor => anchor[0]));
+        const pending = [...mooncakeListingTimePending.entries()]
+            .filter(([id]) => !remoteIds.has(id))
+            .sort((left, right) => mooncakeCompareListingTimeIds(left[0], right[0]));
+        for (const anchor of pending) {
+            const index = mooncakeFindListingTimeAnchorIndex(anchors, anchor[0]);
+            if (mooncakeCanInsertListingTimeAnchor(anchors, index, anchor[1])) anchors.splice(index, 0, anchor);
+        }
+        mooncakeListingTimeAnchors = anchors;
+        mooncakeListingTimeRevision += 1;
+        mooncakeListingTimeEstimateCache.clear();
+    }
+
+    function mooncakeEstimateListingCreatedAt(value) {
+        const id = mooncakeNormalizeListingTimeId(value);
+        if (!id || !mooncakeListingTimeAnchors.length) return null;
+        const cached = mooncakeListingTimeEstimateCache.get(id);
+        if (cached?.revision === mooncakeListingTimeRevision) return cached.result;
+        const anchors = mooncakeListingTimeAnchors;
+        const index = mooncakeFindListingTimeAnchorIndex(anchors, id);
+        let result = null;
+        if (index < anchors.length && anchors[index][0] === id) {
+            result = { createdAtMs: anchors[index][1], quality: 'exact', accuracy: 1 };
+        } else if (index === 0) {
+            result = { createdAtMs: anchors[0][1], quality: 'lower', accuracy: 0 };
+        } else if (index === anchors.length) {
+            result = { createdAtMs: anchors.at(-1)[1], quality: 'upper', accuracy: 0 };
+        } else {
+            const left = anchors[index - 1];
+            const right = anchors[index];
+            const offset = BigInt(id) - BigInt(left[0]);
+            const span = BigInt(right[0]) - BigInt(left[0]);
+            const numericOffset = Number(offset);
+            const numericSpan = Number(span);
+            if (numericSpan > 0 && Number.isSafeInteger(numericOffset) && Number.isSafeInteger(numericSpan)) {
+                const ratio = numericOffset / numericSpan;
+                const createdAtMs = Math.round(left[1] + ratio * (right[1] - left[1]));
+                result = {
+                    createdAtMs: Math.max(left[1], Math.min(right[1], createdAtMs)),
+                    quality: 'estimated',
+                    accuracy: Math.max(1 - Math.min(
+                        Math.abs(createdAtMs - left[1]),
+                        Math.abs(right[1] - createdAtMs)
+                    ) / MOONCAKE_LISTING_TIME_ACCURACY_WINDOW_MS, 0)
+                };
+            }
+        }
+        mooncakeListingTimeEstimateCache.set(id, { revision: mooncakeListingTimeRevision, result });
+        if (mooncakeListingTimeEstimateCache.size > 1000) {
+            mooncakeListingTimeEstimateCache.delete(mooncakeListingTimeEstimateCache.keys().next().value);
+        }
+        return result;
+    }
+
+    function mooncakeFormatListingAge(durationMs) {
+        const normalized = Math.max(0, durationMs);
+        const totalDays = normalized / 86400000;
+        if (totalDays >= 1) return `${totalDays.toFixed(1)}d`;
+        const totalHours = normalized / 3600000;
+        if (totalHours >= 1) return `${totalHours.toFixed(1)}h`;
+        return `${Math.floor(normalized / 60000)}m`;
+    }
+
+    function mooncakeBlendListingAgeColor(from, to, progress) {
+        const clamped = Math.max(0, Math.min(1, progress));
+        return `rgb(${Math.round(from[0] + (to[0] - from[0]) * clamped)}, ${Math.round(from[1] + (to[1] - from[1]) * clamped)}, ${Math.round(from[2] + (to[2] - from[2]) * clamped)})`;
+    }
+
+    function mooncakeGetListingAgeColor(durationMs) {
+        const normalized = Math.max(0, Number(durationMs) || 0);
+        const twelveHours = 12 * 60 * 60 * 1000;
+        const oneDay = 24 * 60 * 60 * 1000;
+        const threeDays = 72 * 60 * 60 * 1000;
+        const fresh = [0, 255, 0];
+        const neutral = [255, 255, 255];
+        const warm = [255, 159, 69];
+        const stale = [255, 0, 0];
+        if (normalized < twelveHours) {
+            return mooncakeBlendListingAgeColor(fresh, neutral, normalized / twelveHours);
+        }
+        if (normalized < oneDay) {
+            return mooncakeBlendListingAgeColor(neutral, warm, (normalized - twelveHours) / twelveHours);
+        }
+        if (normalized < threeDays) {
+            return mooncakeBlendListingAgeColor(warm, stale, (normalized - oneDay) / (threeDays - oneDay));
+        }
+        return `rgb(${stale.join(', ')})`;
+    }
+
+    function mooncakeFormatListingCreationTimestamp(timestamp) {
+        const date = new Date(timestamp);
+        if (!Number.isFinite(date.getTime())) return '';
+        const pad = value => String(value).padStart(2, '0');
+        return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+    }
+
+    function mooncakeGetListingAgeTooltipText(node) {
+        const createdAtMs = Number(node?.dataset?.mooncakeListingCreatedAt);
+        const timestamp = mooncakeFormatListingCreationTimestamp(createdAtMs);
+        if (!timestamp) return '';
+        const quality = node?.dataset?.mooncakeListingAgeQuality || '';
+        if (quality === 'exact') return isZH ? `创建时间：${timestamp}` : `Created: ${timestamp}`;
+        if (quality === 'lower') return isZH ? `创建时间不晚于：${timestamp}` : `Created no later than: ${timestamp}`;
+        if (quality === 'upper') return isZH ? `创建时间不早于：${timestamp}` : `Created no earlier than: ${timestamp}`;
+        return isZH ? `估算创建时间：${timestamp}` : `Estimated creation: ${timestamp}`;
+    }
+
+    function mooncakeGetListingAgeNodeFromEventTarget(target) {
+        return target instanceof Element
+            ? target.closest(MOONCAKE_LISTING_TIME_NODE_SELECTOR)
+            : null;
+    }
+
+    function mooncakeGetOrCreateListingAgeTooltip() {
+        if (mooncakeListingAgeTooltip?.isConnected) return mooncakeListingAgeTooltip;
+        const tooltip = document.createElement('div');
+        tooltip.className = 'mooncake-listing-age-tooltip';
+        tooltip.setAttribute('role', 'tooltip');
+        document.body.appendChild(tooltip);
+        mooncakeListingAgeTooltip = tooltip;
+        return tooltip;
+    }
+
+    function mooncakePositionListingAgeTooltip(tooltip, clientX, clientY) {
+        const margin = 10;
+        tooltip.style.left = `${Math.round(clientX + 12)}px`;
+        tooltip.style.top = `${Math.round(clientY + 16)}px`;
+        const rect = tooltip.getBoundingClientRect();
+        const maxLeft = Math.max(margin, document.documentElement.clientWidth - rect.width - margin);
+        const maxTop = Math.max(margin, document.documentElement.clientHeight - rect.height - margin);
+        tooltip.style.left = `${Math.round(Math.min(Math.max(margin, clientX + 12), maxLeft))}px`;
+        tooltip.style.top = `${Math.round(Math.min(Math.max(margin, clientY + 16), maxTop))}px`;
+    }
+
+    function mooncakeHideListingAgeTooltip() {
+        mooncakeListingAgeTooltipTarget = null;
+        mooncakeListingAgeTooltip?.classList.remove('is-visible');
+    }
+
+    function mooncakeShowListingAgeTooltip(node, clientX, clientY) {
+        const text = mooncakeGetListingAgeTooltipText(node);
+        if (!text) return;
+        const tooltip = mooncakeGetOrCreateListingAgeTooltip();
+        mooncakeListingAgeTooltipTarget = node;
+        tooltip.textContent = text;
+        tooltip.classList.add('is-visible');
+        mooncakePositionListingAgeTooltip(tooltip, clientX, clientY);
+    }
+
+    function mooncakeEnsureListingAgeTooltipListeners() {
+        if (mooncakeListingAgeTooltipListenersBound) return;
+        mooncakeListingAgeTooltipListenersBound = true;
+        document.addEventListener('pointerover', event => {
+            const node = mooncakeGetListingAgeNodeFromEventTarget(event.target);
+            if (!node || node === mooncakeListingAgeTooltipTarget ||
+                (event.relatedTarget instanceof Node && node.contains(event.relatedTarget))) return;
+            mooncakeShowListingAgeTooltip(node, event.clientX, event.clientY);
+        });
+        document.addEventListener('pointerout', event => {
+            const node = mooncakeGetListingAgeNodeFromEventTarget(event.target);
+            if (!node || node !== mooncakeListingAgeTooltipTarget ||
+                (event.relatedTarget instanceof Node && node.contains(event.relatedTarget))) return;
+            mooncakeHideListingAgeTooltip();
+        });
+        document.addEventListener('scroll', mooncakeHideListingAgeTooltip, true);
+        window.addEventListener('blur', mooncakeHideListingAgeTooltip);
+    }
+
+    function mooncakeUpdateListingAgeNode(node, now = Date.now()) {
+        if (!node) return;
+        const createdAtMs = Number(node.dataset.mooncakeListingCreatedAt);
+        const quality = node.dataset.mooncakeListingAgeQuality || '';
+        const inlinePrefix = node.classList.contains('mooncake-market-inline-listing-age')
+            ? (isZH ? '时长: ' : 'Age: ')
+            : '';
+        if (!Number.isFinite(createdAtMs) || !quality) {
+            node.textContent = `${inlinePrefix}-`;
+            node.style.removeProperty('color');
+            return;
+        }
+        const duration = mooncakeFormatListingAge(now - createdAtMs);
+        const value = quality === 'lower'
+            ? (isZH ? `${duration}以上` : `>=${duration}`)
+            : quality === 'upper'
+                ? (isZH ? `${duration}以内` : `<=${duration}`)
+                : duration;
+        node.style.color = mooncakeGetListingAgeColor(now - createdAtMs);
+        node.textContent = `${inlinePrefix}${value}`;
+        node.setAttribute('aria-label', node.textContent);
+    }
+
+    function mooncakeSetListingAgeNode(node, estimate) {
+        if (!node) return;
+        if (!estimate) {
+            delete node.dataset.mooncakeListingCreatedAt;
+            delete node.dataset.mooncakeListingAgeQuality;
+            node.removeAttribute('title');
+            node.removeAttribute('aria-label');
+            mooncakeUpdateListingAgeNode(node);
+            return;
+        }
+        node.dataset.mooncakeListingCreatedAt = String(estimate.createdAtMs);
+        node.dataset.mooncakeListingAgeQuality = estimate.quality;
+        node.removeAttribute('title');
+        mooncakeUpdateListingAgeNode(node);
+    }
+
+    function mooncakeStopListingAgeMinuteTimer() {
+        if (!mooncakeListingTimeMinuteTimer) return;
+        clearTimeout(mooncakeListingTimeMinuteTimer);
+        mooncakeListingTimeMinuteTimer = 0;
+    }
+
+    function mooncakeScheduleListingAgeMinuteTimer() {
+        mooncakeStopListingAgeMinuteTimer();
+        if (document.hidden || !mooncakeIsMarketListingAgeEnabled() || !document.querySelector(MOONCAKE_LISTING_TIME_NODE_SELECTOR)) return;
+        const now = Date.now();
+        mooncakeListingTimeMinuteTimer = setTimeout(() => {
+            mooncakeListingTimeMinuteTimer = 0;
+            const updateNow = Date.now();
+            document.querySelectorAll(MOONCAKE_LISTING_TIME_NODE_SELECTOR).forEach(node => mooncakeUpdateListingAgeNode(node, updateNow));
+            mooncakeScheduleListingAgeMinuteTimer();
+        }, 60000 - (now % 60000) + 30);
+    }
+
+    function mooncakeOpenListingTimeDb() {
+        if (mooncakeListingTimeDbUnavailable) return Promise.resolve(null);
+        if (mooncakeListingTimeDbPromise) return mooncakeListingTimeDbPromise;
+        mooncakeListingTimeDbPromise = new Promise((resolve, reject) => {
+            const request = indexedDB.open(MOONCAKE_LISTING_TIME_DB_NAME, 1);
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (!db.objectStoreNames.contains(MOONCAKE_LISTING_TIME_DB_STORE)) {
+                    db.createObjectStore(MOONCAKE_LISTING_TIME_DB_STORE, { keyPath: 'key' });
+                }
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        }).catch(() => {
+            mooncakeListingTimeDbUnavailable = true;
+            mooncakeListingTimeDbPromise = null;
+            return null;
+        });
+        return mooncakeListingTimeDbPromise;
+    }
+
+    async function mooncakeReadListingTimeRecord(key) {
+        const db = await mooncakeOpenListingTimeDb();
+        if (!db) return null;
+        return new Promise(resolve => {
+            const request = db.transaction(MOONCAKE_LISTING_TIME_DB_STORE, 'readonly')
+                .objectStore(MOONCAKE_LISTING_TIME_DB_STORE).get(key);
+            request.onsuccess = () => resolve(request.result?.value ?? null);
+            request.onerror = () => resolve(null);
+        });
+    }
+
+    async function mooncakeWriteListingTimeRecord(key, value) {
+        const db = await mooncakeOpenListingTimeDb();
+        if (!db) return false;
+        return new Promise(resolve => {
+            const transaction = db.transaction(MOONCAKE_LISTING_TIME_DB_STORE, 'readwrite');
+            transaction.objectStore(MOONCAKE_LISTING_TIME_DB_STORE).put({ key, value });
+            transaction.oncomplete = () => resolve(true);
+            transaction.onerror = () => resolve(false);
+            transaction.onabort = () => resolve(false);
+        });
+    }
+
+    async function mooncakeReadListingTimePending() {
+        const db = await mooncakeOpenListingTimeDb();
+        if (!db) return [];
+        return new Promise(resolve => {
+            const transaction = db.transaction(MOONCAKE_LISTING_TIME_DB_STORE, 'readonly');
+            const store = transaction.objectStore(MOONCAKE_LISTING_TIME_DB_STORE);
+            const legacyRequest = store.get('pending');
+            const records = [];
+            const cursorRequest = store.openCursor(IDBKeyRange.bound('pending:', 'pending:\uffff'));
+            cursorRequest.onsuccess = () => {
+                const cursor = cursorRequest.result;
+                if (!cursor) return;
+                records.push(cursor.value);
+                cursor.continue();
+            };
+            transaction.oncomplete = () => {
+                const pending = new Map();
+                mooncakeNormalizeListingTimePendingEntries(legacyRequest.result?.value)
+                    .forEach(([id, timestamp]) => pending.set(id, timestamp));
+                records.forEach(record => {
+                    const key = String(record?.key || '');
+                    if (!key.startsWith('pending:')) return;
+                    const id = mooncakeNormalizeListingTimeId(key.slice(8));
+                    const timestamp = Number(record.value);
+                    if (id && Number.isSafeInteger(timestamp) && timestamp > 0) pending.set(id, timestamp);
+                });
+                resolve([...pending.entries()].sort((left, right) => mooncakeCompareListingTimeIds(left[0], right[0])));
+            };
+            transaction.onerror = () => resolve([]);
+            transaction.onabort = () => resolve([]);
+        });
+    }
+
+    async function mooncakePersistListingTimePending(upsert = [], remove = []) {
+        const db = await mooncakeOpenListingTimeDb();
+        if (!db) return false;
+        return new Promise(resolve => {
+            const transaction = db.transaction(MOONCAKE_LISTING_TIME_DB_STORE, 'readwrite');
+            const store = transaction.objectStore(MOONCAKE_LISTING_TIME_DB_STORE);
+            store.delete('pending');
+            remove.forEach(value => {
+                const id = mooncakeNormalizeListingTimeId(value);
+                if (id) store.delete(`pending:${id}`);
+            });
+            upsert.forEach(entry => {
+                const id = mooncakeNormalizeListingTimeId(entry?.[0]);
+                const timestamp = Number(entry?.[1]);
+                if (id && Number.isSafeInteger(timestamp) && timestamp > 0) {
+                    store.put({ key: `pending:${id}`, value: timestamp });
+                }
+            });
+            transaction.oncomplete = () => resolve(true);
+            transaction.onerror = () => resolve(false);
+            transaction.onabort = () => resolve(false);
+        });
+    }
+
+    function mooncakePersistListingTimeRemote() {
+        const value = {
+            ...mooncakeListingTimeRemote,
+            lastMaintenanceAt: mooncakeListingTimeLastMaintenanceAt
+        };
+        return mooncakeWriteListingTimeRecord('remote', value);
+    }
+
+    function mooncakeQuarantineListingTimeAnchor(id, timestamp, reason, remoteTimestamp = 0) {
+        return mooncakeWriteListingTimeRecord(`conflict:${id}`, {
+            id,
+            timestamp,
+            remoteTimestamp,
+            reason,
+            detectedAt: Date.now()
+        });
+    }
+
+    function mooncakeDecodeListingTimeContent(content) {
+        const normalized = String(content || '').replace(/\s+/g, '');
+        if (!normalized || normalized.length > MOONCAKE_LISTING_TIME_MAX_BASE64_CHARS) return '';
+        const binary = atob(normalized);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+        return new TextDecoder().decode(bytes);
+    }
+
+    function mooncakeEncodeListingTimeContent(content) {
+        const bytes = new TextEncoder().encode(content);
+        let binary = '';
+        for (let index = 0; index < bytes.length; index += 0x8000) {
+            binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+        }
+        return btoa(binary);
+    }
+
+    function mooncakeParseListingTimeFile(fileInfo, referenceNow = Date.now()) {
+        try {
+            const emptyResult = () => ({
+                anchors: [],
+                sha: typeof fileInfo?.sha === 'string' ? fileInfo.sha : '',
+                updatedAtMs: 0,
+                fetchedAt: Date.now()
+            });
+            const encoded = String(fileInfo?.content || '').replace(/\s+/g, '');
+            if (!encoded) return Number(fileInfo?.size) === 0 ? emptyResult() : null;
+            const text = mooncakeDecodeListingTimeContent(fileInfo?.content);
+            if (!text) return null;
+            if (!text.trim()) return emptyResult();
+            const data = JSON.parse(text);
+            if (data?.schemaVersion !== 1 || !Number.isSafeInteger(data.updatedAtMs) || data.updatedAtMs < 0) return null;
+            const anchors = mooncakeNormalizeListingTimeAnchors(data.anchors);
+            if (!anchors) return null;
+            const trustedNow = Number.isFinite(referenceNow) ? referenceNow : Date.now();
+            if (anchors.some(anchor => anchor[1] > trustedNow + MOONCAKE_LISTING_TIME_FUTURE_TOLERANCE_MS)) return null;
+            return {
+                anchors,
+                sha: typeof fileInfo.sha === 'string' ? fileInfo.sha : '',
+                updatedAtMs: data.updatedAtMs,
+                fetchedAt: Date.now()
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function mooncakeFetchListingTime(url, options, timeoutMs) {
+        if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+            return fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
+        }
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        return fetch(url, { ...options, signal: controller.signal })
+            .finally(() => clearTimeout(timeout));
+    }
+
+    async function mooncakeReconcileListingTimePending() {
+        const remote = new Map(mooncakeListingTimeRemote.anchors);
+        const completed = [];
+        const conflicts = [];
+        mooncakeListingTimePending.forEach((timestamp, id) => {
+            const remoteTimestamp = remote.get(id);
+            if (remoteTimestamp !== undefined) {
+                completed.push(id);
+                if (remoteTimestamp !== timestamp) {
+                    conflicts.push({ id, timestamp, reason: 'remote-id-conflict', remoteTimestamp });
+                }
+            }
+        });
+        if (completed.length) await mooncakeSettleListingTimePending(completed, conflicts);
+        return completed;
+    }
+
+    async function mooncakeFetchListingTimeRemote(options = {}) {
+        const force = options.force === true;
+        if (!force && mooncakeListingTimeRemote.fetchedAt &&
+            Date.now() - mooncakeListingTimeRemote.fetchedAt < MOONCAKE_LISTING_TIME_CACHE_TTL_MS) {
+            return mooncakeListingTimeRemote;
+        }
+        if (mooncakeListingTimeRequest) return mooncakeListingTimeRequest;
+        mooncakeListingTimeRequest = (async () => {
+            try {
+                const response = await mooncakeFetchListingTime(MOONCAKE_LISTING_TIME_API_URL, {
+                    method: 'GET',
+                    cache: 'no-store',
+                    credentials: 'omit',
+                    headers: { Accept: 'application/json' }
+                }, 15000);
+                if (!response.ok) return null;
+                const responseDate = Date.parse(response.headers.get('date') || '');
+                const parsed = mooncakeParseListingTimeFile(
+                    await response.json(),
+                    Number.isFinite(responseDate) ? responseDate : Date.now()
+                );
+                if (!parsed) return null;
+                mooncakeListingTimeRemote = parsed;
+                await mooncakeReconcileListingTimePending();
+                mooncakeRebuildListingTimeAnchors();
+                await mooncakePersistListingTimeRemote();
+                scheduleMarketplaceOrderBookHourlyWageRefresh();
+                return parsed;
+            } catch (_) {
+                return null;
+            } finally {
+                mooncakeListingTimeRequest = null;
+            }
+        })();
+        return mooncakeListingTimeRequest;
+    }
+
+    function mooncakeCaptureOwnListingAnchors(collection, options = {}) {
+        if (!collection) return 0;
+        const remote = new Map(mooncakeListingTimeRemote.anchors);
+        const seen = new WeakSet();
+        const captured = [];
+        let added = 0;
+        const visit = (value, fallbackId = '', depth = 0) => {
+            if (!value || depth > 4) return;
+            if (value instanceof Map) {
+                value.forEach((entry, key) => visit(entry, key, depth + 1));
+                return;
+            }
+            if (Array.isArray(value)) {
+                value.forEach(entry => visit(entry, '', depth + 1));
+                return;
+            }
+            if (typeof value !== 'object' || seen.has(value)) return;
+            seen.add(value);
+            const id = mooncakeNormalizeListingTimeId(value.id ?? value.listingId ?? value.marketListingId ?? fallbackId);
+            const timestamp = mooncakeNormalizeListingTimeTimestamp(value.createdTimestamp ?? value.timestamp);
+            if (id && timestamp) {
+                const remoteTimestamp = remote.get(id);
+                const pendingTimestamp = mooncakeListingTimePending.get(id);
+                if (remoteTimestamp !== undefined) {
+                    if (remoteTimestamp !== timestamp) {
+                        mooncakeQuarantineListingTimeAnchor(id, timestamp, 'captured-remote-conflict', remoteTimestamp).catch(() => {});
+                    }
+                } else if (pendingTimestamp === undefined) {
+                    mooncakeListingTimePending.set(id, timestamp);
+                    captured.push([id, timestamp]);
+                    added += 1;
+                } else if (pendingTimestamp !== timestamp) {
+                    mooncakeQuarantineListingTimeAnchor(id, timestamp, 'captured-pending-conflict', pendingTimestamp).catch(() => {});
+                }
+                return;
+            }
+            Object.entries(value).forEach(([key, entry]) => visit(entry, key, depth + 1));
+        };
+        visit(collection);
+        if (added) {
+            mooncakeRebuildListingTimeAnchors();
+            mooncakeQueueListingTimePendingWrite(captured).then(persisted => {
+                if (persisted) {
+                    try { mooncakeListingTimeChannel?.postMessage({ type: 'pending', anchors: captured }); } catch (_) {}
+                }
+                if (options.uploadAfterPersist === true || mooncakeListingTimeMarketTouched) {
+                    mooncakeScheduleListingTimeUpload(3000, 10000);
+                }
+            }).catch(() => {});
+            scheduleMarketplaceOrderBookHourlyWageRefresh();
+        }
+        return added;
+    }
+
+    function mooncakeSerializeListingTimeFile(anchors, updatedAtMs) {
+        return `{"schemaVersion":1,"updatedAtMs":${updatedAtMs},"anchors":[${anchors.map(anchor => JSON.stringify(anchor)).join(',')}]}\n`;
+    }
+
+    function mooncakePrepareListingTimeMerge(remoteAnchors, pendingAnchors) {
+        const latestTimestamp = pendingAnchors.reduce(
+            (latest, anchor) => Math.max(latest, anchor[1]),
+            remoteAnchors.at(-1)?.[1] || 0
+        );
+        const cutoff = latestTimestamp - MOONCAKE_LISTING_TIME_RETENTION_MS;
+        const base = remoteAnchors.filter(anchor => anchor[1] >= cutoff);
+        const activePending = [];
+        const settled = [];
+        pendingAnchors.forEach(anchor => {
+            if (anchor[1] < cutoff) settled.push(anchor[0]);
+            else activePending.push(anchor);
+        });
+
+        const merged = [];
+        const accepted = [];
+        const conflicts = [];
+        let remoteIndex = 0;
+        let pendingIndex = 0;
+        let previousTimestamp = 0;
+        while (remoteIndex < base.length || pendingIndex < activePending.length) {
+            const remote = base[remoteIndex] || null;
+            const pending = activePending[pendingIndex] || null;
+            const comparison = remote && pending
+                ? mooncakeCompareListingTimeIds(remote[0], pending[0])
+                : (remote ? -1 : 1);
+            if (comparison === 0) {
+                merged.push(remote);
+                previousTimestamp = remote[1];
+                settled.push(pending[0]);
+                if (remote[1] !== pending[1]) {
+                    conflicts.push({ id: pending[0], timestamp: pending[1], remoteTimestamp: remote[1], reason: 'remote-id-conflict' });
+                }
+                remoteIndex += 1;
+                pendingIndex += 1;
+                continue;
+            }
+            if (comparison < 0) {
+                merged.push(remote);
+                previousTimestamp = remote[1];
+                remoteIndex += 1;
+                continue;
+            }
+            const nextTimestamp = remote?.[1] ?? Number.POSITIVE_INFINITY;
+            if (pending[1] >= previousTimestamp && pending[1] <= nextTimestamp) {
+                merged.push(pending);
+                previousTimestamp = pending[1];
+                accepted.push(pending[0]);
+            } else {
+                settled.push(pending[0]);
+                conflicts.push({ id: pending[0], timestamp: pending[1], remoteTimestamp: 0, reason: 'non-monotonic-anchor' });
+            }
+            pendingIndex += 1;
+        }
+        return {
+            merged,
+            accepted,
+            settled,
+            conflicts,
+            changed: base.length !== remoteAnchors.length || accepted.length > 0
+        };
+    }
+
+    function mooncakeCompactListingTimeAnchors(anchors, protectedIds = new Set(), maxAnchors = MOONCAKE_LISTING_TIME_MAX_ANCHORS) {
+        const limit = Math.max(2, Math.trunc(maxAnchors));
+        if (anchors.length <= limit) return anchors;
+        const anchorIds = new Set(anchors.map(anchor => anchor[0]));
+        const keepIds = new Set([...protectedIds].filter(id => anchorIds.has(id)));
+        keepIds.add(anchors[0][0]);
+        keepIds.add(anchors.at(-1)[0]);
+        if (keepIds.size > limit) return null;
+        const candidates = anchors.filter(anchor => !keepIds.has(anchor[0]));
+        const sampleCount = Math.min(candidates.length, limit - keepIds.size);
+        for (let index = 0; index < sampleCount; index += 1) {
+            const candidateIndex = Math.floor((index + 0.5) * candidates.length / sampleCount);
+            keepIds.add(candidates[candidateIndex][0]);
+        }
+        return anchors.filter(anchor => keepIds.has(anchor[0]));
+    }
+
+    async function mooncakeSettleListingTimePending(ids, conflicts = []) {
+        const uniqueIds = [...new Set(ids)];
+        if (conflicts.length) {
+            await Promise.allSettled(conflicts.map(conflict => mooncakeQuarantineListingTimeAnchor(
+                conflict.id,
+                conflict.timestamp,
+                conflict.reason,
+                conflict.remoteTimestamp
+            )));
+        }
+        await mooncakeQueueListingTimePendingWrite([], uniqueIds).catch(() => false);
+        uniqueIds.forEach(id => mooncakeListingTimePending.delete(id));
+        return true;
+    }
+
+    function mooncakeGetListingTimeGiteeToken() {
+        const token = String(MOONCAKE_LISTING_TIME_GITEE_TOKEN || '').trim();
+        return token && !/^replace/i.test(token) ? token : '';
+    }
+
+    async function mooncakeUploadListingTimeWithLock(task) {
+        if (navigator.locks?.request) {
+            return navigator.locks.request(MOONCAKE_LISTING_TIME_LOCK_NAME, { mode: 'exclusive' }, task);
+        }
+        const owner = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+        const now = Date.now();
+        try {
+            const current = JSON.parse(localStorage.getItem(MOONCAKE_LISTING_TIME_LEASE_KEY) || 'null');
+            if (current?.expiresAt > now) return false;
+            localStorage.setItem(MOONCAKE_LISTING_TIME_LEASE_KEY, JSON.stringify({ owner, expiresAt: now + 120000 }));
+            const acquired = JSON.parse(localStorage.getItem(MOONCAKE_LISTING_TIME_LEASE_KEY) || 'null');
+            if (acquired?.owner !== owner) return false;
+            return await task();
+        } catch (_) {
+            return await task();
+        } finally {
+            try {
+                const current = JSON.parse(localStorage.getItem(MOONCAKE_LISTING_TIME_LEASE_KEY) || 'null');
+                if (current?.owner === owner) localStorage.removeItem(MOONCAKE_LISTING_TIME_LEASE_KEY);
+            } catch (_) {}
+        }
+    }
+
+    async function mooncakeUploadListingTimeAnchors() {
+        if (!mooncakeIsMarketListingAgeUploadEnabled() || Date.now() < mooncakeListingTimeUploadBlockedUntil) return false;
+        const token = mooncakeGetListingTimeGiteeToken();
+        if (!token) return false;
+        return mooncakeUploadListingTimeWithLock(async () => {
+            await mooncakeListingTimePendingWrite.catch(() => false);
+            for (let attempt = 0; attempt < 4; attempt += 1) {
+                const remote = await mooncakeFetchListingTimeRemote({ force: true });
+                if (!remote?.sha) return false;
+                const now = Date.now();
+                const pending = [...mooncakeListingTimePending.entries()]
+                    .sort((left, right) => mooncakeCompareListingTimeIds(left[0], right[0]));
+                const prepared = mooncakePrepareListingTimeMerge(remote.anchors, pending);
+                if (prepared.settled.length) {
+                    if (!await mooncakeSettleListingTimePending(prepared.settled, prepared.conflicts)) return false;
+                    mooncakeRebuildListingTimeAnchors();
+                }
+                if (!prepared.changed) {
+                    mooncakeListingTimeLastMaintenanceAt = now;
+                    await mooncakePersistListingTimeRemote();
+                    try { mooncakeListingTimeChannel?.postMessage({ type: 'updated', completed: prepared.settled }); } catch (_) {}
+                    return true;
+                }
+                const protectedIds = new Set(prepared.accepted);
+                let merged = mooncakeCompactListingTimeAnchors(prepared.merged, protectedIds);
+                if (!merged) return false;
+                let content = mooncakeSerializeListingTimeFile(merged, now);
+                let encodedContent = mooncakeEncodeListingTimeContent(content);
+                for (let pass = 0; encodedContent.length > MOONCAKE_LISTING_TIME_MAX_BASE64_CHARS && pass < 4; pass += 1) {
+                    const targetSize = Math.max(
+                        protectedIds.size + 2,
+                        Math.floor(merged.length * MOONCAKE_LISTING_TIME_MAX_BASE64_CHARS / encodedContent.length * 0.95)
+                    );
+                    const compacted = mooncakeCompactListingTimeAnchors(merged, protectedIds, targetSize);
+                    if (!compacted || compacted.length >= merged.length) return false;
+                    merged = compacted;
+                    content = mooncakeSerializeListingTimeFile(merged, now);
+                    encodedContent = mooncakeEncodeListingTimeContent(content);
+                }
+                if (encodedContent.length > MOONCAKE_LISTING_TIME_MAX_BASE64_CHARS) return false;
+                if (!mooncakeIsMarketListingAgeUploadEnabled()) return false;
+                try {
+                    const response = await mooncakeFetchListingTime(MOONCAKE_LISTING_TIME_API_URL.replace('?ref=master', ''), {
+                        method: 'PUT',
+                        credentials: 'omit',
+                        headers: {
+                            Accept: 'application/json',
+                            'Content-Type': 'application/json',
+                            Authorization: `token ${token}`
+                        },
+                        body: JSON.stringify({
+                            message: 'Update listing time anchors',
+                            content: encodedContent,
+                            branch: 'master',
+                            sha: remote.sha
+                        })
+                    }, 30000);
+                    if (response.ok) {
+                        const responseData = await response.json().catch(() => null);
+                        mooncakeListingTimeRemote = {
+                            anchors: merged,
+                            sha: responseData?.content?.sha || remote.sha,
+                            updatedAtMs: now,
+                            fetchedAt: now
+                        };
+                        await mooncakeSettleListingTimePending(prepared.accepted);
+                        mooncakeListingTimeLastMaintenanceAt = now;
+                        mooncakeRebuildListingTimeAnchors();
+                        await mooncakePersistListingTimeRemote();
+                        try {
+                            mooncakeListingTimeChannel?.postMessage({
+                                type: 'updated',
+                                completed: [...prepared.settled, ...prepared.accepted]
+                            });
+                        } catch (_) {}
+                        scheduleMarketplaceOrderBookHourlyWageRefresh();
+                        return true;
+                    }
+                    if (response.status === 401 || response.status === 403) {
+                        mooncakeListingTimeUploadBlockedUntil = now + 6 * 60 * 60 * 1000;
+                        return false;
+                    }
+                    if (![400, 409, 422].includes(response.status)) return false;
+                    await new Promise(resolve => setTimeout(resolve, 250 + Math.random() * 750));
+                } catch (_) {
+                    return false;
+                }
+            }
+            return false;
+        });
+    }
+
+    function mooncakeScheduleListingTimeUpload(minDelayMs = 5000, maxDelayMs = 12000) {
+        if (!mooncakeIsMarketListingAgeUploadEnabled() || !mooncakeGetListingTimeGiteeToken()) return;
+        const now = Date.now();
+        const needsMaintenance = now - mooncakeListingTimeLastMaintenanceAt >= MOONCAKE_LISTING_TIME_MAINTENANCE_INTERVAL_MS;
+        if (!mooncakeListingTimePending.size && !needsMaintenance) return;
+        const blockedDelay = Math.max(0, mooncakeListingTimeUploadBlockedUntil - now);
+        const lowerDelay = Math.max(0, minDelayMs, blockedDelay);
+        const upperDelay = Math.max(lowerDelay, maxDelayMs, blockedDelay + 5000);
+        const delay = lowerDelay + Math.random() * (upperDelay - lowerDelay);
+        const dueAt = now + delay;
+        if (mooncakeListingTimeUploadTimer && mooncakeListingTimeUploadDueAt <= dueAt) return;
+        if (mooncakeListingTimeUploadTimer) clearTimeout(mooncakeListingTimeUploadTimer);
+        mooncakeListingTimeUploadDueAt = dueAt;
+        mooncakeListingTimeUploadTimer = setTimeout(() => {
+            mooncakeListingTimeUploadTimer = 0;
+            mooncakeListingTimeUploadDueAt = 0;
+            if (mooncakeListingTimeUploadPromise) {
+                mooncakeScheduleListingTimeUpload(1000, 3000);
+                return;
+            }
+            let succeeded = false;
+            mooncakeListingTimeUploadPromise = mooncakeUploadListingTimeAnchors()
+                .then(result => {
+                    succeeded = result === true;
+                    return result;
+                })
+                .finally(() => {
+                    mooncakeListingTimeUploadPromise = null;
+                    if (succeeded) {
+                        mooncakeListingTimeUploadFailureCount = 0;
+                    } else {
+                        mooncakeListingTimeUploadFailureCount += 1;
+                        const retryCeiling = Math.min(
+                            30 * 60 * 1000,
+                            5000 * (2 ** Math.min(mooncakeListingTimeUploadFailureCount, 8))
+                        );
+                        mooncakeScheduleListingTimeUpload(1000, retryCeiling);
+                    }
+                });
+        }, delay);
+    }
+
+    async function mooncakeInitializeListingTime() {
+        if (mooncakeListingTimeReadyPromise) return mooncakeListingTimeReadyPromise;
+        mooncakeListingTimeReadyPromise = (async () => {
+            const [cachedRemote, cachedPending] = await Promise.all([
+                mooncakeReadListingTimeRecord('remote'),
+                mooncakeReadListingTimePending()
+            ]);
+            const anchors = mooncakeNormalizeListingTimeAnchors(cachedRemote?.anchors);
+            if (anchors) {
+                mooncakeListingTimeRemote = {
+                    anchors,
+                    sha: typeof cachedRemote.sha === 'string' ? cachedRemote.sha : '',
+                    updatedAtMs: Number(cachedRemote.updatedAtMs) || 0,
+                    fetchedAt: Number(cachedRemote.fetchedAt) || 0
+                };
+                mooncakeListingTimeLastMaintenanceAt = Number(cachedRemote.lastMaintenanceAt) || 0;
+            }
+            const pending = mooncakeNormalizeListingTimePendingEntries(cachedPending);
+            pending.forEach(([id, timestamp]) => {
+                if (!mooncakeListingTimePending.has(id)) mooncakeListingTimePending.set(id, timestamp);
+            });
+            await mooncakeReconcileListingTimePending();
+            await mooncakeQueueListingTimePendingWrite([...mooncakeListingTimePending.entries()]);
+            mooncakeRebuildListingTimeAnchors();
+            return true;
+        })();
+        return mooncakeListingTimeReadyPromise;
+    }
+
+    function mooncakeTouchListingTimeMarket() {
+        if (!mooncakeIsMarketListingAgeEnabled() && !mooncakeIsMarketListingAgeUploadEnabled()) return;
+        mooncakeListingTimeMarketTouched = true;
+        mooncakeInitializeListingTime()
+            .then(() => mooncakeFetchListingTimeRemote())
+            .catch(() => null)
+            .finally(() => mooncakeScheduleListingTimeUpload(15000, 60000));
+    }
+
+    function mooncakeBootstrapListingTimeFromState() {
+        try {
+            const listingMap = mooncakeFindGameStateNode()?.state?.myMarketListingMap;
+            if (listingMap) mooncakeCaptureOwnListingAnchors(listingMap);
+        } catch (_) {}
+    }
+
+    function mooncakeStartListingTime() {
+        if (mooncakeListingTimeStarted) return;
+        mooncakeListingTimeStarted = true;
+        mooncakeInitializeListingTime().then(() => {
+            mooncakeBootstrapListingTimeFromState();
+            scheduleMarketplaceOrderBookHourlyWageRefresh();
+        }).catch(() => {});
+        document.addEventListener('click', event => {
+            if (mooncakeListingTimeMarketTouched || !event.isTrusted) return;
+            const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+            if (target?.closest?.('[class*="MarketplacePanel"], [class*="MarketplaceItem"]')) mooncakeTouchListingTimeMarket();
+        }, true);
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) mooncakeStopListingAgeMinuteTimer();
+            else {
+                scheduleMarketplaceOrderBookHourlyWageRefresh();
+                if (mooncakeListingTimeMarketTouched) mooncakeFetchListingTimeRemote();
+            }
+        });
+        window.addEventListener('storage', event => {
+            if (event.key !== CONFIG_KEY) return;
+            let stored = null;
+            try { stored = JSON.parse(event.newValue || 'null'); } catch (_) {}
+            const listingAgeEnabled = stored?.features?.marketListingAge !== false;
+            const uploadEnabled = stored?.features?.marketListingAgeUpload !== false;
+            const listingAgeChanged = config.features.marketListingAge !== listingAgeEnabled;
+            config.features.marketListingAge = listingAgeEnabled;
+            config.features.marketListingAgeUpload = uploadEnabled;
+            if (!uploadEnabled) mooncakeCancelListingTimeUploadTimer();
+            else if (mooncakeListingTimeMarketTouched) mooncakeScheduleListingTimeUpload(2000, 7000);
+            if (listingAgeChanged) {
+                if (listingAgeEnabled) scheduleMarketplaceOrderBookHourlyWageRefresh();
+                else mooncakeClearMarketListingAge();
+            }
+        });
+        window.addEventListener('online', () => {
+            if (mooncakeListingTimeMarketTouched) mooncakeScheduleListingTimeUpload(1000, 5000);
+        });
+        try {
+            mooncakeListingTimeChannel = new BroadcastChannel('mooncake-listing-time-v1');
+            mooncakeListingTimeChannel.onmessage = event => {
+                if (event.data?.type === 'pending') {
+                    const anchors = mooncakeNormalizeListingTimePendingEntries(event.data.anchors);
+                    const remote = new Map(mooncakeListingTimeRemote.anchors);
+                    const accepted = [];
+                    let changed = false;
+                    anchors.forEach(([id, timestamp]) => {
+                        const remoteTimestamp = remote.get(id);
+                        if (remoteTimestamp !== undefined) {
+                            if (remoteTimestamp !== timestamp) {
+                                mooncakeQuarantineListingTimeAnchor(
+                                    id, timestamp, 'broadcast-remote-conflict', remoteTimestamp
+                                ).catch(() => {});
+                            }
+                            return;
+                        }
+                        const pendingTimestamp = mooncakeListingTimePending.get(id);
+                        if (pendingTimestamp === undefined) {
+                            mooncakeListingTimePending.set(id, timestamp);
+                            accepted.push([id, timestamp]);
+                            changed = true;
+                        } else if (pendingTimestamp !== timestamp) {
+                            mooncakeQuarantineListingTimeAnchor(
+                                id, timestamp, 'broadcast-pending-conflict', pendingTimestamp
+                            ).catch(() => {});
+                        }
+                    });
+                    if (changed) {
+                        mooncakeRebuildListingTimeAnchors();
+                        mooncakeQueueListingTimePendingWrite(accepted).then(persisted => {
+                            if (persisted && mooncakeListingTimeMarketTouched) mooncakeScheduleListingTimeUpload();
+                        }).catch(() => {});
+                        scheduleMarketplaceOrderBookHourlyWageRefresh();
+                    }
+                    return;
+                }
+                if (event.data?.type !== 'updated') return;
+                Promise.all([
+                    mooncakeReadListingTimeRecord('remote'),
+                    mooncakeReadListingTimePending()
+                ]).then(async ([remote, pending]) => {
+                    const completed = Array.isArray(event.data.completed) ? event.data.completed : [];
+                    completed.forEach(id => mooncakeListingTimePending.delete(mooncakeNormalizeListingTimeId(id)));
+                    const anchors = mooncakeNormalizeListingTimeAnchors(remote?.anchors);
+                    if (anchors) mooncakeListingTimeRemote = { ...mooncakeListingTimeRemote, ...remote, anchors };
+                    const pendingAnchors = mooncakeNormalizeListingTimePendingEntries(pending);
+                    pendingAnchors.forEach(([id, timestamp]) => mooncakeListingTimePending.set(id, timestamp));
+                    await mooncakeReconcileListingTimePending();
+                    mooncakeRebuildListingTimeAnchors();
+                    scheduleMarketplaceOrderBookHourlyWageRefresh();
+                }).catch(() => {});
+            };
+        } catch (_) {}
+        setTimeout(mooncakeBootstrapListingTimeFromState, 1500);
     }
 
     const mooncakeQ7MarketOrderBookCache = new Map();
@@ -2684,8 +3774,9 @@
         const priceBandMins = marketItemOrderBooks.priceBandMins;
         const priceBandMaxs = marketItemOrderBooks.priceBandMaxs;
 
-        if (typeof mooncakeShouldCacheMyListingsLiveOrderBooks === 'function' &&
-            mooncakeShouldCacheMyListingsLiveOrderBooks(itemHrid)) {
+        if (mooncakeIsMarketListingAgeEnabled() ||
+            (typeof mooncakeShouldCacheMyListingsLiveOrderBooks === 'function' &&
+                mooncakeShouldCacheMyListingsLiveOrderBooks(itemHrid))) {
             mooncakeCacheMyListingsLiveOrderBooks(itemHrid, orderBooks, receivedAt);
         }
 
@@ -2733,6 +3824,9 @@
             if (typeof mooncakeRefreshOrderModalEconomics === 'function') {
                 mooncakeRefreshOrderModalEconomics();
             }
+        }
+        if (mooncakeIsMarketListingAgeEnabled()) {
+            scheduleMarketplaceOrderBookHourlyWageRefresh();
         }
         if (!priceChanged && !snapshotQuotesChanged) {
             if (typeof mooncakeNotifyMyListingsManagementMarketUpdate === 'function') {
@@ -2901,6 +3995,37 @@
                 white-space: nowrap;
                 font-variant-numeric: tabular-nums;
             }
+            .mooncake-listing-age-header,
+            .mooncake-listing-age-cell {
+                width: 76px;
+                min-width: 76px;
+                padding: 8px 5px !important;
+                text-align: center !important;
+                white-space: nowrap;
+                font-variant-numeric: tabular-nums;
+            }
+            .mooncake-listing-age-cell {
+                color: var(--color-space-200, #d8deed);
+                cursor: help;
+                font-size: 12px;
+            }
+            .mooncake-listing-age-tooltip {
+                display: none;
+                position: fixed;
+                z-index: 2147483647;
+                pointer-events: none;
+                padding: 4px 7px;
+                border: 1px solid rgba(151, 171, 236, .48);
+                border-radius: 4px;
+                background: rgba(14, 18, 32, .97);
+                box-shadow: 0 3px 12px rgba(0, 0, 0, .42);
+                color: #f3f6ff;
+                font-size: 12px;
+                font-variant-numeric: tabular-nums;
+                line-height: 1.4;
+                white-space: nowrap;
+            }
+            .mooncake-listing-age-tooltip.is-visible { display: block; }
             /* +0 does not show an hourly wage. Use a compact, centered
              * economics column while preserving the +1+ wage/protection grid. */
             .order-book-hourly-wage-header.mooncake-order-book-level-zero-economics-header {
@@ -2988,6 +4113,20 @@
                 white-space: nowrap;
                 font-variant-numeric: tabular-nums;
                 cursor: pointer;
+            }
+            .mooncake-market-inline-listing-age {
+                display: block;
+                width: 100%;
+                min-width: 0;
+                margin: 2px 0 0;
+                color: var(--color-disabled, #9aa0ad);
+                font-size: 10px;
+                font-weight: 700;
+                line-height: 1.2;
+                text-align: center;
+                white-space: nowrap;
+                font-variant-numeric: tabular-nums;
+                cursor: help;
             }
             .mooncake-market-inline-hourly-label {
                 margin-right: 3px;
@@ -7444,6 +8583,7 @@
         'personal_buffs_updated',
         'actions_updated',
         'market_item_order_books_updated',
+        'market_listings_updated',
         'action_completed'
     ]);
     const BLT_WS_TYPE_PATTERN = /"type"\s*:\s*"([^"]+)"/;
@@ -7470,7 +8610,12 @@
                 communityActionTypeBuffsMap: obj.communityActionTypeBuffsMap
             }, 'websocket-init', { persistUnchanged: true });
             mooncakeReplaceCharacterActions(obj.characterActions, 'websocket-init');
+            mooncakeCaptureOwnListingAnchors(obj.myMarketListings);
             mooncakeScheduleCharacterStateSync(120);
+            return true;
+        }
+        if (obj.type === 'market_listings_updated') {
+            mooncakeCaptureOwnListingAnchors(obj.endMarketListings, { uploadAfterPersist: true });
             return true;
         }
         if (obj.type === 'actions_updated' && Array.isArray(obj.endCharacterActions)) {
@@ -11704,6 +12849,7 @@
 
     // 用于去抖的变量
     let _pendingOrderBookRaf = null;
+    let _pendingOrderBookResizeTimer = 0;
     let _pendingSummaryRaf = null;
     const mooncakeOrderBookRenderGenerations = new WeakMap();
     let _summaryRenderGeneration = 0;
@@ -12492,6 +13638,9 @@
         '.buy-hourly-wage-header',
         '.buy-hourly-wage-cell',
         '.mooncake-market-inline-hourly-wage',
+        '.mooncake-listing-age-header',
+        '.mooncake-listing-age-cell',
+        '.mooncake-market-inline-listing-age',
         '[data-mooncake-summary-hourly-cell]',
         `#${MOONCAKE_LEVEL_BAR_ID}`,
         `#${MOONCAKE_STOCK_NAV_BAR_ID}`,
@@ -31121,27 +32270,35 @@
             _pendingOrderBookRaf = null;
             try {
                 const orderBooksContainer = document.querySelector('[class*="MarketplacePanel_orderBooksContainer"]');
-                if (!orderBooksContainer) return;
-
-                if (!isMarketplaceHourlyWageEnabled()) {
-                    orderBooksContainer.querySelectorAll('table').forEach(clearOrderBookHourlyWageColumns);
-                    mooncakeApplyMarketplaceResponsiveTableLayout({ orderBooksContainer });
+                if (!orderBooksContainer) {
+                    mooncakeStopListingAgeMinuteTimer();
                     return;
                 }
 
-                const askTable = orderBooksContainer.firstChild?.firstChild;
-                const bidTable = orderBooksContainer.lastChild?.firstChild;
+                const orderBookTables = Array.from(orderBooksContainer.querySelectorAll('table'));
+                const askTable = orderBookTables[0] || null;
+                const bidTable = orderBookTables[1] || null;
                 const tables = [askTable, bidTable].filter(Boolean);
                 const itemNode = mooncakeFindCurrentMarketItemNode();
                 const itemHrid = itemNode ? extractItemHridFromElement(itemNode) : null;
-                if (!itemNode || !itemHrid || !mooncakeIsEnhanceableItem(itemHrid)) {
+                const enhancementLevel = mooncakeGetCurrentMarketEnhanceLevel(0);
+                const rangedOwnsListingAge = mooncakeIsRangedListingAgeActive(orderBooksContainer);
+
+                if (mooncakeIsMarketListingAgeEnabled() && itemHrid && !rangedOwnsListingAge) {
+                    if (askTable) mooncakeRenderMarketListingAge(askTable, itemHrid, enhancementLevel, 'sell');
+                    if (bidTable) mooncakeRenderMarketListingAge(bidTable, itemHrid, enhancementLevel, 'buy');
+                    mooncakeScheduleListingAgeMinuteTimer();
+                } else {
+                    mooncakeClearMarketListingAge(orderBooksContainer);
+                }
+
+                if (!isMarketplaceHourlyWageEnabled() || !itemNode || !itemHrid || !mooncakeIsEnhanceableItem(itemHrid)) {
                     tables.forEach(clearOrderBookHourlyWageColumns);
                     mooncakeApplyMarketplaceResponsiveTableLayout({ orderBooksContainer });
                     scheduleMooncakeMarketJumpHelpers();
                     return;
                 }
                 mooncakeApplyMarketplaceResponsiveTableLayout({ orderBooksContainer });
-                const enhancementLevel = mooncakeGetCurrentMarketEnhanceLevel(0);
 
                 if (askTable) {
                     addHourlyWageToOrderBook(askTable, itemHrid, enhancementLevel, 'sell');
@@ -31236,7 +32393,7 @@
                                 needMarketJumpHelpers = true;
                             }
 
-                            if (node.closest('.MarketplacePanel_orderBooksContainer__B4YE-')) {
+                            if (node.closest('[class*="MarketplacePanel_orderBooksContainer"]')) {
                                 needOrderBook = true;
                                 needMarketJumpHelpers = true;
                             }
@@ -31268,7 +32425,7 @@
                             }
 
                             if (node.matches && node.matches('tr')) {
-                                if (targetEl?.closest?.('.MarketplacePanel_orderBooksContainer__B4YE- table, .MarketplacePanel_orderBooksContainer__B4YE-')) {
+                                if (targetEl?.closest?.('[class*="MarketplacePanel_orderBooksContainer"] table, [class*="MarketplacePanel_orderBooksContainer"]')) {
                                     needOrderBook = true;
                                 }
                                 if (targetEl?.closest?.('[class*="MarketplacePanel_itemSummaryTable"]')) {
@@ -31351,9 +32508,247 @@
             };
 
             enhancementDetailTableObserver = subscribeDocumentMutations('market-detail', handleMutations);
+            scheduleMarketplaceOrderBookHourlyWageRefresh();
         } catch (err) {
             console.error('[Better Loot Tracker] hookEnhancementDetailTable 设置失败:', err);
         }
+    }
+
+    function mooncakeIsRangedListingAgeActive(orderBooksContainer) {
+        const listingConfig = window._rwivb?.configs?.listingClass;
+        if (listingConfig?.orderBooksInfo && listingConfig?.estimateListingCreateTimeByLifespan) {
+            return listingConfig.orderBooksInfo.value === true &&
+                listingConfig.estimateListingCreateTimeByLifespan.value === true;
+        }
+        return !!orderBooksContainer?.querySelector?.('table.RangedWayIdleOrderBooksInfoSet');
+    }
+
+    function mooncakeRemoveMarketplaceInlineListingAges(root) {
+        root?.querySelectorAll?.('.mooncake-market-inline-listing-age').forEach(node => node.remove());
+    }
+
+    function mooncakeClearMarketListingAge(root = document) {
+        root?.querySelectorAll?.('.mooncake-listing-age-header, .mooncake-listing-age-cell, .mooncake-market-inline-listing-age')
+            .forEach(node => node.remove());
+        mooncakeHideListingAgeTooltip();
+        if (!document.querySelector(MOONCAKE_LISTING_TIME_NODE_SELECTOR)) mooncakeStopListingAgeMinuteTimer();
+    }
+
+    function mooncakeIsOrderBookSeparatorRow(row) {
+        const className = typeof row?.className === 'string' ? row.className : '';
+        return /MarketplacePanel_(?:outsideRangeSeparator|hiddenListingsSeparator)/.test(className);
+    }
+
+    function mooncakeGetNativeOrderBookCells(row) {
+        return Array.from(row?.children || []).filter(cell =>
+            cell.tagName === 'TD' &&
+            !cell.matches('.order-book-hourly-wage-cell, .mooncake-listing-age-cell, .RangedWayIdleOrderBooksInfo')
+        );
+    }
+
+    function mooncakeGetOrderBookRowCells(row) {
+        const cells = mooncakeGetNativeOrderBookCells(row);
+        const priceCell = cells.find(cell =>
+            /price/i.test(String(cell.className || '')) || !!cell.querySelector?.('[class*="MarketplacePanel_price"]')
+        ) || cells[1] || null;
+        const quantityCell = cells.find(cell => /quantity|amount/i.test(String(cell.className || ''))) || cells[0] || null;
+        return { priceCell, quantityCell };
+    }
+
+    function mooncakeReadOrderBookRowListing(row) {
+        const fromCandidate = (candidate, allowPlainId = true) => {
+            if (!candidate || typeof candidate !== 'object') return null;
+            const id = mooncakeNormalizeListingTimeId(
+                candidate.listingId ?? candidate.marketListingId ?? (allowPlainId ? candidate.id : '')
+            );
+            const createdAtMs = mooncakeNormalizeListingTimeTimestamp(candidate.createdTimestamp);
+            if (!id && !createdAtMs) return null;
+            const quantity = Number(candidate.quantity ?? candidate.amount ?? candidate.count ??
+                ((Number(candidate.orderQuantity) || 0) - (Number(candidate.filledQuantity) || 0)));
+            const price = Number(candidate.price ?? candidate.orderPrice ?? candidate.listingPrice ?? candidate.unitPrice);
+            return {
+                listingId: id,
+                createdAtMs,
+                price: Number.isFinite(price) ? price : NaN,
+                quantity: Number.isFinite(quantity) ? quantity : NaN
+            };
+        };
+
+        try {
+            const fiberKey = mooncakeGetFiberKey(row);
+            let fiber = fiberKey ? Reflect.get(row, fiberKey) : null;
+            for (let depth = 0; fiber && depth < 10; depth += 1) {
+                const props = fiber.memoizedProps || fiber.pendingProps;
+                for (const candidate of [props?.listing, props?.marketListing, props?.orderBookListing, props?.order]) {
+                    const result = fromCandidate(candidate);
+                    if (result) return result;
+                }
+                const direct = fromCandidate(props, false);
+                if (direct) return direct;
+                if (depth === 0) {
+                    const hiddenMatch = String(fiber.key ?? '').match(/^hidden-([1-9]\d{0,23})$/);
+                    const hiddenId = mooncakeNormalizeListingTimeId(hiddenMatch?.[1]);
+                    if (hiddenId) return { listingId: hiddenId, createdAtMs: 0, price: NaN, quantity: NaN };
+                }
+                fiber = fiber.return;
+            }
+        } catch (_) {}
+
+        const listingId = mooncakeNormalizeListingTimeId(
+            row?.dataset?.listingId ?? row?.dataset?.marketListingId ?? row?.getAttribute?.('data-order-id')
+        );
+        return listingId ? { listingId, createdAtMs: 0, price: NaN, quantity: NaN } : null;
+    }
+
+    function mooncakeGetOwnOrderBookExtraListings(itemHrid, enhancementLevel, side, allOrderBookIds) {
+        let listingMap = null;
+        try { listingMap = mooncakeFindGameStateNode()?.state?.myMarketListingMap; } catch (_) {}
+        const entries = listingMap instanceof Map
+            ? [...listingMap.entries()]
+            : (listingMap && typeof listingMap === 'object' ? Object.entries(listingMap) : []);
+        const isSell = side === 'sell';
+        const extras = [];
+        entries.forEach(([fallbackId, listing]) => {
+            if (!listing || typeof listing !== 'object' || listing.itemHrid !== itemHrid ||
+                Number(listing.enhancementLevel) !== Number(enhancementLevel) || !!listing.isSell !== isSell) return;
+            const isActive = mooncakeResolveMyListingActiveStatus(
+                listing.status ?? listing.orderStatus ?? listing.listingStatus
+            );
+            if (isActive === false) return;
+            const listingId = mooncakeNormalizeListingTimeId(
+                listing.id ?? listing.listingId ?? listing.marketListingId ?? fallbackId
+            );
+            if (!listingId || allOrderBookIds.has(listingId)) return;
+            extras.push({
+                listingId,
+                createdTimestamp: mooncakeNormalizeListingTimeTimestamp(listing.createdTimestamp),
+                price: Math.max(0, Number(listing.price) || 0)
+            });
+        });
+        return extras.sort((left, right) => {
+            if (left.price !== right.price) return (left.price - right.price) * (isSell ? 1 : -1);
+            return mooncakeCompareListingTimeIds(left.listingId, right.listingId);
+        });
+    }
+
+    function mooncakeResolveOrderBookRowEstimate(row, sequenceListing) {
+        const direct = mooncakeReadOrderBookRowListing(row);
+        if (direct?.createdAtMs) {
+            return { listingId: direct.listingId, estimate: { createdAtMs: direct.createdAtMs, quality: 'exact' } };
+        }
+        const sequenceId = mooncakeNormalizeListingTimeId(sequenceListing?.listingId);
+        const listingId = direct?.listingId || sequenceId;
+        const createdAtMs = !direct?.listingId || direct.listingId === sequenceId
+            ? mooncakeNormalizeListingTimeTimestamp(sequenceListing?.createdTimestamp)
+            : 0;
+        return {
+            listingId,
+            estimate: createdAtMs
+                ? { createdAtMs, quality: 'exact', accuracy: 1 }
+                : (listingId ? mooncakeEstimateListingCreatedAt(listingId) : null)
+        };
+    }
+
+    function mooncakeUpdateOrderBookAgeNode(node, resolved) {
+        const estimate = resolved?.estimate || null;
+        const signature = estimate
+            ? `${resolved.listingId || ''}|${estimate.createdAtMs}|${estimate.quality}|${mooncakeListingTimeRevision}`
+            : `none|${resolved?.listingId || ''}|${mooncakeListingTimeRevision}`;
+        if (node.dataset.mooncakeListingAgeSignature === signature) {
+            mooncakeUpdateListingAgeNode(node);
+            return;
+        }
+        node.dataset.mooncakeListingAgeSignature = signature;
+        mooncakeSetListingAgeNode(node, estimate);
+    }
+
+    function mooncakeEnsureInlineListingAge(priceCell) {
+        const nodes = Array.from(priceCell?.querySelectorAll?.('.mooncake-market-inline-listing-age') || []);
+        let node = nodes.shift() || null;
+        nodes.forEach(extra => extra.remove());
+        if (!node) {
+            node = document.createElement('span');
+            node.className = 'mooncake-market-inline-listing-age';
+        }
+        const hourly = priceCell.querySelector('.mooncake-market-inline-hourly-wage:last-of-type');
+        const nativePrice = priceCell.querySelector('[class*="MarketplacePanel_price"]');
+        if (hourly) hourly.insertAdjacentElement('afterend', node);
+        else if (nativePrice?.parentElement) nativePrice.insertAdjacentElement('afterend', node);
+        else priceCell.appendChild(node);
+        return node;
+    }
+
+    function mooncakeRenderMarketListingAge(orderBookTable, itemHrid, enhancementLevel, side) {
+        const headerRow = orderBookTable?.querySelector?.('thead tr');
+        const tbody = orderBookTable?.querySelector?.('tbody');
+        if (!headerRow || !tbody) return;
+        mooncakeEnsureListingAgeTooltipListeners();
+        const book = mooncakeGetMyListingsLiveOrderBook(itemHrid, enhancementLevel);
+        const listings = book?.[side === 'sell' ? 'asks' : 'bids'] || [];
+        const allOrderBookIds = new Set(
+            [...(book?.asks || []), ...(book?.bids || [])]
+                .map(listing => mooncakeNormalizeListingTimeId(listing.listingId))
+                .filter(Boolean)
+        );
+        const rowListings = [
+            ...listings,
+            ...mooncakeGetOwnOrderBookExtraListings(itemHrid, enhancementLevel, side, allOrderBookIds)
+        ];
+        let rowIndex = 0;
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+
+        if (mooncakeShouldUseMobileMarketTableLayout()) {
+            orderBookTable.querySelectorAll('.mooncake-listing-age-header, .mooncake-listing-age-cell').forEach(node => node.remove());
+            rows.forEach(row => {
+                if (mooncakeIsOrderBookSeparatorRow(row)) {
+                    mooncakeRemoveMarketplaceInlineListingAges(row);
+                    return;
+                }
+                const sequenceListing = rowListings[rowIndex] || null;
+                rowIndex += 1;
+                const { priceCell } = mooncakeGetOrderBookRowCells(row);
+                if (!priceCell) return;
+                mooncakeUpdateOrderBookAgeNode(
+                    mooncakeEnsureInlineListingAge(priceCell),
+                    mooncakeResolveOrderBookRowEstimate(row, sequenceListing)
+                );
+            });
+            return;
+        }
+
+        mooncakeRemoveMarketplaceInlineListingAges(orderBookTable);
+        let header = headerRow.querySelector('.mooncake-listing-age-header');
+        if (!header) {
+            header = document.createElement('th');
+            header.className = 'mooncake-listing-age-header';
+            const headers = Array.from(headerRow.querySelectorAll('th'));
+            const actionHeader = headers.find(cell => /^(?:操作|Action)$/i.test(String(cell.textContent || '').trim())) ||
+                (headers.length >= 3 ? headers.at(-1) : null);
+            headerRow.insertBefore(header, actionHeader);
+        }
+        header.textContent = isZH ? '时长' : 'Age';
+        header.title = isZH ? '挂单已存在时长' : 'Listing age';
+        const columnIndex = Array.from(headerRow.querySelectorAll('th')).indexOf(header);
+
+        rows.forEach(row => {
+            const existing = Array.from(row.querySelectorAll('.mooncake-listing-age-cell'));
+            let cell = existing.shift() || document.createElement('td');
+            existing.forEach(extra => extra.remove());
+            cell.className = 'mooncake-listing-age-cell';
+            const rowCells = Array.from(row.children).filter(node => node.tagName === 'TD' && node !== cell);
+            const reference = rowCells[columnIndex] || null;
+            if (Array.from(row.children).indexOf(cell) !== columnIndex) row.insertBefore(cell, reference);
+            if (mooncakeIsOrderBookSeparatorRow(row)) {
+                cell.classList.add('mooncake-listing-age-separator');
+                delete cell.dataset.mooncakeListingAgeSignature;
+                mooncakeSetListingAgeNode(cell, null);
+                cell.textContent = '';
+                return;
+            }
+            const sequenceListing = rowListings[rowIndex] || null;
+            rowIndex += 1;
+            mooncakeUpdateOrderBookAgeNode(cell, mooncakeResolveOrderBookRowEstimate(row, sequenceListing));
+        });
     }
 
     function mooncakeBeginOrderBookRender(orderBookTable) {
@@ -31400,7 +32795,8 @@
         const price = priceCell.querySelector?.('[class*="MarketplacePanel_price"]');
         if (price) return String(price.textContent || '').trim();
         const copy = priceCell.cloneNode?.(true);
-        copy?.querySelectorAll?.('.mooncake-market-inline-hourly-wage').forEach(metric => metric.remove());
+        copy?.querySelectorAll?.('.mooncake-market-inline-hourly-wage, .mooncake-market-inline-listing-age')
+            .forEach(metric => metric.remove());
         return String(copy?.textContent || priceCell.textContent || '').trim();
     }
 
@@ -32251,6 +33647,10 @@
             const isMooncakeInjectedMarketClick = !!target.closest(MOONCAKE_MARKET_INJECTED_SELECTOR);
             const marketControl = target.closest?.('[class*="MarketplacePanel"] button, [class*="MarketplacePanel"] select, [class*="MarketplacePanel"] [role="button"], [class*="MarketplacePanel"] [role="tab"], [class*="TabsComponent"] button, [class*="TabsComponent"] [role="button"], [class*="TabsComponent"] [role="tab"]');
             const navControl = target.closest?.('[class*="Navigation"], [class*="Sidebar"], [class*="Bottom"], [class*="Tab"] button, [role="navigation"], [role="tablist"] [role="tab"]');
+            if (e.isTrusted && !isMooncakeInjectedMarketClick &&
+                (marketControl?.closest?.('[class*="MarketplacePanel"]') || mooncakeIsQ7MarketNavigationClick(target))) {
+                mooncakeTouchListingTimeMarket();
+            }
             if (!isMooncakeInjectedMarketClick && (marketControl || navControl)) {
                 scheduleMooncakeMarketJumpHelpers(120);
                 if (_pendingMarketJumpFollowupTimer) clearTimeout(_pendingMarketJumpFollowupTimer);
@@ -32399,8 +33799,16 @@
             hideTooltip();
         }, true);
         window.addEventListener("resize", hideTooltip);
+        window.addEventListener('resize', () => {
+            if (_pendingOrderBookResizeTimer) clearTimeout(_pendingOrderBookResizeTimer);
+            _pendingOrderBookResizeTimer = setTimeout(() => {
+                _pendingOrderBookResizeTimer = 0;
+                scheduleMarketplaceOrderBookHourlyWageRefresh();
+            }, 120);
+        }, { passive: true });
 
         hookWebSocket();
+        mooncakeStartListingTime();
         setTimeout(startMooncakeChatLaborObserver, 1200);
         hookMooncakeMarketHistoryEvents();
         hookMooncakeOrderModalEconomics();
@@ -32491,6 +33899,8 @@
         switch (key) {
             case 'market-history': return mooncakeIsMarketHistoryCardEnabled();
             case 'market-hourly': return isMarketplaceHourlyWageEnabled();
+            case 'market-listing-age': return mooncakeIsMarketListingAgeEnabled();
+            case 'market-listing-age-upload': return mooncakeIsMarketListingAgeUploadEnabled();
             case 'dungeon-token-listing-guide': return mooncakeIsDungeonTokenListingGuideEnabled();
             case 'my-listings-management': return mooncakeIsMyListingsManagementEnabled();
             case 'my-listings-target-filter': return mooncakeIsMyListingsTargetFilterEnabled();
@@ -32513,6 +33923,8 @@
         switch (key) {
             case 'market-history': mooncakeSetMarketHistoryCardEnabled(enabled); break;
             case 'market-hourly': setMarketplaceHourlyWageEnabled(enabled); break;
+            case 'market-listing-age': mooncakeSetMarketListingAgeEnabled(enabled); break;
+            case 'market-listing-age-upload': mooncakeSetMarketListingAgeUploadEnabled(enabled); break;
             case 'dungeon-token-listing-guide': mooncakeSetDungeonTokenListingGuideEnabled(enabled); break;
             case 'my-listings-management': mooncakeSetMyListingsManagementEnabled(enabled); break;
             case 'my-listings-target-filter': mooncakeSetMyListingsTargetFilterEnabled(enabled); break;
@@ -33971,6 +35383,7 @@
             marketHistoryRow,
             columnBlock,
             marketHourlyRow,
+            mooncakeCreateEnhancementSettingsToggle('market-listing-age', isZH ? '挂单时长' : 'Listing age', isZH ? '在订单簿显示挂单已存在时长。' : 'Show listing age in order books.'),
             mooncakeCreateBaseItemCostPricePolicyControl(),
             mooncakeCreateEnhancementSettingsToggle('dungeon-token-listing-guide', isZH ? '地下城代币提示' : 'Dungeon token guide', isZH ? '收购挂牌时标记当前每代币买一最优的地下城兑换物。' : 'Mark dungeon redemptions that currently have the best bid value per token.'),
             mooncakeCreateEnhancementSettingsToggle('market-jump', isZH ? '快捷导航' : 'Quick navigation', isZH ? '显示等级与上下游入口。' : 'Show level and related-item shortcuts.'),
@@ -33979,6 +35392,7 @@
         );
         listings.rows.append(
             mooncakeCreateEnhancementSettingsToggle('my-listings-management', isZH ? '挂单管理' : 'Listing management', isZH ? '搜索并筛选我的挂单。' : 'Search and filter your listings.'),
+            mooncakeCreateEnhancementSettingsToggle('market-listing-age-upload', isZH ? '挂单时间众筹' : 'Share listing times', isZH ? '共享挂单id，估算创建时间。' : 'Share only your listing IDs and creation times.'),
             mooncakeCreateEnhancementSettingsToggle('order-archive', isZH ? '挂单记录' : 'Order archive', isZH ? '保存挂单快照。' : 'Save listing snapshots.'),
             orderTargetHourlyRow,
             mooncakeCreateEnhancementSettingsToggle('my-listings-target-filter', isZH ? '扣扣出击' : 'Undercut', isZH ? '筛选可继续压价的出售单。' : 'Find sale listings that can be undercut.'),
