@@ -364,15 +364,15 @@
         })
     });
     const MOONCAKE_HOURLY_WAGE_COLOR_PROFILE_MAX_M = 1000000;
-    // Whiteboard cost uses two independent ordered fallback chains. A source
-    // is only considered when its own market side exists; there is never an
-    // implicit cross-side fallback inside an individual source.
+    // Whiteboard cost uses a self-craft fallback chain plus one explicit
+    // ready-made quote. A source is only considered when its own market side
+    // exists; there is never an implicit cross-side fallback inside a source.
     const MOONCAKE_BASE_ITEM_COST_PRICE_SOURCE_KEYS = Object.freeze([
         'ask', 'askMinusOne', 'bidPlusOne', 'bid'
     ]);
     const MOONCAKE_DEFAULT_BASE_ITEM_COST_PRICE_POLICY = Object.freeze({
         material: Object.freeze(['ask', 'bid']),
-        product: Object.freeze(['ask', 'bid'])
+        product: 'ask'
     });
     const MOONCAKE_BASE_ITEM_COST_RESOLUTION_CACHE_LIMIT = 128;
     const mooncakeBaseItemCostResolutionCaches = new WeakMap();
@@ -1219,6 +1219,18 @@
         return normalized;
     }
 
+    function mooncakeNormalizeBaseItemCostPriceSource(value, fallback = 'ask') {
+        if (MOONCAKE_BASE_ITEM_COST_PRICE_SOURCE_KEYS.includes(value)) return value;
+        // v1.6.108 and earlier stored ready-made quotes as an ordered array.
+        // Keep its first valid choice when migrating to the explicit single
+        // quote model, so existing users retain their previous priority.
+        if (Array.isArray(value)) {
+            const firstValid = value.find(source => MOONCAKE_BASE_ITEM_COST_PRICE_SOURCE_KEYS.includes(source));
+            if (firstValid) return firstValid;
+        }
+        return MOONCAKE_BASE_ITEM_COST_PRICE_SOURCE_KEYS.includes(fallback) ? fallback : 'ask';
+    }
+
     function mooncakeNormalizeBaseItemCostPricePolicy(value) {
         const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
         return {
@@ -1226,7 +1238,7 @@
                 source.material,
                 MOONCAKE_DEFAULT_BASE_ITEM_COST_PRICE_POLICY.material
             ),
-            product: mooncakeNormalizeBaseItemCostPriceSourceList(
+            product: mooncakeNormalizeBaseItemCostPriceSource(
                 source.product,
                 MOONCAKE_DEFAULT_BASE_ITEM_COST_PRICE_POLICY.product
             )
@@ -1239,7 +1251,7 @@
 
     function mooncakeGetBaseItemCostPriceSources(kind) {
         const policy = mooncakeGetBaseItemCostPricePolicy();
-        return kind === 'product' ? policy.product : policy.material;
+        return kind === 'product' ? [policy.product] : policy.material;
     }
 
     function mooncakeBaseItemCostPriceSourceListsMatch(left, right) {
@@ -1269,11 +1281,30 @@
 
     function mooncakeSetBaseItemCostPriceSources(kind, value) {
         const group = kind === 'product' ? 'product' : 'material';
+        if (group === 'product') {
+            return mooncakeSetBaseItemCostProductPriceSource(value);
+        }
         const current = mooncakeGetBaseItemCostPricePolicy();
         // An explicit empty list is meaningful: it disables that whole route.
         const nextSources = mooncakeNormalizeBaseItemCostPriceSourceList(value);
         if (mooncakeBaseItemCostPriceSourceListsMatch(current[group], nextSources)) return true;
         current[group] = nextSources;
+        if (!config.preferences) config.preferences = {};
+        config.preferences.baseItemCostPricePolicy = current;
+        saveConfig();
+        mooncakeRefreshBaseItemCostPricePolicySurfaces();
+        return true;
+    }
+
+    function mooncakeGetBaseItemCostProductPriceSource() {
+        return mooncakeGetBaseItemCostPricePolicy().product;
+    }
+
+    function mooncakeSetBaseItemCostProductPriceSource(value) {
+        const nextSource = mooncakeNormalizeBaseItemCostPriceSource(value);
+        const current = mooncakeGetBaseItemCostPricePolicy();
+        if (current.product === nextSource) return true;
+        current.product = nextSource;
         if (!config.preferences) config.preferences = {};
         config.preferences.baseItemCostPricePolicy = current;
         saveConfig();
@@ -2319,12 +2350,7 @@
     function mooncakeGetListingAgeTooltipText(node) {
         const createdAtMs = Number(node?.dataset?.mooncakeListingCreatedAt);
         const timestamp = mooncakeFormatListingCreationTimestamp(createdAtMs);
-        if (!timestamp) return '';
-        const quality = node?.dataset?.mooncakeListingAgeQuality || '';
-        if (quality === 'exact') return isZH ? `创建时间：${timestamp}` : `Created: ${timestamp}`;
-        if (quality === 'lower') return isZH ? `创建时间不晚于：${timestamp}` : `Created no later than: ${timestamp}`;
-        if (quality === 'upper') return isZH ? `创建时间不早于：${timestamp}` : `Created no earlier than: ${timestamp}`;
-        return isZH ? `估算创建时间：${timestamp}` : `Estimated creation: ${timestamp}`;
+        return timestamp;
     }
 
     function mooncakeGetListingAgeNodeFromEventTarget(target) {
@@ -4006,7 +4032,6 @@
             }
             .mooncake-listing-age-cell {
                 color: var(--color-space-200, #d8deed);
-                cursor: help;
                 font-size: 12px;
             }
             .mooncake-listing-age-tooltip {
@@ -4126,7 +4151,6 @@
                 text-align: center;
                 white-space: nowrap;
                 font-variant-numeric: tabular-nums;
-                cursor: help;
             }
             .mooncake-market-inline-hourly-label {
                 margin-right: 3px;
@@ -5578,7 +5602,7 @@
             mooncakeCharacterCalcSignature || 'live',
             Number.isFinite(artisanMultiplier) ? artisanMultiplier.toFixed(12) : 'default',
             policy.material.join(','),
-            policy.product.join(','),
+            policy.product,
             itemHrid
         ].join('|');
     }
@@ -10565,17 +10589,17 @@
     // 找到最佳保护等级
     function findBestProtectLevel(itemHrid, targetLevel, marketData, targetPrice, options = {}) {
         const enhancementCosts = getEnhancementCosts(itemHrid);
-        if (!enhancementCosts) return { protectAt: 2, materialCost: 0, protectCost: 0, totalCost: 0 };
+        if (!Array.isArray(enhancementCosts)) return null;
 
         // 计算每次强化的材料成本
         let perActionCost = 0;
-        const processedItems = new Set();
         for (const cost of enhancementCosts) {
-            let price = getMarketPrice(cost.itemHrid, marketData);
-            // 如果没有市场价格，递归计算制造成本
-            if (price <= 0) {
-                price = getCraftingCost(cost.itemHrid, marketData, processedItems);
-            }
+            const count = Number(cost?.count);
+            const price = mooncakeResolveGenericMaterialPrice(cost?.itemHrid, marketData);
+            // A missing quote is not a free material. Keep legacy +1..+12
+            // routes consistent with the generic route builder and reject the
+            // estimate until every required input has a usable price.
+            if (!cost?.itemHrid || !(count >= 0) || !(price > 0)) return null;
             perActionCost += price * cost.count;
         }
 
@@ -10609,6 +10633,7 @@
 
         for (let protectAt = startProtect; protectAt <= targetLevel; protectAt++) {
             const sim = Enhancelate(itemHrid, targetLevel, protectAt);
+            if (sim.protectCount > 1e-9 && !(minProtectCost > 0)) continue;
             const totalCost = baseItemPrice + perActionCost * sim.actions + minProtectCost * sim.protectCount;
             const totalTimeHours = sim.actions > 0 ? calcEnhancingTimeSeconds(itemHrid, sim.actions) / 3600 : 0;
 
@@ -10782,11 +10807,12 @@
             return cached;
         }
         const craftingCost = mooncakeGetConfiguredBaseItemCraftingCost(itemHrid, marketData, policy);
-        const productPrice = mooncakeResolveMarketQuoteByPolicy(itemHrid, marketData, policy.product);
+        const productPrice = mooncakeGetBaseItemCostPolicyQuote(itemHrid, marketData, policy.product);
 
         // Only these two completed routes compete: material-route crafting and
-        // a +0 finished-product quote. Every route itself stops at the first
-        // enabled, available quote in its user-defined fallback order.
+        // a +0 finished-product quote. The ready-made quote is intentionally
+        // single-choice, so a missing left quote cannot silently fall through
+        // to a much lower buy order.
         const resolution = craftingCost > 0 && productPrice > 0
             ? (craftingCost < productPrice
                 ? { price: craftingCost, source: 'craft', craftingCost, productPrice }
@@ -12038,7 +12064,11 @@
     function getExpectedTotalCostToLevel(itemHrid, level, marketData) {
         if (!level || level <= 0) return 0;
         const strategy = findBestProtectLevel(itemHrid, level, marketData);
-        return strategy ? strategy.totalCost : 0;
+        // Keep unavailable quotes distinct from a genuine zero-level cost.
+        // Consumers must not turn a missing enhancement route into free value.
+        return Number.isFinite(Number(strategy?.totalCost)) && strategy.totalCost > 0
+            ? strategy.totalCost
+            : null;
     }
 
     function applySuperEnhanceFailurePadding(drops, startLevel) {
@@ -12435,11 +12465,21 @@
 
             // 只有成功时才显示差值信息
             const diffHtml = success ? `<span style="margin-left: 8px; color: ${diffColor}; font-weight: bold;">${diffText}</span>` : '';
-            const superOriginalCost = baseItemPrice + getExpectedTotalCostToLevel(itemHrid, startLevel, marketData);
-            const superFinalValue = superSuccess
-                ? baseItemPrice + getExpectedTotalCostToLevel(itemHrid, superTargetLevel, marketData)
-                : baseItemPrice;
-            const superProfit = superFinalValue - superOriginalCost - actualTotalCost;
+            const superStartEnhancementCost = getExpectedTotalCostToLevel(itemHrid, startLevel, marketData);
+            const superFinalEnhancementCost = superSuccess
+                ? getExpectedTotalCostToLevel(itemHrid, superTargetLevel, marketData)
+                : 0;
+            const hasSuperValuation = Number.isFinite(superStartEnhancementCost) &&
+                Number.isFinite(superFinalEnhancementCost);
+            const superOriginalCost = hasSuperValuation
+                ? baseItemPrice + superStartEnhancementCost
+                : null;
+            const superFinalValue = hasSuperValuation
+                ? baseItemPrice + superFinalEnhancementCost
+                : null;
+            const superProfit = hasSuperValuation
+                ? superFinalValue - superOriginalCost - actualTotalCost
+                : null;
             const superProfitColor = superProfit >= 0 ? 'rgb(100, 255, 100)' : 'rgb(255, 100, 100)';
 
             const actualProtectCountLabel = isZH
@@ -12458,13 +12498,17 @@
                 ${diffHtml}
             `;
 
+            const superValuationHtml = hasSuperValuation
+                ? `
+                <span style="margin-left: 8px; color: #e0e0e0;">${t.originalCost}: ${formatNumber(superOriginalCost)}</span>
+                <span style="margin-left: 8px; color: #e0e0e0;">${t.finalValue}: ${formatNumber(superFinalValue)}</span>
+                <span style="margin-left: 8px; color: ${superProfitColor};">${t.profit}: ${formatNumber(superProfit)}</span>`
+                : `<span style="margin-left: 8px; color: var(--color-disabled, #9aa0ad);">${isZH ? '成本估值：缺价' : 'Cost valuation: missing quote'}</span>`;
             const superHtml = `
                 <span style="color: ${statusColor}; font-weight: bold;">[${statusText}]</span>
                 <span style="margin-left: 8px; color: #e0e0e0;">${t.superSpend}: ${formatNumber(actualTotalCost)}</span>
                 <span title="${actualProtectCountTitle}" style="margin-left: 8px; color: ${protectColor};">${actualProtectCountLabel}</span>
-                <span style="margin-left: 8px; color: #e0e0e0;">${t.originalCost}: ${formatNumber(superOriginalCost)}</span>
-                <span style="margin-left: 8px; color: #e0e0e0;">${t.finalValue}: ${formatNumber(superFinalValue)}</span>
-                <span style="margin-left: 8px; color: ${superProfitColor};">${t.profit}: ${formatNumber(superProfit)}</span>
+                ${superValuationHtml}
             `;
 
             titleInfo.innerHTML = `
@@ -30582,6 +30626,9 @@
                     const enhancementCosts = getEnhancementCosts(itemHrid);
                     const protectionItems = getProtectionItems(itemHrid);
                     const recipe = getCraftingRecipe(itemHrid);
+                    const formatCostQuote = value => Number(value) > 0
+                        ? formatNumberPrice(value)
+                        : (isZH ? '缺价' : 'No quote');
 
                     // 计算最低保护价格
                     let minProtectCost = Infinity;
@@ -30601,19 +30648,15 @@
                     // 获取材料成本数据
                     let materialCostsRows = '';
                     if (enhancementCosts && enhancementCosts.length > 0) {
-                        const processedItems = new Set();
                         materialCostsRows = enhancementCosts.map((cost, index) => {
                             const itemName = getItemName(cost.itemHrid);
-                            let price = getMarketPrice(cost.itemHrid, marketData);
-                            // 如果没有市场价格，递归计算制造成本
-                            if (price <= 0) {
-                                price = getCraftingCost(cost.itemHrid, marketData, processedItems);
-                            }
+                            const price = mooncakeResolveGenericMaterialPrice(cost.itemHrid, marketData);
+                            const hasPrice = Number(price) > 0;
                             return `
                                 <div style="display: grid; grid-template-columns: 1fr 60px 80px; gap: 8px; padding: 6px 0; ${index < enhancementCosts.length - 1 ? 'border-bottom: 1px solid rgba(255,255,255,0.05);' : ''}">
                                     <span style="color: var(--color-disabled); font-size: 12px; text-align: left;">${itemName}</span>
                                     <span style="color: var(--color-space-200); font-size: 12px; text-align: center;">${cost.count}</span>
-                                    <span style="color: var(--color-space-200); font-size: 12px; text-align: right; font-weight: bold;">${formatNumberPrice(price)}</span>
+                                    <span style="color: ${hasPrice ? 'var(--color-space-200)' : '#f87171'}; font-size: 12px; text-align: right; font-weight: bold;" ${hasPrice ? '' : `title="${isZH ? '无市场报价且无法递归制作估值，工时费暂不可估值' : 'No market quote or craft valuation; hourly estimates are unavailable'}"`}>${formatCostQuote(price)}</span>
                                 </div>
                             `;
                         }).join('');
@@ -30634,11 +30677,12 @@
                         protectionCostsRows = sortedProtectionItems.map((protectHrid, index) => {
                             const itemName = getItemName(protectHrid);
                             const price = getMarketPrice(protectHrid, marketData);
-                            const isMinProtect = protectHrid === minProtectHrid && price > 0;
+                            const hasPrice = Number(price) > 0;
+                            const isMinProtect = protectHrid === minProtectHrid && hasPrice;
                             return `
                                 <div style="display: grid; grid-template-columns: 1fr 80px; gap: 8px; padding: 6px 0; ${index < sortedProtectionItems.length - 1 ? 'border-bottom: 1px solid rgba(255,255,255,0.05);' : ''} ${isMinProtect ? 'background: rgba(52, 211, 153, 0.15); margin: 0 -8px; padding-left: 8px; padding-right: 8px; border-radius: 4px;' : ''}">
                                     <span style="color: ${isMinProtect ? 'var(--color-space-200)' : 'var(--color-disabled)'}; font-size: 12px; text-align: left; font-weight: ${isMinProtect ? 'bold' : 'normal'};">${itemName}</span>
-                                    <span style="color: ${isMinProtect ? '#34d399' : 'var(--color-space-200)'}; font-size: 12px; text-align: right; font-weight: bold;">${formatNumberPrice(price)}</span>
+                                    <span style="color: ${isMinProtect ? '#34d399' : (hasPrice ? 'var(--color-space-200)' : '#f87171')}; font-size: 12px; text-align: right; font-weight: bold;">${formatCostQuote(price)}</span>
                                 </div>
                             `;
                         }).join('');
@@ -30719,6 +30763,7 @@
                                 finalPrice = craftingCost;
                                 if (craftingCost > 0) usesCraftedInput = true;
                             }
+                            const hasFinalPrice = Number(finalPrice) > 0;
 
                             // 计算实际使用数量（考虑工匠茶加成）
                             const adjustedCount = isFixedUpgradeItem
@@ -30727,36 +30772,44 @@
                             const sourceColor = usesMarketIntermediate ? '#fbbf24'
                                 : (usesMarketBaseCharm ? '#93c5fd'
                                     : (usesCraftedInput ? '#34d399' : 'var(--color-space-200)'));
-                            const sourceHint = usesCheapMarketIntermediate
+                            const sourceHint = !hasFinalPrice
+                                ? (isZH ? '缺价' : 'No quote')
+                                : (usesCheapMarketIntermediate
                                 ? (isZH ? '低价购买' : 'Buy low')
                                 : (usesMarketIntermediate
                                     ? (isZH ? '固定件购买' : 'Buy fixed item')
                                     : (usesMarketBaseCharm
                                         ? (isZH ? '市场底材' : 'Market base')
-                                        : (usesCraftedInput ? (isZH ? '需自制' : 'Craft it') : '')));
-                            const sourceTitle = usesCheapMarketIntermediate
+                                        : (usesCraftedInput ? (isZH ? '需自制' : 'Craft it') : ''))));
+                            const sourceTitle = !hasFinalPrice
+                                ? (isZH ? '当前自制报价策略下无可用报价，未计入自制白板成本' : 'No quote is available under the current craft policy; excluded from the self-crafted base cost.')
+                                : (usesCheapMarketIntermediate
                                 ? (isZH ? '已选市场报价低于自制成本：这一件固定升级材料已计为市场购买' : 'The selected market quote is lower than craft cost for this fixed upgrade item.')
                                 : (usesMarketBaseCharm
                                     ? (isZH ? '此护符没有制作配方，按已选市场报价作为必要市场底材计入' : 'This charm has no recipe and uses the selected market quote as a required market base.')
                                     : (usesCraftedInput
                                         ? (isZH ? '此项按自制成本计算，需要自行制作' : 'This input is priced as self-crafted.')
-                                        : ''));
+                                        : '')));
                             return `
                                 <div style="display: grid; grid-template-columns: 1fr 60px 80px; gap: 8px; padding: 6px 0; ${index < recipe.inputs.length - 1 ? 'border-bottom: 1px solid rgba(255,255,255,0.05);' : ''}">
                                     <div style="color: var(--color-disabled); font-size: 12px; text-align: left;" ${sourceTitle ? `title="${sourceTitle}"` : ''}>
-                                        <div>${itemName}</div>
-                                        ${sourceHint ? `<div style="color: ${sourceColor}; font-size: 10px; font-weight: bold; margin-top: 2px;">${sourceHint}</div>` : ''}
+                                        <div style="color: ${hasFinalPrice ? 'inherit' : '#f87171'};">${itemName}</div>
+                                        ${sourceHint ? `<div style="color: ${hasFinalPrice ? sourceColor : '#f87171'}; font-size: 10px; font-weight: bold; margin-top: 2px;">${sourceHint}</div>` : ''}
                                     </div>
                                     <span style="color: var(--color-space-200); font-size: 12px; text-align: center;">${adjustedCount.toFixed(2)}</span>
-                                    <span style="color: ${sourceColor}; font-size: 12px; text-align: right; font-weight: bold;">${formatNumberPrice(finalPrice)}</span>
+                                    <span style="color: ${hasFinalPrice ? sourceColor : '#f87171'}; font-size: 12px; text-align: right; font-weight: bold;">${formatCostQuote(finalPrice)}</span>
                                 </div>
                             `;
                         }).join('');
                     }
 
+                    const isCraftingCostAvailable = craftingCost > 0;
                     const craftingCostCardLabel = isBaseCrafted
                         ? (isZH ? '自制成本（已采用）' : 'Craft cost (used)')
-                        : (isZH ? '总制造成本' : 'Total crafting cost');
+                        : (isCraftingCostAvailable ? (isZH ? '自制成本' : 'Craft cost') : (isZH ? '自制成本（缺价）' : 'Craft cost (no quote)'));
+                    const craftingCostCardColor = isBaseCrafted
+                        ? '#34d399'
+                        : (isCraftingCostAvailable ? 'var(--color-space-200)' : '#f87171');
                     const craftedBaseNotice = isBaseCrafted
                         ? `<div style="color: #34d399; font-size: 11px; line-height: 1.45; margin: 2px 0 6px;">${isZH ? '强化成本已按自制白板计入，需自行按下方配方制作' : 'Enhancement costs use the self-crafted base shown below.'}</div>`
                         : '';
@@ -30782,17 +30835,17 @@
                         <div style="background: var(--color-midnight-800); border-radius: 4px; overflow: hidden;">
                             <div style="flex: 1; padding: 8px 12px;">
                                 <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 6px;">
-                                    <div style="padding: 6px; background: ${isBaseCrafted ? 'rgba(52, 211, 153, 0.15)' : 'rgba(255,255,255,0.05)'} ; border-radius: 4px; text-align: center;">
+                                    <div style="padding: 6px; background: ${isBaseCrafted ? 'rgba(52, 211, 153, 0.15)' : (isCraftingCostAvailable ? 'rgba(255,255,255,0.05)' : 'rgba(248,113,113,.10)')} ; border-radius: 4px; text-align: center;">
                                         <div style="color: var(--color-disabled); font-size: 10px; margin-bottom: 4px;">${craftingCostCardLabel}</div>
-                                        <div style="color: ${isBaseCrafted ? '#34d399' : 'var(--color-space-200)'} ; font-size: ${isBaseCrafted ? '14px' : '12px'} ; font-weight: bold;">${formatNumberPrice(craftingCost)}</div>
+                                        <div style="color: ${craftingCostCardColor} ; font-size: ${isBaseCrafted ? '14px' : '12px'} ; font-weight: bold;">${formatCostQuote(craftingCost)}</div>
                                     </div>
                                     <div style="padding: 6px; background: ${isBaseMarketAsk ? 'rgba(52, 211, 153, 0.15)' : 'rgba(255,255,255,0.05)'} ; border-radius: 4px; text-align: center;">
                                         <div style="color: var(--color-disabled); font-size: 10px; margin-bottom: 4px;">${isZH ? '左一价格' : 'Left Price (Ask)'}</div>
-                                        <div style="color: ${isBaseMarketAsk ? '#34d399' : 'var(--color-space-200)'} ; font-size: ${isBaseMarketAsk ? '14px' : '12px'} ; font-weight: bold;">${formatNumberPrice(basePriceObject?.a || 0)}</div>
+                                        <div style="color: ${isBaseMarketAsk ? '#34d399' : (Number(basePriceObject?.a) > 0 ? 'var(--color-space-200)' : '#f87171')} ; font-size: ${isBaseMarketAsk ? '14px' : '12px'} ; font-weight: bold;">${formatCostQuote(basePriceObject?.a)}</div>
                                     </div>
                                     <div style="padding: 6px; background: ${isBaseMarketBid ? 'rgba(52, 211, 153, 0.15)' : 'rgba(255,255,255,0.05)'} ; border-radius: 4px; text-align: center;">
                                         <div style="color: var(--color-disabled); font-size: 10px; margin-bottom: 4px;">${isZH ? '右一价格' : 'Right Price (Bid)'}</div>
-                                        <div style="color: ${isBaseMarketBid ? '#34d399' : 'var(--color-space-200)'} ; font-size: ${isBaseMarketBid ? '14px' : '12px'} ; font-weight: bold;">${formatNumberPrice(basePriceObject?.b || 0)}</div>
+                                        <div style="color: ${isBaseMarketBid ? '#34d399' : (Number(basePriceObject?.b) > 0 ? 'var(--color-space-200)' : '#f87171')} ; font-size: ${isBaseMarketBid ? '14px' : '12px'} ; font-weight: bold;">${formatCostQuote(basePriceObject?.b)}</div>
                                     </div>
                                 </div>
                                 ${craftedBaseNotice}
@@ -34122,7 +34175,8 @@
             const kind = groupNode.getAttribute(MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_GROUP_ATTR) === 'product'
                 ? 'product'
                 : 'material';
-            const activeSources = policy[kind];
+            const isReadyMade = kind === 'product';
+            const activeSources = isReadyMade ? [policy.product] : policy.material;
             const activeSet = new Set(activeSources);
             const options = groupNode.querySelector(`[${MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_OPTIONS_ATTR}]`);
             if (!options) return;
@@ -34130,17 +34184,19 @@
                 [...options.querySelectorAll(`[${MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_SOURCE_ATTR}]`)]
                     .map(button => [button.getAttribute(MOONCAKE_BASE_ITEM_COST_PRICE_POLICY_SOURCE_ATTR), button])
             );
-            const displayOrder = [
-                ...activeSources,
-                ...MOONCAKE_BASE_ITEM_COST_PRICE_SOURCE_KEYS.filter(source => !activeSet.has(source))
-            ];
+            const displayOrder = isReadyMade
+                ? MOONCAKE_BASE_ITEM_COST_PRICE_SOURCE_KEYS
+                : [
+                    ...activeSources,
+                    ...MOONCAKE_BASE_ITEM_COST_PRICE_SOURCE_KEYS.filter(source => !activeSet.has(source))
+                ];
             for (const source of displayOrder) {
                 const button = buttonsBySource.get(source);
                 if (!button) continue;
                 const active = activeSet.has(source);
                 button.setAttribute('aria-pressed', String(active));
-                button.draggable = active;
-                button.title = active
+                button.draggable = !isReadyMade && active;
+                button.title = !isReadyMade && active
                     ? `${mooncakeGetBaseItemCostPriceSourceHint(source)}${isZH ? '；可拖拽调整兜底顺序' : '; drag to reorder fallback priority'}`
                     : mooncakeGetBaseItemCostPriceSourceHint(source);
                 options.appendChild(button);
@@ -34203,9 +34259,17 @@
                 button.addEventListener('click', event => {
                     event.preventDefault();
                     event.stopPropagation();
-                    mooncakeToggleBaseItemCostPriceSource(kind, source);
+                    if (kind === 'product') {
+                        mooncakeSetBaseItemCostProductPriceSource(source);
+                    } else {
+                        mooncakeToggleBaseItemCostPriceSource(kind, source);
+                    }
                 });
                 button.addEventListener('dragstart', event => {
+                    if (kind === 'product') {
+                        event.preventDefault();
+                        return;
+                    }
                     if (button.getAttribute('aria-pressed') !== 'true') {
                         event.preventDefault();
                         return;
@@ -34218,6 +34282,7 @@
                     }
                 });
                 button.addEventListener('dragover', event => {
+                    if (kind === 'product') return;
                     const dragging = mooncakeBaseItemCostPricePolicyDragging;
                     if (!dragging || dragging.kind !== kind || dragging.source === source ||
                         button.getAttribute('aria-pressed') !== 'true') return;
@@ -34229,6 +34294,7 @@
                     button.removeAttribute('data-mooncake-base-item-cost-price-policy-drop-target');
                 });
                 button.addEventListener('drop', event => {
+                    if (kind === 'product') return;
                     const dragging = mooncakeBaseItemCostPricePolicyDragging;
                     button.removeAttribute('data-mooncake-base-item-cost-price-policy-drop-target');
                     if (!dragging || dragging.kind !== kind || dragging.source === source ||
@@ -34260,8 +34326,8 @@
         const note = document.createElement('small');
         note.setAttribute('data-mooncake-base-item-cost-price-policy-note', '1');
         note.textContent = isZH
-            ? '亮起即启用，按拖拽的顺序进行优先级，最终两条路径取最低'
-            : 'Enabled options follow drag order; the lower result from both paths wins.';
+            ? '自制亮起即启用，可拖拽排序；现成为单选。两条路线最终取最低。'
+            : 'Craft sources may be enabled and reordered; ready-made is single-choice. The lower complete route wins.';
         row.append(title, formula, groups, formulaEnd, note);
         mooncakeSyncBaseItemCostPricePolicyControls(row);
         return row;
@@ -34986,8 +35052,9 @@
             #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-note] { grid-column:1 / -1; min-width:0; color:rgba(202,215,245,.60); font-size:10px; font-weight:650; line-height:1.35; overflow-wrap:anywhere; }
             #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-options] { min-width:0; display:flex; flex-wrap:wrap; align-items:center; gap:4px; }
             #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-source] { min-width:0; min-height:26px; box-sizing:border-box; cursor:pointer; border:1px solid rgba(142,158,202,.25); border-radius:4px; background:rgba(25,30,45,.72); color:rgba(198,209,235,.50); padding:3px 6px; font:inherit; font-size:11px; font-weight:800; line-height:1; white-space:nowrap; transition:background .12s ease,border-color .12s ease,color .12s ease,transform .12s ease; }
-            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-source][aria-pressed="true"] { cursor:grab; border-color:rgba(127,154,245,.76); background:rgba(72,94,180,.86); color:#f4f7ff; box-shadow:0 0 0 1px rgba(109,138,239,.16) inset; }
-            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-source][aria-pressed="true"]:active { cursor:grabbing; }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-source][aria-pressed="true"] { border-color:rgba(127,154,245,.76); background:rgba(72,94,180,.86); color:#f4f7ff; box-shadow:0 0 0 1px rgba(109,138,239,.16) inset; }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-group="material"] [data-mooncake-base-item-cost-price-policy-source][aria-pressed="true"] { cursor:grab; }
+            #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-group="material"] [data-mooncake-base-item-cost-price-policy-source][aria-pressed="true"]:active { cursor:grabbing; }
             #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-source][data-mooncake-base-item-cost-price-policy-dragging="1"] { opacity:.46; transform:scale(.96); }
             #better-loot-tracker-config-panel [data-mooncake-base-item-cost-price-policy-source][data-mooncake-base-item-cost-price-policy-drop-target="1"] { border-color:#b7cafb; box-shadow:0 0 0 2px rgba(127,154,245,.28); }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-toggle-state] { color:rgba(219,228,250,.63); font-size:10px; font-weight:700; white-space:nowrap; }
