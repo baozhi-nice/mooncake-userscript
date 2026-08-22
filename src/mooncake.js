@@ -1523,7 +1523,7 @@
     const MOONCAKE_LISTING_FUNDS_ATTR = 'data-mooncake-listing-funds';
     const MOONCAKE_LISTING_FUNDS_CLASS = 'MooncakeTotalListingFunds';
     const MOONCAKE_RANGED_LISTING_FUNDS_SELECTOR = '.RangedWayIdleTotalListingFunds';
-    const MOONCAKE_LISTING_FUNDS_COIN_GAP_PX = 128;
+    const MOONCAKE_LISTING_FUNDS_COIN_GAP_PX = 12;
     const mooncakeListingFundsListings = new Map();
     let mooncakeListingFundsRenderTimer = 0;
     let mooncakeListingFundsMutationUnsubscribe = null;
@@ -1586,12 +1586,30 @@
         return changed;
     }
 
-    function mooncakeBootstrapListingFundsFromState() {
-        if (mooncakeListingFundsListings.size) return;
+    function mooncakeGetListingFundsStateCollection() {
         try {
-            const listingMap = mooncakeFindGameStateNode()?.state?.myMarketListingMap;
-            if (listingMap != null) mooncakeUpdateListingFundsListings(listingMap, { replace: true });
-        } catch (_) {}
+            const host = mooncakeFindGameStateNode();
+            const state = host?.state || host;
+            const candidates = [
+                state?.myMarketListingMap,
+                state?.myMarketListings,
+                state?.initCharacterData?.myMarketListings,
+                state?.characterData?.myMarketListings,
+                host?.myMarketListings
+            ];
+            return candidates.find(candidate => mooncakeCollectionEntries(candidate).length > 0) ||
+                candidates.find(candidate => candidate != null) || null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function mooncakeBootstrapListingFundsFromState() {
+        if (mooncakeListingFundsListings.size) return true;
+        const collection = mooncakeGetListingFundsStateCollection();
+        if (collection == null) return false;
+        mooncakeUpdateListingFundsListings(collection, { replace: true });
+        return mooncakeListingFundsListings.size > 0;
     }
 
     function mooncakeGetListingFundsTotals() {
@@ -1633,24 +1651,44 @@
         return panels[0] || null;
     }
 
+    function mooncakeFormatListingFundsMoney(value) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return '-';
+        const sign = numeric < 0 ? '-' : '';
+        const absolute = Math.abs(numeric);
+        const units = [
+            [1e9, 'B'],
+            [1e6, 'M'],
+            [1e3, 'K']
+        ];
+        const unit = units.find(([threshold]) => absolute >= threshold);
+        if (!unit) return String(Math.round(numeric));
+        return `${sign}${(absolute / unit[0]).toFixed(1)}${unit[1]}`;
+    }
+
     function mooncakeSetListingFundsCoinStackContent(node, amount, label) {
         const amountNode = node.querySelector('[class*="Item_count"]');
         const labelNode = node.querySelector('[class*="Item_name"]');
         if (!amountNode || !labelNode) return false;
-        amountNode.textContent = formatMoney(amount);
+        amountNode.textContent = mooncakeFormatListingFundsMoney(amount);
         labelNode.textContent = label;
         labelNode.style.color = '#66CCFF';
         node.style.pointerEvents = 'none';
+        node.style.whiteSpace = 'nowrap';
+        node.style.width = 'max-content';
         node.setAttribute(MOONCAKE_LISTING_FUNDS_ATTR, '1');
         node.classList.add(MOONCAKE_LISTING_FUNDS_CLASS);
         return true;
     }
 
-    function mooncakeCreateListingFundsCoinStack(template, amount, label, left, top) {
+    function mooncakeCreateListingFundsCoinStack(template, amount, label) {
         const node = template.cloneNode(true);
         if (!mooncakeSetListingFundsCoinStackContent(node, amount, label)) return null;
-        node.style.left = `${Math.round(left)}px`;
-        node.style.top = `${Math.round(top)}px`;
+        // The native coin stacks are absolutely positioned. Keep new stacks
+        // invisible while their real rendered widths are measured below.
+        node.style.left = '0px';
+        node.style.top = '0px';
+        node.style.visibility = 'hidden';
         return node;
     }
 
@@ -1683,17 +1721,25 @@
         const left = coinRect.left - panelRect.left;
         const top = coinRect.top - panelRect.top;
         const totals = mooncakeGetListingFundsTotals();
-        // Keep the four balances on the same native coin-stack row. The
-        // marketplace header has horizontal room, while a two-by-two block
-        // obscures the controls immediately below it.
+        // Keep all four balances on one row, but use the rendered widths of
+        // the native stack instead of a fixed step. Large values such as 3.9B
+        // otherwise collide with the following label.
         const rows = [
-            [totals.prepaidCoins, isZH ? '购买预付金' : 'Buy prepaid', left + MOONCAKE_LISTING_FUNDS_COIN_GAP_PX, top],
-            [totals.unclaimedCoins, isZH ? '待领取金额' : 'Unclaimed coins', left + MOONCAKE_LISTING_FUNDS_COIN_GAP_PX * 2, top],
-            [totals.sellProceeds, isZH ? '出售可获金' : 'Sell proceeds', left + MOONCAKE_LISTING_FUNDS_COIN_GAP_PX * 3, top]
+            [totals.prepaidCoins, isZH ? '购买预付金' : 'Buy prepaid'],
+            [totals.unclaimedCoins, isZH ? '待领取金额' : 'Unclaimed coins'],
+            [totals.sellProceeds, isZH ? '出售可获金' : 'Sell proceeds']
         ];
-        rows.forEach(([amount, label, x, y]) => {
-            const node = mooncakeCreateListingFundsCoinStack(currentCoinStack, amount, label, x, y);
-            if (node) panel.insertBefore(node, currentCoinStack.nextSibling);
+        const nodes = rows.map(([amount, label]) => mooncakeCreateListingFundsCoinStack(currentCoinStack, amount, label))
+            .filter(Boolean);
+        nodes.forEach(node => panel.insertBefore(node, currentCoinStack.nextSibling));
+
+        let cursorLeft = left + coinRect.width + MOONCAKE_LISTING_FUNDS_COIN_GAP_PX;
+        nodes.forEach(node => {
+            const width = Math.max(1, node.getBoundingClientRect().width);
+            node.style.left = `${Math.round(cursorLeft)}px`;
+            node.style.top = `${Math.round(top)}px`;
+            node.style.visibility = '';
+            cursorLeft += width + MOONCAKE_LISTING_FUNDS_COIN_GAP_PX;
         });
     }
 
@@ -1723,10 +1769,14 @@
             if (mooncakeListingFundsMutationNeedsRender(mutations)) mooncakeScheduleListingFundsRender(180);
         });
         window.addEventListener('resize', () => mooncakeScheduleListingFundsRender(120), { passive: true });
-        setTimeout(() => {
-            mooncakeBootstrapListingFundsFromState();
-            mooncakeScheduleListingFundsRender(180);
-        }, 1200);
+        // document-start captures the initial character packet. These retries
+        // cover slow React hydration and userscript managers that inject late.
+        [250, 1200, 3000, 7000].forEach(delay => {
+            setTimeout(() => {
+                mooncakeBootstrapListingFundsFromState();
+                mooncakeScheduleListingFundsRender(180);
+            }, delay);
+        });
     }
 
     function mooncakeIsDungeonTokenListingGuideEnabled() {
@@ -28877,7 +28927,14 @@
     function mooncakePrepareEnhancePlanLayout(panel, enhancingComponent) {
         if (!panel || !enhancingComponent) return null;
         const enhancingAction = panel.querySelector('[class*="EnhancingPanel_enhancingAction"]');
-        const layout = mooncakeGetEnhancePlanLayoutMetrics(panel, enhancingAction);
+        const rawLayout = mooncakeGetEnhancePlanLayoutMetrics(panel, enhancingAction);
+        // Mobile browsers may expose a wide, scaled game canvas. Use the
+        // visual handset layout here too, otherwise the regular enhancement
+        // tab incorrectly keeps the desktop stacked mode while Current Actions
+        // already uses the native left/right pair.
+        const layout = mooncakeShouldUseMobileMarketTableLayout()
+            ? { ...rawLayout, mode: 'mobile', narrow: true }
+            : rawLayout;
         const column = document.getElementById(MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID);
         mooncakeSetEnhancePlanLayoutAttributes(layout, panel, enhancingAction, enhancingComponent, column);
         // Only a real viewport resize may change the plan layout. Observing
@@ -29011,6 +29068,34 @@
                 grid-template-columns: minmax(0, .94fr) minmax(0, 1.06fr) !important;
                 column-gap: 8px !important;
                 row-gap: 10px !important;
+            }
+            /* Keep the native two-panel enhancement form side by side on
+               handsets even before the market-reference column is available. */
+            [class*="EnhancingPanel_enhancingPanel"][data-mooncake-enhance-mobile-layout="1"] [class*="SkillActionDetail_enhancingComponent"] {
+                display: grid !important;
+                grid-template-columns: minmax(0, .94fr) minmax(0, 1.06fr) !important;
+                align-items: flex-start !important;
+                column-gap: 8px !important;
+                row-gap: 10px !important;
+                min-width: 0 !important;
+                width: 100% !important;
+            }
+            [class*="EnhancingPanel_enhancingPanel"][data-mooncake-enhance-mobile-layout="1"] [class*="SkillActionDetail_enhancingComponent"] > [class*="SkillActionDetail_inputs"] {
+                grid-column: 1 !important;
+                grid-row: 1 !important;
+                min-width: 0 !important;
+                width: auto !important;
+                max-width: 100% !important;
+                box-sizing: border-box !important;
+            }
+            [class*="EnhancingPanel_enhancingPanel"][data-mooncake-enhance-mobile-layout="1"] [class*="SkillActionDetail_enhancingComponent"] > [class*="SkillActionDetail_info"] {
+                grid-column: 2 !important;
+                grid-row: 1 !important;
+                min-width: 0 !important;
+                width: auto !important;
+                max-width: 100% !important;
+                overflow: hidden !important;
+                box-sizing: border-box !important;
             }
             [class*="EnhancingPanel_enhancingPanel"]:has(#${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}) {
                 overflow: visible !important;
@@ -30222,6 +30307,7 @@
         }
         if (mooncakeShouldUseMobileMarketTableLayout()) {
             panel.setAttribute('data-mooncake-enhance-mobile-layout', '1');
+            ensureMooncakeEnhanceMarketPlanStyle();
         } else {
             panel.removeAttribute('data-mooncake-enhance-mobile-layout');
         }
