@@ -889,7 +889,9 @@
     }
 
     const MOONCAKE_ENHANCEMENT_LEVEL_STYLE_ID = 'MooncakeEnhancementLevelStyle';
-    const MOONCAKE_ENHANCEMENT_LEVEL_SELECTOR = '[class*="Item_enhancementLevel"]';
+    // Native item cards and chat market links render their enhancement label with
+    // different CSS-module prefixes, but both should use the same tier palette.
+    const MOONCAKE_ENHANCEMENT_LEVEL_SELECTOR = '[class*="Item_enhancementLevel"], [class*="MarketListingLink_enhancementLevel"]';
     const MOONCAKE_ENHANCEMENT_LEVEL_ATTR = 'data-mooncake-enhancement-level';
     const MOONCAKE_ENHANCEMENT_LEVEL_BODY_ATTR = 'data-mooncake-enhancement-level-style';
     let mooncakeEnhancementLevelStyleUnsubscribe = null;
@@ -1522,7 +1524,6 @@
     const MOONCAKE_LISTING_FUNDS_CLASS = 'MooncakeTotalListingFunds';
     const MOONCAKE_RANGED_LISTING_FUNDS_SELECTOR = '.RangedWayIdleTotalListingFunds';
     const MOONCAKE_LISTING_FUNDS_COIN_GAP_PX = 128;
-    const MOONCAKE_LISTING_FUNDS_ROW_GAP_PX = 24;
     const mooncakeListingFundsListings = new Map();
     let mooncakeListingFundsRenderTimer = 0;
     let mooncakeListingFundsMutationUnsubscribe = null;
@@ -1682,10 +1683,13 @@
         const left = coinRect.left - panelRect.left;
         const top = coinRect.top - panelRect.top;
         const totals = mooncakeGetListingFundsTotals();
+        // Keep the four balances on the same native coin-stack row. The
+        // marketplace header has horizontal room, while a two-by-two block
+        // obscures the controls immediately below it.
         const rows = [
-            [totals.unclaimedCoins, isZH ? '待领取金额' : 'Unclaimed coins', left, top + MOONCAKE_LISTING_FUNDS_ROW_GAP_PX],
             [totals.prepaidCoins, isZH ? '购买预付金' : 'Buy prepaid', left + MOONCAKE_LISTING_FUNDS_COIN_GAP_PX, top],
-            [totals.sellProceeds, isZH ? '出售可获金' : 'Sell proceeds', left + MOONCAKE_LISTING_FUNDS_COIN_GAP_PX, top + MOONCAKE_LISTING_FUNDS_ROW_GAP_PX]
+            [totals.unclaimedCoins, isZH ? '待领取金额' : 'Unclaimed coins', left + MOONCAKE_LISTING_FUNDS_COIN_GAP_PX * 2, top],
+            [totals.sellProceeds, isZH ? '出售可获金' : 'Sell proceeds', left + MOONCAKE_LISTING_FUNDS_COIN_GAP_PX * 3, top]
         ];
         rows.forEach(([amount, label, x, y]) => {
             const node = mooncakeCreateListingFundsCoinStack(currentCoinStack, amount, label, x, y);
@@ -5621,10 +5625,10 @@
         return result;
     }
 
-    // For +0 equipment, the actionable question on either order-book side is
-    // whether buying at the displayed quote beats making the item. Keep the
-    // tax-adjusted manufacture profit as supporting tooltip detail instead of
-    // letting it replace the purchase-saving value on sale rows.
+    // For +0 sell listings, "purchase savings" must answer the direct player
+    // decision: buy this completed item or craft one from its recipe. A ready-
+    // made market quote is useful for the enhancement cost route, but it must
+    // not erase the saving shown on the very sell order being evaluated.
     function mooncakeCalculateLevelZeroMarketComparison(itemHrid, side, price, marketData) {
         const quotePrice = Number(price);
         if (!itemHrid || !(quotePrice > 0) || !marketData) return null;
@@ -5632,26 +5636,34 @@
         const normalizedSide = side === 'buy' ? 'buy' : 'sell';
         const baseResolution = mooncakeResolveGenericBaseItemPrice(itemHrid, marketData);
         const baseCost = Number(baseResolution?.price) || 0;
-        if (!(baseCost > 0)) return null;
+        const craftingCost = Number(baseResolution?.craftingCost) || 0;
+        // A sell listing is something the player can buy now, so compare it
+        // with crafting. A buy listing retains the configured lowest usable
+        // acquisition baseline because it is not a direct buy-now decision.
+        const comparisonCost = normalizedSide === 'sell' ? craftingCost : baseCost;
+        const comparisonCostSource = normalizedSide === 'sell'
+            ? 'craft'
+            : baseResolution?.source || null;
+        if (!(comparisonCost > 0)) return null;
         const manufacture = normalizedSide === 'sell'
             ? mooncakeCalculateLevelZeroManufactureProfit(
                 itemHrid,
                 quotePrice,
                 marketData,
-                baseResolution?.craftingCost
+                craftingCost
             )
             : null;
-        const purchaseSavings = baseCost - quotePrice;
+        const purchaseSavings = comparisonCost - quotePrice;
 
         return {
             side: normalizedSide,
             quotePrice,
             afterTaxRevenue: normalizedSide === 'sell' ? manufacture?.afterTaxRevenue ?? null : null,
-            // Keep the established field name for existing renderers, while
-            // making it the configurable +0 acquisition baseline.
-            manufacturingCost: baseCost,
+            baseItemCost: baseCost,
+            comparisonCost,
+            comparisonCostSource,
             baseItemSource: baseResolution?.source || null,
-            craftingCost: Number(baseResolution?.craftingCost) || 0,
+            craftingCost,
             readyMadeCost: Number(baseResolution?.productPrice) || 0,
             readyMadePriceSource: mooncakeGetBaseItemCostProductPriceSource(),
             directManufacturingCost: manufacture?.manufacturingCost ?? null,
@@ -5689,6 +5701,9 @@
         const selectedSourceLabel = result.baseItemSource === 'craft'
             ? (isZH ? '自制' : 'Craft')
             : (isZH ? `现成${readyMadeSourceLabel}` : `Ready-made ${readyMadeSourceLabel}`);
+        const comparisonSourceLabel = result.comparisonCostSource === 'craft'
+            ? (isZH ? '自制成本' : 'Craft cost')
+            : (isZH ? '最低取得成本' : 'Lowest acquisition cost');
         const formatAvailableCost = value => Number(value) > 0
             ? formatMoney(value)
             : (isZH ? '无可用报价' : 'Unavailable');
@@ -5696,13 +5711,16 @@
             ? `<span class="tt-label">${isZH ? `成交后（扣 ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% 市场税）` : `After ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% market tax`}:</span> <span class="tt-value">${formatMoney(result.afterTaxRevenue)}</span>\n`
                 + `<span class="tt-label">${isZH ? '制造利润:' : 'Manufacturing profit:'}</span> <span class="tt-value" style="color:${manufactureProfitColor};font-weight:bold;">${mooncakeFormatSignedMoney(result.manufactureProfit)}</span>`
             : '';
+        const sourceDetail = isBuy
+            ? `<span class="tt-label">${isZH ? '采用成本:' : 'Selected cost:'}</span> <span class="tt-value" style="font-weight:bold;">${formatMoney(result.baseItemCost)}（${selectedSourceLabel}）</span>\n`
+            : '';
         return `<div class="tt-header">${title}</div>`
             + `<span class="tt-label">${isZH ? '装备:' : 'Item:'}</span> <span class="tt-value">${getItemName(itemHrid) || itemHrid} +0</span>\n`
             + `<span class="tt-label">${quoteLabel}</span> <span class="tt-value">${formatMoney(result.quotePrice)}</span>\n`
             + `<span class="tt-label">${isZH ? '自制成本:' : 'Craft cost:'}</span> <span class="tt-value">${formatAvailableCost(result.craftingCost)}</span>\n`
-            + `<span class="tt-label">${readyMadeLabel}</span> <span class="tt-value">${formatAvailableCost(result.readyMadeCost)}</span>\n`
-            + `<span class="tt-label">${isZH ? '采用成本:' : 'Selected cost:'}</span> <span class="tt-value" style="font-weight:bold;">${formatMoney(result.manufacturingCost)}（${selectedSourceLabel}）</span>\n`
-            + `<span class="tt-label">${isZH ? '计算口径:' : 'Basis:'}</span> <span class="tt-value">${isZH ? '采用成本 - 当前报价' : 'Selected cost - current quote'}</span>\n`
+            + `<span class="tt-label">${readyMadeLabel}</span> <span class="tt-value">${formatAvailableCost(result.readyMadeCost)}</span>${isBuy ? '\n' : `（${isZH ? '仅作市场参考' : 'market reference only'}）\n`}`
+            + sourceDetail
+            + `<span class="tt-label">${isZH ? '计算口径:' : 'Basis:'}</span> <span class="tt-value">${comparisonSourceLabel} - ${isZH ? '当前报价' : 'current quote'}</span>\n`
             + `<span class="tt-label">${comparisonLabel}</span> <span class="tt-value" style="color:${comparisonColor};font-weight:bold;">${mooncakeFormatSignedMoney(result.purchaseSavings)}</span>\n`
             + manufactureDetail;
     }
@@ -28985,6 +29003,15 @@
             [class*="SkillActionDetail_enhancingComponent"][${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="stacked"]:has(#${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}) {
                 grid-template-columns: minmax(240px, .96fr) minmax(260px, 1.04fr) !important;
             }
+            /* Keep the game's input and information panels side by side on
+               phones. The market reference is the extra surface, so it moves
+               below them instead of turning the native two-panel form into a
+               single vertical column. */
+            [class*="SkillActionDetail_enhancingComponent"][${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"]:has(#${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}) {
+                grid-template-columns: minmax(0, .94fr) minmax(0, 1.06fr) !important;
+                column-gap: 8px !important;
+                row-gap: 10px !important;
+            }
             [class*="EnhancingPanel_enhancingPanel"]:has(#${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}) {
                 overflow: visible !important;
                 min-width: 0 !important;
@@ -29075,6 +29102,13 @@
                 max-width: 720px !important;
                 justify-self: center !important;
             }
+            [class*="SkillActionDetail_enhancingComponent"][${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] > #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} {
+                grid-column: 1 / -1 !important;
+                grid-row: 2 !important;
+                width: 100% !important;
+                max-width: 100% !important;
+                justify-self: stretch !important;
+            }
             [class*="SkillActionDetail_enhancingComponent"]:has(#${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}) > [class*="SkillActionDetail_inputs"] {
                 grid-column: 1 !important;
                 grid-row: 1 !important;
@@ -29093,6 +29127,10 @@
             }
             [class*="SkillActionDetail_enhancingComponent"][${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="wide"]:has(#${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}) > [class*="SkillActionDetail_info"],
             [class*="SkillActionDetail_enhancingComponent"][${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="stacked"]:has(#${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}) > [class*="SkillActionDetail_info"] {
+                grid-column: 2 !important;
+                grid-row: 1 !important;
+            }
+            [class*="SkillActionDetail_enhancingComponent"][${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"]:has(#${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}) > [class*="SkillActionDetail_info"] {
                 grid-column: 2 !important;
                 grid-row: 1 !important;
             }
@@ -33583,9 +33621,13 @@
         if (Number(enhancementLevel) !== 0) {
             return isZH ? '工时费（每小时）' : 'Hourly wage';
         }
-        const purchaseSavingTitle = isZH
-            ? '购买节省（白板成本 - 当前报价）'
-            : 'Purchase savings (base-item cost - current quote)';
+        const purchaseSavingTitle = side === 'sell'
+            ? (isZH
+                ? '购买节省（自制成本 - 当前报价）'
+                : 'Purchase savings (craft cost - current quote)')
+            : (isZH
+                ? '购买节省（最低取得成本 - 当前报价）'
+                : 'Purchase savings (lowest acquisition cost - current quote)');
         return side === 'sell'
             ? (isZH ? `${purchaseSavingTitle}；制造利润见提示` : `${purchaseSavingTitle}; manufacturing profit in tooltip`)
             : purchaseSavingTitle;
@@ -33762,11 +33804,11 @@
         const hourlyWageHeaderTitle = isLevelZeroEconomics
             ? (normalizedSide === 'sell'
                 ? (isZH
-                    ? '+0 显示购买节省（白板成本 - 当前报价）；制造利润见提示'
-                    : '+0 shows purchase savings (base-item cost - current quote); manufacturing profit is in the tooltip')
+                    ? '+0 显示购买节省（自制成本 - 当前报价）；制造利润见提示'
+                    : '+0 shows purchase savings (craft cost - current quote); manufacturing profit is in the tooltip')
                 : (isZH
-                    ? '+0 显示购买节省（白板成本 - 当前报价）'
-                    : '+0 shows purchase savings (base-item cost - current quote)'))
+                    ? '+0 显示购买节省（最低取得成本 - 当前报价）'
+                    : '+0 shows purchase savings (lowest acquisition cost - current quote)'))
             : (isZH ? '+1 及以上显示工时费' : '+1 and above: hourly wage');
         const renderGeneration = mooncakeBeginOrderBookRender(orderBookTable);
 
@@ -34204,8 +34246,8 @@
         const sellHourlyWageHeader = document.createElement('th');
         sellHourlyWageHeader.className = 'sell-hourly-wage-header';
         sellHourlyWageHeader.title = isZH
-            ? '+1 及以上显示工时费；+0 显示购买节省（白板成本 - 当前报价），制造利润见提示'
-            : '+1 and above: hourly wage; +0 shows purchase savings (base-item cost - current quote), with manufacturing profit in the tooltip';
+            ? '+1 及以上显示工时费；+0 显示购买节省（自制成本 - 当前报价），制造利润见提示'
+            : '+1 and above: hourly wage; +0 shows purchase savings (craft cost - current quote), with manufacturing profit in the tooltip';
         sellHourlyWageHeader.textContent = isZH ? '工时费' : 'Hourly Wage';
         sellHourlyWageHeader.style.cssText = 'padding: 8px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums;';
 
@@ -34213,8 +34255,8 @@
         const buyHourlyWageHeader = document.createElement('th');
         buyHourlyWageHeader.className = 'buy-hourly-wage-header';
         buyHourlyWageHeader.title = isZH
-            ? '+1 及以上显示工时费；+0 显示购买节省（白板成本 - 当前报价）'
-            : '+1 and above: hourly wage; +0 shows purchase savings (base-item cost - current quote)';
+            ? '+1 及以上显示工时费；+0 显示购买节省（最低取得成本 - 当前报价）'
+            : '+1 and above: hourly wage; +0 shows purchase savings (lowest acquisition cost - current quote)';
         buyHourlyWageHeader.textContent = isZH ? '工时费' : 'Hourly Wage';
         buyHourlyWageHeader.style.cssText = 'padding: 8px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums;';
 
