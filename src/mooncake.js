@@ -1508,9 +1508,221 @@
         if (config.features.marketListingAgeUpload) {
             mooncakeTouchListingTimeMarket();
             if (mooncakeListingTimeMarketTouched) mooncakeScheduleListingTimeUpload(2000, 7000);
+            mooncakeScheduleListingFundsRender(180);
         } else {
             mooncakeCancelListingTimeUploadTimer();
+            mooncakeClearListingFundsDisplay();
         }
+    }
+
+    // Keep this display tied to the listing-time sharing switch. It has no
+    // network side effects, but both features consume the same live listing
+    // snapshot and users expect one switch to control them together.
+    const MOONCAKE_LISTING_FUNDS_ATTR = 'data-mooncake-listing-funds';
+    const MOONCAKE_LISTING_FUNDS_CLASS = 'MooncakeTotalListingFunds';
+    const MOONCAKE_RANGED_LISTING_FUNDS_SELECTOR = '.RangedWayIdleTotalListingFunds';
+    const MOONCAKE_LISTING_FUNDS_COIN_GAP_PX = 128;
+    const MOONCAKE_LISTING_FUNDS_ROW_GAP_PX = 24;
+    const mooncakeListingFundsListings = new Map();
+    let mooncakeListingFundsRenderTimer = 0;
+    let mooncakeListingFundsMutationUnsubscribe = null;
+
+    function mooncakeNormalizeListingFundsNumber(value) {
+        const numeric = Number(value);
+        return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+    }
+
+    function mooncakeGetListingFundsId(listing, fallbackId = '') {
+        const rawId = listing?.id ?? listing?.listingId ?? listing?.marketListingId ?? fallbackId;
+        const normalized = mooncakeNormalizeMarketListingId(rawId);
+        return normalized === null ? '' : String(normalized);
+    }
+
+    function mooncakeIsClosedListingForFunds(listing) {
+        const status = String(listing?.status ?? listing?.orderStatus ?? listing?.listingStatus ?? '').toLowerCase();
+        if (status.includes('cancelled')) return true;
+        if (!status.includes('filled')) return false;
+        return mooncakeNormalizeListingFundsNumber(listing?.unclaimedItemCount) <= 0 &&
+            mooncakeNormalizeListingFundsNumber(listing?.unclaimedCoinCount) <= 0;
+    }
+
+    function mooncakeNormalizeListingFundsListing(listing, fallbackId = '') {
+        if (!listing || typeof listing !== 'object') return null;
+        const id = mooncakeGetListingFundsId(listing, fallbackId);
+        if (!id) return null;
+        return {
+            id,
+            isSell: !!listing.isSell,
+            itemHrid: String(listing.itemHrid || ''),
+            orderQuantity: mooncakeNormalizeListingFundsNumber(listing.orderQuantity ?? listing.quantity),
+            filledQuantity: mooncakeNormalizeListingFundsNumber(listing.filledQuantity),
+            price: mooncakeNormalizeListingFundsNumber(listing.price ?? listing.orderPrice ?? listing.listingPrice),
+            coinsAvailable: mooncakeNormalizeListingFundsNumber(listing.coinsAvailable),
+            unclaimedCoinCount: mooncakeNormalizeListingFundsNumber(listing.unclaimedCoinCount),
+            unclaimedItemCount: mooncakeNormalizeListingFundsNumber(listing.unclaimedItemCount),
+            status: listing.status ?? listing.orderStatus ?? listing.listingStatus ?? ''
+        };
+    }
+
+    function mooncakeUpdateListingFundsListings(collection, { replace = false } = {}) {
+        if (replace) mooncakeListingFundsListings.clear();
+        let changed = false;
+        for (const [fallbackId, listing] of mooncakeCollectionEntries(collection)) {
+            const id = mooncakeGetListingFundsId(listing, fallbackId);
+            if (!id) continue;
+            if (mooncakeIsClosedListingForFunds(listing)) {
+                changed = mooncakeListingFundsListings.delete(id) || changed;
+                continue;
+            }
+            const normalized = mooncakeNormalizeListingFundsListing(listing, fallbackId);
+            if (!normalized) continue;
+            const signature = JSON.stringify(normalized);
+            if (JSON.stringify(mooncakeListingFundsListings.get(id)) === signature) continue;
+            mooncakeListingFundsListings.set(id, normalized);
+            changed = true;
+        }
+        if (changed || replace) mooncakeScheduleListingFundsRender(260);
+        return changed;
+    }
+
+    function mooncakeBootstrapListingFundsFromState() {
+        if (mooncakeListingFundsListings.size) return;
+        try {
+            const listingMap = mooncakeFindGameStateNode()?.state?.myMarketListingMap;
+            if (listingMap != null) mooncakeUpdateListingFundsListings(listingMap, { replace: true });
+        } catch (_) {}
+    }
+
+    function mooncakeGetListingFundsTotals() {
+        mooncakeBootstrapListingFundsFromState();
+        let unclaimedCoins = 0;
+        let prepaidCoins = 0;
+        let sellProceeds = 0;
+        mooncakeListingFundsListings.forEach(listing => {
+            unclaimedCoins += listing.unclaimedCoinCount;
+            prepaidCoins += listing.coinsAvailable;
+            if (!listing.isSell) return;
+            const remainingQuantity = Math.max(0, listing.orderQuantity - listing.filledQuantity);
+            const taxRate = listing.itemHrid === '/items/bag_of_10_cowbells' ? 0.82 : 0.95;
+            sellProceeds += remainingQuantity * Math.floor(listing.price * taxRate);
+        });
+        return {
+            unclaimedCoins: Math.floor(unclaimedCoins),
+            prepaidCoins: Math.floor(prepaidCoins),
+            sellProceeds: Math.floor(sellProceeds)
+        };
+    }
+
+    function mooncakeClearListingFundsDisplay() {
+        document.querySelectorAll(`[${MOONCAKE_LISTING_FUNDS_ATTR}="1"]`).forEach(node => node.remove());
+    }
+
+    function mooncakeIsRangedListingFundsActive(panel = null) {
+        try {
+            if (window._rwivb?.configs?.listingClass?.showTotalListingFunds?.value === true) return true;
+        } catch (_) {}
+        return !!(panel?.querySelector?.(MOONCAKE_RANGED_LISTING_FUNDS_SELECTOR) ||
+            document.querySelector(MOONCAKE_RANGED_LISTING_FUNDS_SELECTOR));
+    }
+
+    function mooncakeFindListingFundsMarketplacePanel() {
+        const panels = Array.from(document.querySelectorAll('[class*="MarketplacePanel_marketplacePanel"], [class*="MarketplacePanel"]'))
+            .filter(mooncakeIsVisibleElement)
+            .sort((left, right) => Number(mooncakeIsMarketplaceModalDescendant(right)) - Number(mooncakeIsMarketplaceModalDescendant(left)));
+        return panels[0] || null;
+    }
+
+    function mooncakeSetListingFundsCoinStackContent(node, amount, label) {
+        const amountNode = node.querySelector('[class*="Item_count"]');
+        const labelNode = node.querySelector('[class*="Item_name"]');
+        if (!amountNode || !labelNode) return false;
+        amountNode.textContent = formatMoney(amount);
+        labelNode.textContent = label;
+        labelNode.style.color = '#66CCFF';
+        node.style.pointerEvents = 'none';
+        node.setAttribute(MOONCAKE_LISTING_FUNDS_ATTR, '1');
+        node.classList.add(MOONCAKE_LISTING_FUNDS_CLASS);
+        return true;
+    }
+
+    function mooncakeCreateListingFundsCoinStack(template, amount, label, left, top) {
+        const node = template.cloneNode(true);
+        if (!mooncakeSetListingFundsCoinStackContent(node, amount, label)) return null;
+        node.style.left = `${Math.round(left)}px`;
+        node.style.top = `${Math.round(top)}px`;
+        return node;
+    }
+
+    function mooncakeRenderListingFundsDisplay() {
+        mooncakeListingFundsRenderTimer = 0;
+        if (!mooncakeIsMarketListingAgeUploadEnabled()) {
+            mooncakeClearListingFundsDisplay();
+            return;
+        }
+
+        // Ranged's feature uses this stable class name. Presence is a safer
+        // cross-userscript capability check than reaching into its private
+        // configuration or storage namespace.
+        const panel = mooncakeFindListingFundsMarketplacePanel();
+        if (mooncakeIsRangedListingFundsActive(panel)) {
+            mooncakeClearListingFundsDisplay();
+            return;
+        }
+        const currentCoinStack = Array.from(panel?.querySelectorAll?.('[class*="MarketplacePanel_coinStack"]') || [])
+            .find(node => node.getAttribute(MOONCAKE_LISTING_FUNDS_ATTR) !== '1');
+        if (!panel || !currentCoinStack || currentCoinStack.parentElement !== panel) {
+            mooncakeClearListingFundsDisplay();
+            return;
+        }
+
+        mooncakeClearListingFundsDisplay();
+        const panelRect = panel.getBoundingClientRect();
+        const coinRect = currentCoinStack.getBoundingClientRect();
+        if (!(panelRect.width > 0 && coinRect.width > 0)) return;
+        const left = coinRect.left - panelRect.left;
+        const top = coinRect.top - panelRect.top;
+        const totals = mooncakeGetListingFundsTotals();
+        const rows = [
+            [totals.unclaimedCoins, isZH ? '待领取金额' : 'Unclaimed coins', left, top + MOONCAKE_LISTING_FUNDS_ROW_GAP_PX],
+            [totals.prepaidCoins, isZH ? '购买预付金' : 'Buy prepaid', left + MOONCAKE_LISTING_FUNDS_COIN_GAP_PX, top],
+            [totals.sellProceeds, isZH ? '出售可获金' : 'Sell proceeds', left + MOONCAKE_LISTING_FUNDS_COIN_GAP_PX, top + MOONCAKE_LISTING_FUNDS_ROW_GAP_PX]
+        ];
+        rows.forEach(([amount, label, x, y]) => {
+            const node = mooncakeCreateListingFundsCoinStack(currentCoinStack, amount, label, x, y);
+            if (node) panel.insertBefore(node, currentCoinStack.nextSibling);
+        });
+    }
+
+    function mooncakeScheduleListingFundsRender(delay = 120) {
+        if (mooncakeListingFundsRenderTimer) clearTimeout(mooncakeListingFundsRenderTimer);
+        mooncakeListingFundsRenderTimer = setTimeout(mooncakeRenderListingFundsDisplay, Math.max(0, Number(delay) || 0));
+    }
+
+    function mooncakeListingFundsMutationNeedsRender(mutations) {
+        for (const mutation of mutations) {
+            for (const node of [...mutation.addedNodes, ...mutation.removedNodes]) {
+                if (!(node instanceof Element)) continue;
+                if (node.getAttribute(MOONCAKE_LISTING_FUNDS_ATTR) === '1' ||
+                    node.closest?.(`[${MOONCAKE_LISTING_FUNDS_ATTR}="1"]`)) continue;
+                if (node.matches?.(MOONCAKE_RANGED_LISTING_FUNDS_SELECTOR) ||
+                    node.querySelector?.(MOONCAKE_RANGED_LISTING_FUNDS_SELECTOR)) return true;
+                if (node.matches?.('[class*="MarketplacePanel_marketplacePanel"], [class*="MarketplacePanel_coinStack"]') ||
+                    node.querySelector?.('[class*="MarketplacePanel_marketplacePanel"], [class*="MarketplacePanel_coinStack"]')) return true;
+            }
+        }
+        return false;
+    }
+
+    function mooncakeStartListingFundsDisplay() {
+        if (mooncakeListingFundsMutationUnsubscribe) return;
+        mooncakeListingFundsMutationUnsubscribe = subscribeDocumentMutations('market-listing-funds', mutations => {
+            if (mooncakeListingFundsMutationNeedsRender(mutations)) mooncakeScheduleListingFundsRender(180);
+        });
+        window.addEventListener('resize', () => mooncakeScheduleListingFundsRender(120), { passive: true });
+        setTimeout(() => {
+            mooncakeBootstrapListingFundsFromState();
+            mooncakeScheduleListingFundsRender(180);
+        }, 1200);
     }
 
     function mooncakeIsDungeonTokenListingGuideEnabled() {
@@ -3049,6 +3261,7 @@
     function mooncakeTouchListingTimeMarket() {
         if (!mooncakeIsMarketListingAgeEnabled() && !mooncakeIsMarketListingAgeUploadEnabled()) return;
         mooncakeListingTimeMarketTouched = true;
+        if (mooncakeIsMarketListingAgeUploadEnabled()) mooncakeScheduleListingFundsRender(180);
         mooncakeInitializeListingTime()
             .then(() => mooncakeFetchListingTimeRemote())
             .catch(() => null)
@@ -3090,8 +3303,13 @@
             const listingAgeChanged = config.features.marketListingAge !== listingAgeEnabled;
             config.features.marketListingAge = listingAgeEnabled;
             config.features.marketListingAgeUpload = uploadEnabled;
-            if (!uploadEnabled) mooncakeCancelListingTimeUploadTimer();
-            else if (mooncakeListingTimeMarketTouched) mooncakeScheduleListingTimeUpload(2000, 7000);
+            if (!uploadEnabled) {
+                mooncakeCancelListingTimeUploadTimer();
+                mooncakeClearListingFundsDisplay();
+            } else {
+                if (mooncakeListingTimeMarketTouched) mooncakeScheduleListingTimeUpload(2000, 7000);
+                mooncakeScheduleListingFundsRender(180);
+            }
             if (listingAgeChanged) {
                 if (listingAgeEnabled) scheduleMarketplaceOrderBookHourlyWageRefresh();
                 else mooncakeClearMarketListingAge();
@@ -4244,12 +4462,16 @@
     function showTooltip(e, html, anchorEl = null) {
         const tip = getTooltipEl();
         mooncakeClearTooltipHideTimer(tip);
+        // The tooltip DOM is shared. Invalidate delayed history-wage work
+        // before replacing it so an old callback cannot paint a new tooltip.
+        tip._mooncakeHistoryHourlySession = (Number(tip._mooncakeHistoryHourlySession) || 0) + 1;
         tip.innerHTML = html;
         tip._mooncakeTooltipAnchor = anchorEl;
         mooncakeSetTooltipPinned(tip, false);
         tip.classList.toggle('mooncake-tooltip-interactive', anchorEl?._mooncakeTooltipInteractive === true);
         tip.classList.add("visible");
         positionTooltip(e, tip, anchorEl);
+        mooncakeHydrateMarketHistoryTimelineHourlyWages(tip);
     }
 
     function positionTooltip(e, tip, anchorEl = null) {
@@ -5429,6 +5651,9 @@
             // making it the configurable +0 acquisition baseline.
             manufacturingCost: baseCost,
             baseItemSource: baseResolution?.source || null,
+            craftingCost: Number(baseResolution?.craftingCost) || 0,
+            readyMadeCost: Number(baseResolution?.productPrice) || 0,
+            readyMadePriceSource: mooncakeGetBaseItemCostProductPriceSource(),
             directManufacturingCost: manufacture?.manufacturingCost ?? null,
             purchaseSavings,
             manufactureProfit: normalizedSide === 'sell' ? manufacture?.profit ?? null : null,
@@ -5450,16 +5675,34 @@
         const quoteLabel = isBuy
             ? (isZH ? '收购报价:' : 'Buy bid:')
             : (isZH ? '出售报价:' : 'Sell quote:');
+        const readyMadeSourceLabel = isZH
+            ? ({
+                ask: '左一',
+                askMinusOne: '左一减一档',
+                bidPlusOne: '右一加一档',
+                bid: '右一'
+            }[result.readyMadePriceSource] || mooncakeGetBaseItemCostPriceSourceLabel(result.readyMadePriceSource))
+            : mooncakeGetBaseItemCostPriceSourceLabel(result.readyMadePriceSource);
+        const readyMadeLabel = isZH
+            ? `现成${readyMadeSourceLabel}:`
+            : `Ready-made ${readyMadeSourceLabel}:`;
+        const selectedSourceLabel = result.baseItemSource === 'craft'
+            ? (isZH ? '自制' : 'Craft')
+            : (isZH ? `现成${readyMadeSourceLabel}` : `Ready-made ${readyMadeSourceLabel}`);
+        const formatAvailableCost = value => Number(value) > 0
+            ? formatMoney(value)
+            : (isZH ? '无可用报价' : 'Unavailable');
         const manufactureDetail = !isBuy && Number.isFinite(result.manufactureProfit)
-            ? `<span class="tt-label">${isZH ? '制造材料成本:' : 'Manufacturing material cost:'}</span> <span class="tt-value">${formatMoney(result.directManufacturingCost)}</span>\n`
-                + `<span class="tt-label">${isZH ? `成交后（扣 ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% 市场税）` : `After ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% market tax`}:</span> <span class="tt-value">${formatMoney(result.afterTaxRevenue)}</span>\n`
+            ? `<span class="tt-label">${isZH ? `成交后（扣 ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% 市场税）` : `After ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% market tax`}:</span> <span class="tt-value">${formatMoney(result.afterTaxRevenue)}</span>\n`
                 + `<span class="tt-label">${isZH ? '制造利润:' : 'Manufacturing profit:'}</span> <span class="tt-value" style="color:${manufactureProfitColor};font-weight:bold;">${mooncakeFormatSignedMoney(result.manufactureProfit)}</span>`
             : '';
         return `<div class="tt-header">${title}</div>`
             + `<span class="tt-label">${isZH ? '装备:' : 'Item:'}</span> <span class="tt-value">${getItemName(itemHrid) || itemHrid} +0</span>\n`
             + `<span class="tt-label">${quoteLabel}</span> <span class="tt-value">${formatMoney(result.quotePrice)}</span>\n`
-            + `<span class="tt-label">${isZH ? '白板成本:' : 'Base-item cost:'}</span> <span class="tt-value">${formatMoney(result.manufacturingCost)}</span>\n`
-            + `<span class="tt-label">${isZH ? '计算口径:' : 'Basis:'}</span> <span class="tt-value">${isZH ? '白板成本 - 当前报价' : 'Base-item cost - current quote'}</span>\n`
+            + `<span class="tt-label">${isZH ? '自制成本:' : 'Craft cost:'}</span> <span class="tt-value">${formatAvailableCost(result.craftingCost)}</span>\n`
+            + `<span class="tt-label">${readyMadeLabel}</span> <span class="tt-value">${formatAvailableCost(result.readyMadeCost)}</span>\n`
+            + `<span class="tt-label">${isZH ? '采用成本:' : 'Selected cost:'}</span> <span class="tt-value" style="font-weight:bold;">${formatMoney(result.manufacturingCost)}（${selectedSourceLabel}）</span>\n`
+            + `<span class="tt-label">${isZH ? '计算口径:' : 'Basis:'}</span> <span class="tt-value">${isZH ? '采用成本 - 当前报价' : 'Selected cost - current quote'}</span>\n`
             + `<span class="tt-label">${comparisonLabel}</span> <span class="tt-value" style="color:${comparisonColor};font-weight:bold;">${mooncakeFormatSignedMoney(result.purchaseSavings)}</span>\n`
             + manufactureDetail;
     }
@@ -8635,11 +8878,13 @@
             }, 'websocket-init', { persistUnchanged: true });
             mooncakeReplaceCharacterActions(obj.characterActions, 'websocket-init');
             mooncakeCaptureOwnListingAnchors(obj.myMarketListings);
+            mooncakeUpdateListingFundsListings(obj.myMarketListings, { replace: true });
             mooncakeScheduleCharacterStateSync(120);
             return true;
         }
         if (obj.type === 'market_listings_updated') {
             mooncakeCaptureOwnListingAnchors(obj.endMarketListings, { uploadAfterPersist: true });
+            mooncakeUpdateListingFundsListings(obj.endMarketListings);
             return true;
         }
         if (obj.type === 'actions_updated' && Array.isArray(obj.endCharacterActions)) {
@@ -13685,6 +13930,7 @@
         '.mooncake-listing-age-header',
         '.mooncake-listing-age-cell',
         '.mooncake-market-inline-listing-age',
+        `[${MOONCAKE_LISTING_FUNDS_ATTR}="1"]`,
         '[data-mooncake-summary-hourly-cell]',
         `#${MOONCAKE_LEVEL_BAR_ID}`,
         `#${MOONCAKE_STOCK_NAV_BAR_ID}`,
@@ -13730,6 +13976,7 @@
     const MOONCAKE_MARKET_HISTORY_ENABLED_KEY = 'Mooncake_marketHistory_card_enabled_v1';
     const MOONCAKE_MARKET_HISTORY_CARD_SELL_FIRST_KEY = 'Mooncake_marketHistory_card_sell_first_v1';
     const MOONCAKE_MARKET_HISTORY_FLOAT_POSITION_KEY = 'Mooncake_marketHistory_relativePosition_v2';
+    const MOONCAKE_MARKET_HISTORY_MOBILE_POSITION_KEY = 'Mooncake_marketHistory_mobilePosition_v1';
     const MOONCAKE_MARKET_HISTORY_TTL = 5 * 60 * 1000;
     const MOONCAKE_MARKET_HISTORY_WINDOWS = [1, 3, 7];
     const MOONCAKE_MARKET_HISTORY_CARD_ID = 'MooncakeMarketHistoryCard';
@@ -13771,6 +14018,7 @@
     let mooncakeMarketHistoryActiveRequestKey = '';
     let mooncakeMarketHistoryScheduleTimer = 0;
     let mooncakeMarketHistoryFloatDrag = null;
+    let mooncakeMarketHistoryMobileDrag = null;
     let mooncakeMarketHistoryResizeFrame = 0;
     let mooncakeMarketHistoryLastRenderKey = '';
     let mooncakeMarketHistoryLastRenderAt = 0;
@@ -13886,6 +14134,47 @@
         } catch (_) {}
     }
 
+    function mooncakeReadMobileMarketHistoryPosition() {
+        try {
+            const stored = JSON.parse(localStorage.getItem(MOONCAKE_MARKET_HISTORY_MOBILE_POSITION_KEY) || 'null');
+            const left = Number(stored?.left);
+            const top = Number(stored?.top);
+            const viewportRatioX = Number(stored?.viewportRatioX);
+            const viewportRatioY = Number(stored?.viewportRatioY);
+            if (!Number.isFinite(left) && !Number.isFinite(viewportRatioX)) return null;
+            if (!Number.isFinite(top) && !Number.isFinite(viewportRatioY)) return null;
+            return { left, top, viewportRatioX, viewportRatioY };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function mooncakeWriteMobileMarketHistoryPosition(card) {
+        const rect = card?.getBoundingClientRect?.();
+        if (!rect) return;
+        const margin = 8;
+        const availableWidth = Math.max(1, window.innerWidth - Number(rect.width || 0) - margin * 2);
+        const availableHeight = Math.max(1, window.innerHeight - Number(rect.height || 0) - margin * 2);
+        const viewportRatioX = Math.min(1, Math.max(0, (rect.left - margin) / availableWidth));
+        const viewportRatioY = Math.min(1, Math.max(0, (rect.top - margin) / availableHeight));
+        card.dataset.mooncakeHistoryMobilePinned = '1';
+        try {
+            localStorage.setItem(MOONCAKE_MARKET_HISTORY_MOBILE_POSITION_KEY, JSON.stringify({
+                left: rect.left,
+                top: rect.top,
+                viewportRatioX,
+                viewportRatioY
+            }));
+        } catch (_) {}
+    }
+
+    function mooncakeClearMobileMarketHistoryPosition(card = document.getElementById(MOONCAKE_MARKET_HISTORY_MOBILE_ID)) {
+        if (card) delete card.dataset.mooncakeHistoryMobilePinned;
+        try {
+            localStorage.removeItem(MOONCAKE_MARKET_HISTORY_MOBILE_POSITION_KEY);
+        } catch (_) {}
+    }
+
     function mooncakeHasViewportHistoryPosition(savedPosition) {
         if (!savedPosition) return false;
         const ratioX = Number(savedPosition.viewportRatioX);
@@ -13956,6 +14245,12 @@
 
     function mooncakeResetMarketHistoryCardPosition() {
         mooncakeClearMarketHistoryFloatPosition();
+        const mobileCard = document.getElementById(MOONCAKE_MARKET_HISTORY_MOBILE_ID);
+        mooncakeClearMobileMarketHistoryPosition(mobileCard);
+        if (mobileCard) {
+            mooncakePositionMobileHistoryCard(mobileCard, mooncakeFindCurrentMarketItemNode());
+            return;
+        }
         const floatingCard = mooncakeGetMarketHistoryFollowingCard();
         if (floatingCard) {
             mooncakeRestoreFollowingMarketHistoryCardToAnchor(floatingCard);
@@ -14213,9 +14508,15 @@
         const enriched = {};
         for (const days of MOONCAKE_MARKET_HISTORY_WINDOWS) {
             const row = windows[days] || {};
+            // Older versions cached only an array of chart buckets. Keep
+            // accepting it so a warm in-memory cache remains usable here.
+            const detail = timeline[days];
             enriched[days] = {
                 ...row,
-                timeline: Array.isArray(timeline[days]) ? timeline[days] : []
+                timeline: Array.isArray(detail)
+                    ? detail
+                    : (Array.isArray(detail?.chart) ? detail.chart : []),
+                trades: Array.isArray(detail?.trades) ? detail.trades : []
             };
         }
         return enriched;
@@ -14701,7 +15002,13 @@
                 minPrice,
                 maxPrice
             };
-            if (timeline) timeline[days] = mooncakeBuildMarketHistoryTimelinePoints(priceStats.timeline, days, Math.floor(now / 1000));
+            if (timeline) {
+                const nowSeconds = Math.floor(now / 1000);
+                timeline[days] = {
+                    chart: mooncakeBuildMarketHistoryTimelinePoints(priceStats.timeline, days, nowSeconds),
+                    trades: mooncakeBuildMarketHistoryTradeRecords(priceStats.timeline, days, nowSeconds)
+                };
+            }
         }
         return includeTimeline ? { windows, timeline } : windows;
     }
@@ -14735,6 +15042,7 @@
 
     function mooncakeRemoveMarketHistoryCards(options = {}) {
         if (options.includeFloating) mooncakeMarketHistoryFloatDrag = null;
+        mooncakeMarketHistoryMobileDrag = null;
         const selector = [
             `#${MOONCAKE_MARKET_HISTORY_CARD_ID}`,
             `#${MOONCAKE_MARKET_HISTORY_MOBILE_ID}`,
@@ -14871,6 +15179,23 @@
         }));
     }
 
+    function mooncakeBuildMarketHistoryTradeRecords(rawPoints, days, nowSeconds = Math.floor(Date.now() / 1000)) {
+        const windowDays = Math.max(1, Math.floor(Number(days) || 1));
+        const windowEnd = Math.floor(Number(nowSeconds) || Date.now() / 1000);
+        const windowStart = windowEnd - windowDays * 24 * 60 * 60;
+        return (Array.isArray(rawPoints) ? rawPoints : [])
+            .map(point => ({
+                time: Math.floor(Number(point?.time)),
+                price: Number(point?.price),
+                volume: Number(point?.volume)
+            }))
+            .filter(point => Number.isFinite(point.time) && point.time > 0
+                && Number.isFinite(point.price) && point.price > 0
+                && Number.isFinite(point.volume) && point.volume > 0
+                && point.time >= windowStart && point.time <= windowEnd)
+            .sort((left, right) => right.time - left.time || right.price - left.price);
+    }
+
     function mooncakeBuildMarketHistoryTimelinePointDetail(point) {
         const start = mooncakeFormatMarketHistoryTimelineTime(point?.startTime || point?.time);
         const end = mooncakeFormatMarketHistoryTimelineTime(point?.endTime || point?.time);
@@ -14899,14 +15224,24 @@
         output.textContent = detail;
     }
 
-    function mooncakeBuildMarketHistoryTimelineTooltip(days, row) {
+    function mooncakeBuildMarketHistoryTimelineTooltip(days, row, itemHrid = '', level = 0) {
         const windowDays = Math.max(1, Math.floor(Number(days) || 1));
         const binSeconds = windowDays <= 1 ? 15 * 60 : windowDays <= 3 ? 60 * 60 : 2 * 60 * 60;
         const points = (Array.isArray(row?.timeline) ? row.timeline : [])
             .filter(point => Number(point?.time) > 0 && Number(point?.price) > 0 && Number(point?.volume) > 0)
             .sort((left, right) => Number(left.time) - Number(right.time));
+        const tradeRecords = Array.isArray(row?.trades) && row.trades.length
+            ? row.trades
+            : points.map(point => ({
+                time: point.startTime || point.time,
+                price: point.price,
+                volume: point.volume
+            }));
+        const trades = tradeRecords
+            .filter(trade => Number(trade?.time) > 0 && Number(trade?.price) > 0 && Number(trade?.volume) > 0)
+            .sort((left, right) => Number(right.time) - Number(left.time) || Number(right.price) - Number(left.price));
         const latestTradeAge = mooncakeFormatMarketHistoryTradeAge(row?.latestTradeAt);
-        const header = isZH ? `近 ${windowDays}d 交易时间轴` : `${windowDays}d trade timeline`;
+        const header = isZH ? `近 ${windowDays}d 成交记录` : `${windowDays}d trade records`;
         if (!points.length) {
             return `<div class="tt-header">${header}</div>`
                 + `<div class="mooncake-history-tooltip-note">${isZH ? '暂无可绘制的时段成交数据' : 'No timestamped trade records available'}</div>`;
@@ -15032,6 +15367,36 @@
         const firstLabel = mooncakeEscapeHtml(mooncakeFormatMarketHistoryTimelineTime(firstTime));
         const lastLabel = mooncakeEscapeHtml(mooncakeFormatMarketHistoryTimelineTime(lastTime));
         const defaultDetail = mooncakeEscapeHtml(mooncakeBuildMarketHistoryTimelinePointDetail(points.at(-1)));
+        const canCalculateTradeHourly = Number(level) > 0 && mooncakeIsMarketHistoryEquipmentTarget(itemHrid);
+        const hourlyContextAttributes = canCalculateTradeHourly
+            ? ` data-mooncake-history-hourly-context="1" data-mooncake-history-hourly-item="${mooncakeEscapeHtml(String(itemHrid || ''))}" data-mooncake-history-hourly-level="${Math.max(0, Math.floor(Number(level) || 0))}"`
+            : '';
+        const tradeRows = trades.map((trade, index) => {
+            const time = mooncakeEscapeHtml(mooncakeFormatMarketHistoryTimelineTime(trade.time));
+            const price = mooncakeEscapeHtml(mooncakeFormatMarketHistoryDetailPrice(trade.price));
+            const volume = mooncakeEscapeHtml(mooncakeFormatCompactNumber(trade.volume));
+            const border = index < trades.length - 1 ? 'border-bottom:1px solid rgba(164,190,238,.14);' : '';
+            const hourly = canCalculateTradeHourly
+                ? `<span data-mooncake-history-detail-hourly-price="${Number(trade.price)}" style="display:block;min-width:70px;color:rgba(230,238,255,.46);text-align:center;font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap;">...</span>`
+                : '<span style="display:block;min-width:70px;color:rgba(230,238,255,.42);text-align:center;font-weight:700;">-</span>';
+            return `<div style="display:grid;grid-template-columns:minmax(0,1.12fr) minmax(60px,.8fr) minmax(70px,.9fr) minmax(36px,.46fr);align-items:center;gap:8px;padding:4px 7px;${border}font-variant-numeric:tabular-nums;">
+                <span style="color:rgba(230,238,255,.74);text-align:center;">${time}</span>
+                <span style="color:#FFD700;text-align:center;font-weight:800;">${price}</span>
+                ${hourly}
+                <span style="color:#87CEEB;text-align:center;font-weight:750;">${volume}</span>
+            </div>`;
+        }).join('');
+        const tradeDetail = trades.length
+            ? `<div${hourlyContextAttributes} style="margin-top:7px;border:1px solid rgba(144,166,235,.28);border-radius:4px;overflow:hidden;">
+                <div style="display:grid;grid-template-columns:minmax(0,1.12fr) minmax(60px,.8fr) minmax(70px,.9fr) minmax(36px,.46fr);gap:8px;padding:4px 7px;background:rgba(75,89,138,.20);color:rgba(214,231,255,.80);font-size:10px;font-weight:800;text-align:center;">
+                    <span>${isZH ? '成交时段' : 'Period'}</span><span>${isZH ? '成交价' : 'Price'}</span><span>${isZH ? '工时' : 'Hourly'}</span><span>${isZH ? '数量' : 'Qty'}</span>
+                </div>
+                <div class="mooncake-history-tooltip-scroll" style="max-height:152px;padding-right:0;font-size:11px;line-height:1.35;">${tradeRows}</div>
+                <div style="padding:4px 7px;border-top:1px solid rgba(164,190,238,.14);color:rgba(230,238,255,.52);font-size:10px;">${isZH
+                    ? `接口按小时汇总，并非逐笔订单；近 ${windowDays}d 共 ${trades.length} 个成交时段`
+                    : `Hourly aggregates, not individual orders; ${trades.length} periods in ${windowDays}d`}</div>
+            </div>`
+            : `<div style="margin-top:7px;color:rgba(230,238,255,.52);font-size:10px;">${isZH ? '成交时段明细将在下次行情刷新后显示' : 'Period details appear after the next market-history refresh'}</div>`;
         return `<div class="tt-header">${header}</div>`
             + summary
             + `<div class="mooncake-history-timeline"><svg class="mooncake-history-timeline-chart" viewBox="0 0 ${width} 177" role="img" aria-label="${isZH ? '成交均价与成交量时间轴' : 'Average price and volume timeline'}">
@@ -15053,6 +15418,7 @@
                 <text x="${right}" y="172" text-anchor="end" fill="rgba(230,238,255,.55)" font-size="8.5">${lastLabel}</text>
             </svg></div>`
             + `<div class="mooncake-history-timeline-detail" data-mooncake-history-timeline-detail>${defaultDetail}</div>`
+            + tradeDetail
             + `<div style="margin-top:5px;padding-top:5px;border-top:1px solid #444;color:#aaa;font-size:11px;">${isZH ? '最近成交：' : 'Latest trade: '}${latestTradeAge}</div>`;
     }
 
@@ -15077,13 +15443,147 @@
         return calcHourlyWageAndMetrics(itemHrid, enhLevel, sourceMarketData, sellPrice);
     }
 
+    // Historical detail may contain many hourly price records. It needs the
+    // live market's wage and colour calculation, but not the alternative
+    // route comparison that is only displayed in richer route tooltips.
+    function mooncakeCalcMarketHistoryHourlyWageResultByPrice(itemHrid, level, price, marketData = null) {
+        const enhLevel = Number(level) || 0;
+        const sellPrice = Number(price) || 0;
+        if (enhLevel <= 0 || sellPrice <= 0 || !mooncakeIsEnhanceableItem(itemHrid)) return null;
+        const sourceMarketData = marketData || getMarketData();
+        if (!sourceMarketData) return null;
+        try {
+            const route = mooncakeCalculateEnhancementRouteAtPrice(itemHrid, enhLevel, sourceMarketData, sellPrice);
+            if (!route || !(Number(route.totalCost) > 0) || !(Number(route.totalTimeHours) > 0)) return null;
+            return {
+                hourlyWage: route.hourlyWage,
+                evaluation: mooncakeEvaluateEnhancementEconomics({
+                    itemHrid,
+                    enhancementLevel: enhLevel,
+                    sellPrice,
+                    totalCost: route.totalCost,
+                    hourlyWage: route.hourlyWage
+                })
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function mooncakeGetMarketHistoryHourlyDetailCache(anchor, itemHrid, level) {
+        const cacheHost = anchor?.closest?.(`#${MOONCAKE_MARKET_HISTORY_CARD_ID}, #${MOONCAKE_MARKET_HISTORY_MOBILE_ID}, ${MOONCAKE_MARKET_HISTORY_FLOAT_SELECTOR}`) || anchor;
+        const objective = getEnhancementRouteObjective();
+        const playerEnhanceSignature = `${mooncakeCharacterCalcSignature || 'live'}:${JSON.stringify(getPlayerEnhanceParams())}`;
+        const signature = `${mooncakeMarketPricingRevision}|${mooncakeHourlyWageColorProfileRevision}|${objective}|${playerEnhanceSignature}|${itemHrid}|${level}`;
+        let cache = cacheHost?._mooncakeHistoryHourlyDetailCache;
+        if (!cache || cache.signature !== signature) {
+            cache = { signature, values: new Map() };
+            if (cacheHost) cacheHost._mooncakeHistoryHourlyDetailCache = cache;
+        }
+        return cache;
+    }
+
+    function mooncakeHydrateMarketHistoryTimelineHourlyWages(tip = tooltipEl) {
+        const context = tip?.querySelector?.('[data-mooncake-history-hourly-context="1"]');
+        if (!context) return;
+        const itemHrid = String(context.getAttribute('data-mooncake-history-hourly-item') || '');
+        const level = Number(context.getAttribute('data-mooncake-history-hourly-level')) || 0;
+        const cells = Array.from(context.querySelectorAll('[data-mooncake-history-detail-hourly-price]'));
+        if (!itemHrid || !(level > 0) || !cells.length) return;
+
+        const cellsByPrice = new Map();
+        cells.forEach(cell => {
+            const price = Number(cell.getAttribute('data-mooncake-history-detail-hourly-price'));
+            if (!(price > 0)) {
+                cell.textContent = '-';
+                return;
+            }
+            const key = String(price);
+            const group = cellsByPrice.get(key) || { price, cells: [] };
+            group.cells.push(cell);
+            cellsByPrice.set(key, group);
+        });
+        const jobs = [...cellsByPrice.entries()];
+        if (!jobs.length) return;
+
+        const marketData = getMarketData();
+        const cache = mooncakeGetMarketHistoryHourlyDetailCache(tip._mooncakeTooltipAnchor, itemHrid, level);
+        const session = tip._mooncakeHistoryHourlySession;
+        const renderUnavailable = cell => {
+            cell.textContent = '-';
+            cell.style.color = 'rgba(230,238,255,.42)';
+        };
+        const renderResult = (cellsForPrice, result) => {
+            if (result && Number.isFinite(Number(result.hourlyWage))) {
+                const html = mooncakeFormatHourlyWageCompact(result.hourlyWage, result.evaluation?.combinedColor);
+                cellsForPrice.forEach(cell => {
+                    cell.innerHTML = html;
+                    cell.style.color = '';
+                });
+                return;
+            }
+            cellsForPrice.forEach(renderUnavailable);
+        };
+
+        if (!marketData) {
+            jobs.forEach(([, job]) => renderResult(job.cells, null));
+            return;
+        }
+
+        let pendingIndex = 0;
+        const processPending = () => {
+            if (tip._mooncakeHistoryHourlySession !== session || !tip.classList.contains('visible') || !tip.contains(context)) return;
+            const startedAt = performance.now();
+            let processed = 0;
+            while (pendingIndex < jobs.length && processed < 4) {
+                const [key, job] = jobs[pendingIndex++];
+                processed++;
+                let result = cache.values.get(key);
+                if (!cache.values.has(key)) {
+                    result = mooncakeCalcMarketHistoryHourlyWageResultByPrice(itemHrid, level, job.price, marketData);
+                    cache.values.set(key, result);
+                }
+                renderResult(job.cells, result);
+                if (performance.now() - startedAt >= 8) break;
+            }
+            if (pendingIndex < jobs.length && tip._mooncakeHistoryHourlySession === session) {
+                if (typeof window.requestAnimationFrame === 'function') {
+                    window.requestAnimationFrame(processPending);
+                } else {
+                    window.setTimeout(processPending, 0);
+                }
+            }
+        };
+        if (typeof window.requestAnimationFrame === 'function') {
+            window.requestAnimationFrame(processPending);
+        } else {
+            window.setTimeout(processPending, 0);
+        }
+    }
+
     function mooncakeFormatHourlyWageCompact(value, color = null) {
         if (value === null || value === undefined) return '-';
         const resolvedColor = color || (Number(value) >= 0 ? '#B9E6A3' : '#FF9A9A');
         return `<span style="color:${resolvedColor};font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap;">${mooncakeFormatSignedHourlyWage(value)}</span>`;
     }
 
-    function mooncakeBuildMarketHistoryHourlyRange(itemHrid, level, minPrice, maxPrice, medianPrice = 0, marketData = undefined, resultByPrice = null) {
+    function mooncakeFormatMobileHourlyWageCompact(value, color = null) {
+        const number = Number(value);
+        if (!Number.isFinite(number)) return '-';
+        const absolute = Math.abs(number);
+        const unit = absolute >= 1e12 ? ['T', 1e12]
+            : absolute >= 1e9 ? ['B', 1e9]
+                : absolute >= 1e6 ? ['M', 1e6]
+                    : absolute >= 1e3 ? ['K', 1e3]
+                        : ['', 1];
+        const scaled = absolute / unit[1];
+        const digits = scaled >= 100 ? 0 : 1;
+        const compact = scaled.toFixed(digits).replace(/\.0$/, '');
+        const resolvedColor = color || (number >= 0 ? '#B9E6A3' : '#FF9A9A');
+        return `<span style="color:${resolvedColor};font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap;">${number > 0 ? '+' : ''}${number < 0 ? '-' : ''}${compact}${unit[0]}</span>`;
+    }
+
+    function mooncakeBuildMarketHistoryHourlyRange(itemHrid, level, minPrice, maxPrice, medianPrice = 0, marketData = undefined, resultByPrice = null, options = {}) {
         const emptyRange = { sellFirst: '-', buyFirst: '-', medianResult: null };
         if (Number(level) <= 0) return emptyRange;
         const sourceMarketData = marketData === undefined ? getMarketData() : marketData;
@@ -15101,7 +15601,9 @@
         const maxResult = getHourlyResult(maxPrice);
         const medianResult = getHourlyResult(medianPrice);
         if (!minResult && !maxResult && !medianResult) return emptyRange;
-        const formatHourly = (result) => mooncakeFormatHourlyWageCompact(result?.hourlyWage, result?.evaluation?.combinedColor);
+        const formatHourly = (result) => options.compact === true
+            ? mooncakeFormatMobileHourlyWageCompact(result?.hourlyWage, result?.evaluation?.combinedColor)
+            : mooncakeFormatHourlyWageCompact(result?.hourlyWage, result?.evaluation?.combinedColor);
         const divider = '<span style="color:rgba(230,238,255,.45);padding:0 2px;">/</span>';
         return {
             sellFirst: `${formatHourly(maxResult)}${divider}${formatHourly(minResult)}`,
@@ -15119,31 +15621,44 @@
             + `<span data-mooncake-history-order-value="buy-first"${sellFirst ? ' hidden' : ''}>${buyFirstValue}</span>`;
     }
 
+    function mooncakeBuildCompactMarketHistoryColGroup(itemHrid, showHourly, visibleColumns) {
+        const columns = [{ weight: 10 }];
+        if (visibleColumns.average) columns.push({ weight: 19 });
+        if (visibleColumns.median) columns.push({ weight: 19 });
+        if (visibleColumns.volume) columns.push({ weight: 14 });
+        if (visibleColumns.buySell) columns.push({ weight: 20 });
+        if (visibleColumns.range) columns.push({ weight: 26 });
+        if (showHourly && visibleColumns.hourly) columns.push({ weight: 30 });
+        const totalWeight = columns.reduce((total, column) => total + column.weight, 0) || 1;
+        return `<colgroup>${columns.map(column => `<col style="width:${(column.weight / totalWeight * 100).toFixed(3)}%;">`).join('')}</colgroup>`;
+    }
+
     function mooncakeBuildMarketHistoryRows(itemHrid, level, windows, sellFirst, options = {}) {
         const dayColors = { 1: '#FF6B6B', 3: '#4ECDC4', 7: '#95E1D3' };
         const showHourly = mooncakeIsMarketHistoryEquipmentTarget(itemHrid);
         const compact = options.compact === true;
         const visibleColumns = mooncakeGetMarketHistoryMobileColumns();
-        const cellPad = compact ? '1px 2px' : '2px 2px';
-        const dayCellPad = compact ? '1px 2px 1px 0' : '2px 2px 2px 0';
-        const hourlyCellPad = compact ? '1px 0 1px 2px' : '2px 0 2px 2px';
+        const cellPad = compact ? '1px' : '2px 2px';
+        const dayCellPad = compact ? '1px 0' : '2px 2px 2px 0';
+        const hourlyCellPad = compact ? '1px' : '2px 0 2px 2px';
+        const compactCellStyle = compact ? 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' : '';
         const marketData = showHourly ? getMarketData() : null;
         const hourlyResultByPrice = new Map();
         return MOONCAKE_MARKET_HISTORY_WINDOWS.map(days => {
             const row = windows?.[days] || {};
             const hourlyRange = showHourly
-                ? mooncakeBuildMarketHistoryHourlyRange(itemHrid, level, row.minPrice, row.maxPrice, row.medianPrice, marketData, hourlyResultByPrice)
+                ? mooncakeBuildMarketHistoryHourlyRange(itemHrid, level, row.minPrice, row.maxPrice, row.medianPrice, marketData, hourlyResultByPrice, { compact })
                 : null;
             const medianTitle = mooncakeBuildMarketHistoryMedianTitle(row.medianPrice, hourlyRange?.medianResult, showHourly);
             return `
                 <tr>
-                    <td style="padding:${dayCellPad};color:${dayColors[days] || '#95E1D3'};font-weight:800;">${days}d</td>
-                    ${visibleColumns.average ? `<td style="padding:${cellPad};text-align:center;color:#FFD700;font-weight:700;font-variant-numeric:tabular-nums;">${mooncakeFormatMarketHistoryPrice(row.avgPrice)}</td>` : ''}
-                    ${visibleColumns.median ? `<td title="${medianTitle}" style="padding:${cellPad};text-align:center;color:#FFA500;font-weight:700;font-variant-numeric:tabular-nums;">${mooncakeFormatMarketHistoryPrice(row.medianPrice)}</td>` : ''}
-                    ${visibleColumns.volume ? `<td style="padding:${cellPad};text-align:center;color:#87CEEB;font-weight:700;font-variant-numeric:tabular-nums;">${mooncakeFormatHistoryPrice(row.volume)}</td>` : ''}
-                    ${visibleColumns.buySell ? `<td style="padding:${cellPad};text-align:center;color:#90EE90;font-weight:700;font-variant-numeric:tabular-nums;">${mooncakeFormatHistoryPrice(row.buyVolume)}/${mooncakeFormatHistoryPrice(row.sellVolume)}</td>` : ''}
-                    ${visibleColumns.range ? `<td class="mooncake-market-history-price-cell" data-mooncake-history-price-window="${days}" style="padding:${cellPad};text-align:center;color:#FFFF00;font-weight:700;font-variant-numeric:tabular-nums;">${mooncakeBuildMarketHistoryOrderValue(`${mooncakeFormatMarketHistoryPrice(row.maxPrice)}/${mooncakeFormatMarketHistoryPrice(row.minPrice)}`, `${mooncakeFormatMarketHistoryPrice(row.minPrice)}/${mooncakeFormatMarketHistoryPrice(row.maxPrice)}`, sellFirst)}</td>` : ''}
-                    ${showHourly && visibleColumns.hourly ? `<td title="${medianTitle}" style="padding:${hourlyCellPad};text-align:center;font-variant-numeric:tabular-nums;">${mooncakeBuildMarketHistoryOrderValue(hourlyRange.sellFirst, hourlyRange.buyFirst, sellFirst)}</td>` : ''}
+                    <td style="padding:${dayCellPad};color:${dayColors[days] || '#95E1D3'};font-weight:800;${compactCellStyle}">${days}d</td>
+                    ${visibleColumns.average ? `<td style="padding:${cellPad};text-align:center;color:#FFD700;font-weight:700;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeFormatMarketHistoryPrice(row.avgPrice)}</td>` : ''}
+                    ${visibleColumns.median ? `<td title="${medianTitle}" style="padding:${cellPad};text-align:center;color:#FFA500;font-weight:700;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeFormatMarketHistoryPrice(row.medianPrice)}</td>` : ''}
+                    ${visibleColumns.volume ? `<td style="padding:${cellPad};text-align:center;color:#87CEEB;font-weight:700;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeFormatHistoryPrice(row.volume)}</td>` : ''}
+                    ${visibleColumns.buySell ? `<td style="padding:${cellPad};text-align:center;color:#90EE90;font-weight:700;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeFormatHistoryPrice(row.buyVolume)}/${mooncakeFormatHistoryPrice(row.sellVolume)}</td>` : ''}
+                    ${visibleColumns.range ? `<td class="mooncake-market-history-price-cell" data-mooncake-history-price-window="${days}" style="padding:${cellPad};text-align:center;color:#FFFF00;font-weight:700;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeBuildMarketHistoryOrderValue(`${mooncakeFormatMarketHistoryPrice(row.maxPrice)}/${mooncakeFormatMarketHistoryPrice(row.minPrice)}`, `${mooncakeFormatMarketHistoryPrice(row.minPrice)}/${mooncakeFormatMarketHistoryPrice(row.maxPrice)}`, sellFirst)}</td>` : ''}
+                    ${showHourly && visibleColumns.hourly ? `<td title="${medianTitle}" style="padding:${hourlyCellPad};text-align:center;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeBuildMarketHistoryOrderValue(hourlyRange.sellFirst, hourlyRange.buyFirst, sellFirst)}</td>` : ''}
                 </tr>
             `;
         }).join('');
@@ -15154,7 +15669,9 @@
         card.querySelectorAll('.mooncake-market-history-price-cell').forEach(cell => {
             const days = Math.max(1, Math.floor(Number(cell.getAttribute('data-mooncake-history-price-window')) || 1));
             const row = windows?.[days] || {};
-            bindTooltip(cell, () => mooncakeBuildMarketHistoryTimelineTooltip(days, row), { interactive: true });
+            const itemHrid = String(card.dataset.itemHrid || '');
+            const level = Number(card.dataset.level) || 0;
+            bindTooltip(cell, () => mooncakeBuildMarketHistoryTimelineTooltip(days, row, itemHrid, level), { interactive: true });
         });
     }
 
@@ -15165,26 +15682,31 @@
         const compact = options.compact === true;
         const visibleColumns = mooncakeGetMarketHistoryMobileColumns();
         const showOrderToggle = visibleColumns.range || (showHourly && visibleColumns.hourly);
-        const headPad = compact ? '0 2px 2px' : '0 2px 3px';
-        const tableFontSize = compact ? '10px' : '11px';
+        const headPad = compact ? '0 1px 2px' : '0 2px 3px';
+        const tableFontSize = compact ? '9px' : '11px';
         const tableLineHeight = compact ? '1.2' : '1.35';
         const tableWidth = compact || showHourly ? '100%' : 'auto';
+        const compactHeadStyle = compact ? 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' : '';
+        const compactColGroup = compact
+            ? mooncakeBuildCompactMarketHistoryColGroup(itemHrid, showHourly, visibleColumns)
+            : '';
         const sideVolumeTitle = isZH
             ? '买/卖：估算的成交数量，非人数。左为主动买入（成交价更接近卖一 a），右为主动卖出（更接近买一 b）。接口没有逐笔成交方向，仅供参考。'
             : 'Buy/Sell: estimated item quantity, not player count. Left is aggressive buying (price closer to ask a); right is aggressive selling (closer to bid b). The API has no per-trade side, so this is indicative only.';
         const body = stateText
             ? `<div style="display:flex;align-items:center;gap:8px;padding:3px 2px;color:rgba(230,238,255,.68);font-size:${compact ? '12px' : '13px'};white-space:nowrap;"><span>${stateText}</span>${stateText === '加载失败' ? '<button type="button" data-mooncake-history-refresh="1" style="cursor:pointer;border:1px solid rgba(144,166,235,.35);border-radius:5px;background:rgba(144,166,235,.16);color:#eef6ff;padding:2px 6px;font-size:11px;">重试</button>' : ''}</div>`
             : `<div style="overflow-x:${compact ? 'hidden' : 'auto'};overflow-y:hidden;max-width:100%;">
-                    <table style="width:${tableWidth};border-collapse:collapse;font-size:${tableFontSize};line-height:${tableLineHeight};white-space:nowrap;table-layout:auto;">
+                    <table style="width:${tableWidth};border-collapse:collapse;font-size:${tableFontSize};line-height:${tableLineHeight};white-space:nowrap;table-layout:${compact ? 'fixed' : 'auto'};">
+                        ${compactColGroup}
                         <thead>
                             <tr style="color:#AAAAAA;font-size:${tableFontSize};">
-                                <th style="padding:0 2px 3px 0;font-weight:700;">${showOrderToggle ? `<button type="button" data-mooncake-history-order-toggle="1" title="${orderPresentation.nextTitle}" aria-label="${orderPresentation.toggleLabel}" aria-pressed="${!sellFirst}" style="width:18px;height:16px;padding:0;border:0;background:transparent;color:rgba(220,232,255,.42);font-size:${tableFontSize};font-weight:400;line-height:1;cursor:pointer;opacity:.72;">⇄</button>` : ''}</th>
-                                ${visibleColumns.average ? `<th style="padding:${headPad};text-align:center;font-weight:700;">均价</th>` : ''}
-                                ${visibleColumns.median ? `<th style="padding:${headPad};text-align:center;font-weight:700;">中位</th>` : ''}
-                                ${visibleColumns.volume ? `<th style="padding:${headPad};text-align:center;font-weight:700;">量</th>` : ''}
-                                ${visibleColumns.buySell ? `<th title="${sideVolumeTitle}" style="padding:${headPad};text-align:center;font-weight:700;">${isZH ? '买/卖' : 'Buy/Sell'}</th>` : ''}
-                                ${visibleColumns.range ? `<th data-mooncake-history-order-label="1" data-sell-first-label="max/min" data-buy-first-label="min/max" style="padding:${headPad};text-align:center;font-weight:700;">${orderPresentation.priceHeader}</th>` : ''}
-                                ${showHourly && visibleColumns.hourly ? `<th data-mooncake-history-order-label="1" data-sell-first-label="${isZH ? '工时' : 'Hourly'}" data-buy-first-label="${isZH ? '工时' : 'Hourly'}" style="padding:0 0 2px 2px;text-align:center;font-weight:700;">${orderPresentation.hourlyHeader}</th>` : ''}
+                                <th style="padding:0 1px 2px 0;text-align:center;font-weight:700;${compactHeadStyle}">${showOrderToggle ? `<button type="button" data-mooncake-history-order-toggle="1" title="${orderPresentation.nextTitle}" aria-label="${orderPresentation.toggleLabel}" aria-pressed="${!sellFirst}" style="width:${compact ? '14px' : '18px'};height:${compact ? '14px' : '16px'};padding:0;border:0;background:transparent;color:rgba(220,232,255,.42);font-size:${tableFontSize};font-weight:400;line-height:1;cursor:pointer;opacity:.72;">⇄</button>` : ''}</th>
+                                ${visibleColumns.average ? `<th style="padding:${headPad};text-align:center;font-weight:700;${compactHeadStyle}">均价</th>` : ''}
+                                ${visibleColumns.median ? `<th style="padding:${headPad};text-align:center;font-weight:700;${compactHeadStyle}">中位</th>` : ''}
+                                ${visibleColumns.volume ? `<th style="padding:${headPad};text-align:center;font-weight:700;${compactHeadStyle}">量</th>` : ''}
+                                ${visibleColumns.buySell ? `<th title="${sideVolumeTitle}" style="padding:${headPad};text-align:center;font-weight:700;${compactHeadStyle}">${isZH ? '买/卖' : 'Buy/Sell'}</th>` : ''}
+                                ${visibleColumns.range ? `<th data-mooncake-history-order-label="1" data-sell-first-label="max/min" data-buy-first-label="min/max" style="padding:${headPad};text-align:center;font-weight:700;${compactHeadStyle}">${orderPresentation.priceHeader}</th>` : ''}
+                                ${showHourly && visibleColumns.hourly ? `<th data-mooncake-history-order-label="1" data-sell-first-label="${isZH ? '工时' : 'Hourly'}" data-buy-first-label="${isZH ? '工时' : 'Hourly'}" style="padding:${headPad};text-align:center;font-weight:700;${compactHeadStyle}">${orderPresentation.hourlyHeader}</th>` : ''}
                             </tr>
                         </thead>
                         <tbody>${mooncakeBuildMarketHistoryRows(itemHrid, level, windows, sellFirst, { compact })}</tbody>
@@ -15219,6 +15741,18 @@
         return Math.max(168, Math.min(420, width + 18));
     }
 
+    function mooncakeMoveMobileMarketHistoryCard(card, requestedLeft, requestedTop, measuredSize = null) {
+        if (!card?.isConnected) return;
+        const margin = 8;
+        const rect = measuredSize || card.getBoundingClientRect();
+        const maxLeft = Math.max(margin, window.innerWidth - Number(rect.width || 0) - margin);
+        const maxTop = Math.max(margin, window.innerHeight - Number(rect.height || 0) - margin);
+        const left = Math.min(maxLeft, Math.max(margin, Number.isFinite(requestedLeft) ? requestedLeft : margin));
+        const top = Math.min(maxTop, Math.max(margin, Number.isFinite(requestedTop) ? requestedTop : margin));
+        card.style.left = `${left}px`;
+        card.style.top = `${top}px`;
+    }
+
     function mooncakePositionMobileHistoryCard(card, currentItem) {
         const margin = 8;
         const itemRect = currentItem?.getBoundingClientRect?.();
@@ -15226,10 +15760,25 @@
         const iconRect = iconNode?.getBoundingClientRect?.();
         const anchorRect = iconRect && iconRect.width > 0 && iconRect.height > 0 ? iconRect : itemRect;
         const expanded = card.dataset.expanded === '1';
+        const viewportWidth = Math.max(1, window.innerWidth - margin * 2);
         const width = expanded
-            ? Math.min(mooncakeGetMobileMarketHistoryCardWidth(card.dataset.itemHrid), window.innerWidth - margin * 2)
-            : 34;
-        const height = expanded ? Math.max(122, Math.min(170, card.offsetHeight || 138)) : 28;
+            ? Math.min(Math.max(280, mooncakeGetMobileMarketHistoryCardWidth(card.dataset.itemHrid) + 28), viewportWidth)
+            : 60;
+        Object.assign(card.style, {
+            position: 'fixed',
+            width: `${width}px`,
+            minHeight: expanded ? '112px' : '30px',
+            maxWidth: `calc(100vw - ${margin * 2}px)`,
+            maxHeight: expanded ? `min(176px, calc(100vh - ${margin * 2}px))` : '30px',
+            overflowX: 'hidden',
+            overflowY: expanded ? 'auto' : 'hidden',
+            zIndex: MOONCAKE_MARKET_HISTORY_FLOAT_Z_INDEX,
+            padding: expanded ? '6px 34px 7px 6px' : '0',
+            cursor: '',
+            touchAction: 'auto',
+            userSelect: 'none'
+        });
+        const height = expanded ? Math.max(112, Math.min(176, card.getBoundingClientRect().height || 132)) : 30;
         const anchorLeft = anchorRect ? anchorRect.right + 6 : window.innerWidth - width - margin;
         const collapsedLeft = Math.min(Math.max(margin, anchorLeft), window.innerWidth - width - margin);
         const expandedLeft = Math.min(Math.max(margin, anchorLeft), window.innerWidth - width - margin);
@@ -15240,17 +15789,21 @@
         if (expandedTop + height > window.innerHeight - margin) {
             expandedTop = Math.max(margin, window.innerHeight - height - margin);
         }
-        const left = expanded ? expandedLeft : collapsedLeft;
-        const top = Math.max(margin, Math.min(expanded ? expandedTop : collapsedTop, window.innerHeight - height - margin));
-        Object.assign(card.style, {
-            position: 'fixed',
-            left: `${left}px`,
-            top: `${top}px`,
-            width: `${width}px`,
-            minHeight: `${height}px`,
-            zIndex: MOONCAKE_MARKET_HISTORY_CARD_Z_INDEX,
-            padding: expanded ? '7px 42px 7px 8px' : '0'
-        });
+        const saved = mooncakeReadMobileMarketHistoryPosition();
+        const availableWidth = Math.max(1, window.innerWidth - width - margin * 2);
+        const availableHeight = Math.max(1, window.innerHeight - height - margin * 2);
+        const savedLeft = Number.isFinite(saved?.viewportRatioX)
+            ? margin + Math.min(1, Math.max(0, saved.viewportRatioX)) * availableWidth
+            : Number(saved?.left);
+        const savedTop = Number.isFinite(saved?.viewportRatioY)
+            ? margin + Math.min(1, Math.max(0, saved.viewportRatioY)) * availableHeight
+            : Number(saved?.top);
+        if (saved) card.dataset.mooncakeHistoryMobilePinned = '1';
+        const left = Number.isFinite(savedLeft) ? savedLeft : (expanded ? expandedLeft : collapsedLeft);
+        const top = Number.isFinite(savedTop)
+            ? savedTop
+            : Math.max(margin, Math.min(expanded ? expandedTop : collapsedTop, window.innerHeight - height - margin));
+        mooncakeMoveMobileMarketHistoryCard(card, left, top, { width, height });
     }
 
     function mooncakeCreateMarketHistoryCardControl(text, title, attribute) {
@@ -15328,11 +15881,25 @@
 
         const controls = document.createElement('span');
         controls.setAttribute('data-mooncake-history-card-controls', '1');
+        const dragHandle = mooncakeCreateMarketHistoryCardControl('⠿', isZH ? '按住拖动交易卡片' : 'Drag trading card', 'data-mooncake-history-mobile-drag-handle');
+        Object.assign(dragHandle.style, {
+            width: '24px',
+            minWidth: '24px',
+            height: '24px',
+            minHeight: '24px',
+            cursor: 'grab',
+            touchAction: 'none',
+            fontSize: '15px'
+        });
+        controls.appendChild(dragHandle);
         controls.appendChild(mooncakeCreateMarketHistoryCardControl('×', isZH ? '收起' : 'Collapse', 'data-mooncake-history-toggle'));
         Object.assign(controls.style, {
             position: 'absolute',
             right: '4px',
             top: '3px',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
             gap: '2px'
         });
         card.appendChild(controls);
@@ -15430,6 +15997,15 @@
     function mooncakeBuildMarketHistoryCollapsedHtml() {
         const title = isZH ? '点击展开交易卡片' : 'Expand trading card';
         return `<span title="${title}" aria-label="${title}" style="display:flex;width:32px;height:26px;align-items:center;justify-content:center;color:#eef6ff;font-size:13px;font-weight:900;line-height:1;cursor:pointer;">量</span>`;
+    }
+
+    function mooncakeBuildMobileMarketHistoryCollapsedHtml() {
+        const toggleTitle = isZH ? '展开交易卡片' : 'Expand trading card';
+        const dragTitle = isZH ? '按住拖动交易卡片' : 'Drag trading card';
+        return `<span style="display:flex;width:58px;height:28px;align-items:center;justify-content:center;gap:0;">
+            <button type="button" data-mooncake-history-toggle="1" title="${toggleTitle}" aria-label="${toggleTitle}" style="width:34px;height:28px;padding:0;border:0;background:transparent;color:#eef6ff;font-size:13px;font-weight:900;cursor:pointer;">量</button>
+            <button type="button" data-mooncake-history-mobile-drag-handle="1" title="${dragTitle}" aria-label="${dragTitle}" style="width:24px;height:28px;padding:0;border:0;background:transparent;color:rgba(238,246,255,.72);font-size:15px;font-weight:800;line-height:1;cursor:grab;touch-action:none;">⠿</button>
+        </span>`;
     }
 
     function mooncakeRenderFloatingMarketHistoryCard(card, target, windows, stateText = '') {
@@ -15644,6 +16220,80 @@
         mooncakeMarketHistoryFloatDrag = null;
     }
 
+    function mooncakeStartMobileMarketHistoryDrag(event) {
+        if (event.isPrimary === false || (event.pointerType === 'mouse' && event.button !== 0)) return;
+        const handle = event.target?.closest?.('[data-mooncake-history-mobile-drag-handle]');
+        const card = handle?.closest?.(`#${MOONCAKE_MARKET_HISTORY_MOBILE_ID}`);
+        if (!handle || !card?.isConnected) return;
+        const rect = card.getBoundingClientRect();
+        mooncakeMarketHistoryMobileDrag = {
+            card,
+            handle,
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            offsetX: event.clientX - rect.left,
+            offsetY: event.clientY - rect.top,
+            width: rect.width,
+            height: rect.height,
+            moved: false,
+            pendingLeft: null,
+            pendingTop: null,
+            frame: 0
+        };
+        handle.style.cursor = 'grabbing';
+        try { handle.setPointerCapture?.(event.pointerId); } catch (_) {}
+        event.preventDefault();
+        event.stopPropagation();
+    }
+
+    function mooncakeMoveMobileMarketHistoryDrag(event) {
+        const drag = mooncakeMarketHistoryMobileDrag;
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        if (!drag.card?.isConnected) {
+            if (drag.frame) cancelAnimationFrame(drag.frame);
+            mooncakeMarketHistoryMobileDrag = null;
+            return;
+        }
+        const deltaX = event.clientX - drag.startX;
+        const deltaY = event.clientY - drag.startY;
+        if (!drag.moved && Math.hypot(deltaX, deltaY) < 4) {
+            event.preventDefault();
+            return;
+        }
+        drag.moved = true;
+        drag.pendingLeft = event.clientX - drag.offsetX;
+        drag.pendingTop = event.clientY - drag.offsetY;
+        if (!drag.frame) {
+            drag.frame = requestAnimationFrame(() => {
+                drag.frame = 0;
+                mooncakeMoveMobileMarketHistoryCard(
+                    drag.card,
+                    drag.pendingLeft,
+                    drag.pendingTop,
+                    { width: drag.width, height: drag.height }
+                );
+            });
+        }
+        event.preventDefault();
+    }
+
+    function mooncakeEndMobileMarketHistoryDrag(event) {
+        const drag = mooncakeMarketHistoryMobileDrag;
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        if (drag.frame) cancelAnimationFrame(drag.frame);
+        drag.frame = 0;
+        if (drag.moved) {
+            const finalLeft = Number.isFinite(drag.pendingLeft) ? drag.pendingLeft : drag.card.getBoundingClientRect().left;
+            const finalTop = Number.isFinite(drag.pendingTop) ? drag.pendingTop : drag.card.getBoundingClientRect().top;
+            mooncakeMoveMobileMarketHistoryCard(drag.card, finalLeft, finalTop, { width: drag.width, height: drag.height });
+            mooncakeWriteMobileMarketHistoryPosition(drag.card);
+        }
+        try { drag.handle?.releasePointerCapture?.(event.pointerId); } catch (_) {}
+        if (drag.handle?.isConnected) drag.handle.style.cursor = 'grab';
+        mooncakeMarketHistoryMobileDrag = null;
+    }
+
     function mooncakeRenderMarketHistoryCard(target, windows = null, stateText = '') {
         if (!target?.currentItem || !target.itemHrid) {
             mooncakeRemoveMarketHistoryCards({ includeFloating: true });
@@ -15712,7 +16362,7 @@
         }
 
         if (isMobile && card.dataset.expanded !== '1') {
-            card.innerHTML = `<button type="button" data-mooncake-history-toggle="1" title="交易量" style="width:34px;height:28px;border:0;background:transparent;color:#eef6ff;font-size:13px;font-weight:900;cursor:pointer;">量</button>`;
+            card.innerHTML = mooncakeBuildMobileMarketHistoryCollapsedHtml();
             mooncakePositionMobileHistoryCard(card, target.currentItem);
             return card;
         }
@@ -15757,7 +16407,15 @@
             if (!regularCardIsCurrent) mooncakeRenderMarketHistoryCard(target, null, '加载中...');
             return;
         }
-        const followingCard = mooncakeGetMarketHistoryFollowingCard();
+        let followingCard = mooncakeGetMarketHistoryFollowingCard();
+        // A desktop floating card uses its own wide-table renderer. Do not
+        // retain it after crossing into the handset layout, or it can cover
+        // the order book instead of being rebuilt as the compact phone card.
+        if (isPhone && followingCard) {
+            if (mooncakeMarketHistoryFloatDrag?.card === followingCard) mooncakeMarketHistoryFloatDrag = null;
+            followingCard.remove();
+            followingCard = null;
+        }
         const followingCurrentTarget = followingCard
             && followingCard.dataset.itemHrid === target.itemHrid
             && Number(followingCard.dataset.level) === Number(target.level);
@@ -16063,6 +16721,10 @@
                 event.stopPropagation();
             }
         }, true);
+        document.addEventListener('pointerdown', mooncakeStartMobileMarketHistoryDrag, true);
+        window.addEventListener('pointermove', mooncakeMoveMobileMarketHistoryDrag, { capture: true, passive: false });
+        window.addEventListener('pointerup', mooncakeEndMobileMarketHistoryDrag, true);
+        window.addEventListener('pointercancel', mooncakeEndMobileMarketHistoryDrag, true);
         document.addEventListener('pointerdown', mooncakeStartMarketHistoryFloatingDrag, true);
         window.addEventListener('pointermove', mooncakeMoveMarketHistoryFloatingDrag, { capture: true, passive: false });
         window.addEventListener('pointerup', mooncakeEndMarketHistoryFloatingDrag, true);
@@ -16135,6 +16797,14 @@
                 const currentItem = mooncakeFindCurrentMarketItemNode();
                 const phoneCard = document.getElementById(MOONCAKE_MARKET_HISTORY_MOBILE_ID);
                 if (phoneCard) mooncakePositionMobileHistoryCard(phoneCard, currentItem);
+                if (mooncakeIsPhoneMarketUi()) {
+                    const desktopFloating = mooncakeGetMarketHistoryFollowingCard();
+                    if (desktopFloating) {
+                        if (mooncakeMarketHistoryFloatDrag?.card === desktopFloating) mooncakeMarketHistoryFloatDrag = null;
+                        desktopFloating.remove();
+                        scheduleMooncakeMarketHistoryCard(0, { force: true });
+                    }
+                }
                 mooncakeGetMarketHistoryFloatingCards().forEach(floating => mooncakePositionFloatingMarketHistoryCard(floating, null, currentItem));
             });
         }, true);
@@ -32156,7 +32826,7 @@
             mooncakeSyncMyListingsManagementControl(control);
             mooncakeScheduleMyListingsManagement();
         });
-        control.append(searchWrap, ...sideButtons, collectable, undercut);
+        control.append(searchWrap, ...sideButtons, undercut, collectable);
 
         const listingCount = root.querySelector('[class*="MarketplacePanel_listingCount"]');
         const buttonHost = root.querySelector('[class*="MarketplacePanel_buttonContainer"]');
@@ -33862,6 +34532,7 @@
 
         hookWebSocket();
         mooncakeStartListingTime();
+        mooncakeStartListingFundsDisplay();
         setTimeout(startMooncakeChatLaborObserver, 1200);
         hookMooncakeMarketHistoryEvents();
         hookMooncakeOrderModalEconomics();
@@ -35459,7 +36130,7 @@
         );
         listings.rows.append(
             mooncakeCreateEnhancementSettingsToggle('my-listings-management', isZH ? '挂单管理' : 'Listing management', isZH ? '搜索并筛选我的挂单。' : 'Search and filter your listings.'),
-            mooncakeCreateEnhancementSettingsToggle('market-listing-age-upload', isZH ? '挂单时间众筹' : 'Share listing times', isZH ? '共享挂单id，估算创建时间。' : 'Share only your listing IDs and creation times.'),
+            mooncakeCreateEnhancementSettingsToggle('market-listing-age-upload', isZH ? '挂单时间众筹' : 'Share listing times', isZH ? '共享挂单 id、估算创建时间，并显示挂单资金汇总。' : 'Share listing IDs, estimate creation times, and show listing fund totals.'),
             mooncakeCreateEnhancementSettingsToggle('order-archive', isZH ? '挂单记录' : 'Order archive', isZH ? '保存挂单快照。' : 'Save listing snapshots.'),
             orderTargetHourlyRow,
             mooncakeCreateEnhancementSettingsToggle('my-listings-target-filter', isZH ? '扣扣出击' : 'Undercut', isZH ? '筛选可继续压价的出售单。' : 'Find sale listings that can be undercut.'),
