@@ -24323,6 +24323,8 @@
     const MOONCAKE_ENH_COST_MARKET_ATTR = 'data-mooncake-enh-cost-market';
     const MOONCAKE_ENH_COST_MARKET_HOST_ATTR = 'data-mooncake-enh-cost-market-host';
     const MOONCAKE_ENH_COST_MARKET_SIG_ATTR = 'data-mooncake-enh-cost-market-sig';
+    const MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR = 'data-mooncake-upgrade-source-market';
+    const MOONCAKE_UPGRADE_SOURCE_MARKET_HOST_ATTR = 'data-mooncake-upgrade-source-market-host';
     const MOONCAKE_ENH_PREVIEW_EXCLUDE_SEL = '[class*="SkillActionDetail_enhancingOutput"], [class*="SkillActionDetail_outputItems"]';
     const MOONCAKE_ENH_PROTECTION_NEAR_ASK_RATIO = 0.05;
     const MOONCAKE_ENH_PROTECTION_NEAR_ASK_LIMIT = 3;
@@ -24360,6 +24362,9 @@
     ].join(',');
     const mooncakeEnhanceCostPurchaseHostStyles = new WeakMap();
     const mooncakeEnhanceCostPurchaseFirstChildStyles = new WeakMap();
+    const mooncakeUpgradeSourceMarketHostStyles = new WeakMap();
+    let mooncakeUpgradeSourceMarketRefreshTimer = 0;
+    let mooncakeUpgradeSourceMarketUnsubscribe = null;
     const mooncakeEnhanceCurrentDataPanelStyles = new WeakMap();
     const mooncakeEnhancePlanLayoutStyleSnapshots = new Map();
     const mooncakeEnhanceCurrentPlanAnchorStyles = new Map();
@@ -24810,6 +24815,179 @@
             host.appendChild(button);
         }
         requirements.setAttribute(MOONCAKE_ENH_COST_MARKET_SIG_ATTR, signature);
+    }
+
+    function mooncakeIsUpgradeSourceLabel(node) {
+        if (!(node instanceof Element) || node.children.length > 0) return false;
+        const text = String(node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        return text === '升级自' || text === '升级来源' || text === 'upgrade from' || text === 'upgraded from';
+    }
+
+    function mooncakeGetUpgradeSourceItemHrid(itemContainer) {
+        return mooncakeGetEnhanceCostItemHrid(itemContainer) ||
+            mooncakeGetItemHridFromContainer(itemContainer) ||
+            extractItemHridFromElement(itemContainer);
+    }
+
+    function mooncakeFindUpgradeSourceItemContainer(label) {
+        let candidate = label?.parentElement || null;
+        for (let depth = 0; candidate && candidate !== document.body && depth < 6; depth += 1, candidate = candidate.parentElement) {
+            const itemContainers = [...candidate.querySelectorAll('[class*="Item_itemContainer"]')]
+                .filter(item => mooncakeGetUpgradeSourceItemHrid(item));
+            if (itemContainers.length === 1) return itemContainers[0];
+        }
+        return null;
+    }
+
+    function mooncakePrepareUpgradeSourceMarketHost(itemContainer) {
+        if (!itemContainer) return null;
+        if (!mooncakeUpgradeSourceMarketHostStyles.has(itemContainer)) {
+            mooncakeUpgradeSourceMarketHostStyles.set(itemContainer, {
+                position: itemContainer.style.position,
+                marginRight: itemContainer.style.marginRight,
+                overflow: itemContainer.style.overflow
+            });
+        }
+        Object.assign(itemContainer.style, {
+            position: 'relative',
+            marginRight: '28px',
+            overflow: 'visible'
+        });
+        itemContainer.setAttribute(MOONCAKE_UPGRADE_SOURCE_MARKET_HOST_ATTR, '1');
+        return itemContainer;
+    }
+
+    function mooncakeRestoreUpgradeSourceMarketHost(itemContainer) {
+        if (!itemContainer) return;
+        const style = mooncakeUpgradeSourceMarketHostStyles.get(itemContainer);
+        if (style) {
+            Object.assign(itemContainer.style, style);
+            mooncakeUpgradeSourceMarketHostStyles.delete(itemContainer);
+        }
+        itemContainer.removeAttribute(MOONCAKE_UPGRADE_SOURCE_MARKET_HOST_ATTR);
+    }
+
+    function mooncakeRemoveUpgradeSourceMarketButtons(root = document) {
+        root.querySelectorAll?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`).forEach(button => {
+            const host = button.parentElement;
+            button.remove();
+            if (!host?.querySelector?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)) {
+                mooncakeRestoreUpgradeSourceMarketHost(host);
+            }
+        });
+    }
+
+    function mooncakeEnsureUpgradeSourceMarketButton(itemContainer, itemHrid) {
+        if (!itemContainer || !itemHrid || !mooncakeCanOpenMarketplaceForInventoryItem(itemHrid)) return;
+        const existing = [...itemContainer.querySelectorAll(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)];
+        if (existing.some(button => button.dataset.itemHrid === itemHrid)) return;
+        existing.forEach(button => button.remove());
+
+        const shopItem = mooncakeGetCoinShopItem(itemHrid);
+        const itemName = getItemName(itemHrid) || (isZH ? '材料' : 'material');
+        const label = shopItem
+            ? (isZH ? `前往${itemName}系统商店` : `Open ${itemName} shop`)
+            : (isZH ? `打开${itemName}市场` : `Open ${itemName} market`);
+        const host = mooncakePrepareUpgradeSourceMarketHost(itemContainer);
+        if (!host) return;
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'mooncake-upgrade-source-market-btn';
+        button.setAttribute(MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR, '1');
+        button.dataset.itemHrid = itemHrid;
+        button.setAttribute('aria-label', label);
+        Object.assign(button.style, {
+            position: 'absolute',
+            left: 'calc(100% + 4px)',
+            top: '50%',
+            transform: 'translateY(-50%)',
+            zIndex: '2',
+            width: '22px',
+            minWidth: '22px',
+            maxWidth: '22px',
+            height: '22px',
+            minHeight: '22px',
+            maxHeight: '22px',
+            padding: '3px',
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            margin: '0',
+            border: shopItem ? '1px solid rgba(228,184,99,.52)' : '1px solid rgba(133,165,229,.42)',
+            borderRadius: '4px',
+            background: shopItem ? 'rgba(64,48,25,.9)' : 'rgba(31,39,63,.9)',
+            color: 'rgba(213,229,255,.96)',
+            cursor: 'pointer',
+            lineHeight: '1',
+            boxSizing: 'border-box'
+        });
+        const icon = mooncakeCreateMiscIconSvg(shopItem ? 'shop' : 'marketplace', 14);
+        if (icon) button.appendChild(icon);
+        else button.textContent = shopItem ? 'S' : 'M';
+        bindTooltip(button, () => mooncakeBuildEnhanceCostPurchaseTooltipHtml(itemHrid));
+        button.addEventListener('click', async event => {
+            event.preventDefault();
+            event.stopPropagation();
+            hideTooltip();
+            const opened = await mooncakeOpenMaterialPurchaseSource(itemHrid, 1);
+            if (opened && !shopItem && event.isTrusted) {
+                mooncakeQueueQ7MarketReport(itemHrid, 0);
+            }
+        });
+        host.appendChild(button);
+    }
+
+    function ensureMooncakeUpgradeSourceMarketButtons(root = document) {
+        const labels = [...root.querySelectorAll('span, div, label')]
+            .filter(mooncakeIsUpgradeSourceLabel)
+            .filter(mooncakeIsVisibleElement);
+        for (const label of labels) {
+            const itemContainer = mooncakeFindUpgradeSourceItemContainer(label);
+            const itemHrid = mooncakeGetUpgradeSourceItemHrid(itemContainer);
+            if (!itemHrid || itemHrid === '/items/coin' || itemHrid === '/items/coins') continue;
+            mooncakeEnsureUpgradeSourceMarketButton(itemContainer, itemHrid);
+        }
+    }
+
+    function scheduleMooncakeUpgradeSourceMarketButtons(delay = 80) {
+        if (mooncakeUpgradeSourceMarketRefreshTimer) clearTimeout(mooncakeUpgradeSourceMarketRefreshTimer);
+        mooncakeUpgradeSourceMarketRefreshTimer = setTimeout(() => {
+            mooncakeUpgradeSourceMarketRefreshTimer = 0;
+            try {
+                ensureMooncakeUpgradeSourceMarketButtons();
+            } catch (error) {
+                console.error('[Better Loot Tracker] 升级自材料市场按钮处理失败:', error);
+            }
+        }, Math.max(0, Number(delay) || 0));
+    }
+
+    function hookMooncakeUpgradeSourceMarketButtons() {
+        if (mooncakeUpgradeSourceMarketUnsubscribe) return;
+        const isRelevantNode = node => {
+            if (!(node instanceof Element)) return false;
+            if (node.matches?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`) ||
+                node.closest?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)) return false;
+            const className = typeof node.className === 'string' ? node.className : '';
+            return className.includes('SkillActionDetail') || className.includes('Item_itemContainer') ||
+                !!node.querySelector?.('[class*="SkillActionDetail"], [class*="Item_itemContainer"]');
+        };
+        mooncakeUpgradeSourceMarketUnsubscribe = subscribeDocumentMutations('upgrade-source-market', mutations => {
+            for (const mutation of mutations) {
+                if (mutation.type !== 'childList') continue;
+                if ([...mutation.addedNodes, ...mutation.removedNodes].some(isRelevantNode)) {
+                    scheduleMooncakeUpgradeSourceMarketButtons();
+                    return;
+                }
+            }
+        });
+        document.addEventListener('click', event => {
+            if (event.target?.closest?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)) return;
+            if (event.target?.closest?.('[class*="SkillActionDetail"]')) {
+                scheduleMooncakeUpgradeSourceMarketButtons(120);
+            }
+        }, true);
+        scheduleMooncakeUpgradeSourceMarketButtons(500);
     }
 
     function mooncakeIsEnhanceCurrentActionTab(panel) {
@@ -34683,6 +34861,7 @@
         setTimeout(hookEnhancementDetailTable, 4000);
         setTimeout(ensureMooncakeMarketJumpHelpers, 4500);
         setTimeout(hookMooncakeEnhanceProtectionBuyBox, 4500);
+        setTimeout(hookMooncakeUpgradeSourceMarketButtons, 4500);
 
         // 初始化虚拟配置悬浮框
         setTimeout(ensureVirtualConfigFab, 1000);
