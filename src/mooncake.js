@@ -14045,6 +14045,7 @@
     const MOONCAKE_MARKET_HISTORY_CARD_SELL_FIRST_KEY = 'Mooncake_marketHistory_card_sell_first_v1';
     const MOONCAKE_MARKET_HISTORY_FLOAT_POSITION_KEY = 'Mooncake_marketHistory_relativePosition_v2';
     const MOONCAKE_MARKET_HISTORY_MOBILE_POSITION_KEY = 'Mooncake_marketHistory_mobilePosition_v1';
+    const MOONCAKE_MARKET_HISTORY_MOBILE_EXPANDED_KEY = 'Mooncake_marketHistory_mobileExpanded_v1';
     const MOONCAKE_MARKET_HISTORY_TTL = 5 * 60 * 1000;
     const MOONCAKE_MARKET_HISTORY_WINDOWS = [1, 3, 7];
     const MOONCAKE_MARKET_HISTORY_CARD_ID = 'MooncakeMarketHistoryCard';
@@ -14240,6 +14241,22 @@
         if (card) delete card.dataset.mooncakeHistoryMobilePinned;
         try {
             localStorage.removeItem(MOONCAKE_MARKET_HISTORY_MOBILE_POSITION_KEY);
+        } catch (_) {}
+    }
+
+    function mooncakeReadMobileMarketHistoryExpanded() {
+        try {
+            return localStorage.getItem(MOONCAKE_MARKET_HISTORY_MOBILE_EXPANDED_KEY) === '1';
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function mooncakeSetMobileMarketHistoryExpanded(card, expanded) {
+        const isExpanded = expanded === true;
+        if (card) card.dataset.expanded = isExpanded ? '1' : '0';
+        try {
+            localStorage.setItem(MOONCAKE_MARKET_HISTORY_MOBILE_EXPANDED_KEY, isExpanded ? '1' : '0');
         } catch (_) {}
     }
 
@@ -15835,7 +15852,8 @@
         Object.assign(card.style, {
             position: 'fixed',
             width: `${width}px`,
-            minHeight: expanded ? '112px' : '30px',
+            height: expanded ? 'auto' : '30px',
+            minHeight: expanded ? '34px' : '30px',
             maxWidth: `calc(100vw - ${margin * 2}px)`,
             maxHeight: expanded ? `min(176px, calc(100vh - ${margin * 2}px))` : '30px',
             overflowX: 'hidden',
@@ -15846,7 +15864,9 @@
             touchAction: 'auto',
             userSelect: 'none'
         });
-        const height = expanded ? Math.max(112, Math.min(176, card.getBoundingClientRect().height || 132)) : 30;
+        const height = expanded
+            ? Math.min(176, Math.max(34, card.getBoundingClientRect().height || card.scrollHeight || 0))
+            : 30;
         const anchorLeft = anchorRect ? anchorRect.right + 6 : window.innerWidth - width - margin;
         const collapsedLeft = Math.min(Math.max(margin, anchorLeft), window.innerWidth - width - margin);
         const expandedLeft = Math.min(Math.max(margin, anchorLeft), window.innerWidth - width - margin);
@@ -16377,11 +16397,16 @@
         if (!card) {
             card = document.createElement('div');
             card.id = id;
-            card.dataset.expanded = isMobile ? '0' : '1';
+            card.dataset.expanded = isMobile
+                ? (mooncakeReadMobileMarketHistoryExpanded() ? '1' : '0')
+                : '1';
             if (isMobile) document.body.appendChild(card);
             else target.currentItem.appendChild(card);
         } else if (!isMobile && card.parentElement !== target.currentItem) {
             target.currentItem.appendChild(card);
+        }
+        if (isMobile && card.dataset.expanded === '1') {
+            mooncakeSetMobileMarketHistoryExpanded(card, true);
         }
         card.dataset.itemHrid = target.itemHrid;
         card.dataset.level = String(target.level);
@@ -16431,6 +16456,7 @@
 
         if (isMobile && card.dataset.expanded !== '1') {
             card.innerHTML = mooncakeBuildMobileMarketHistoryCollapsedHtml();
+            card.setAttribute('aria-expanded', 'false');
             mooncakePositionMobileHistoryCard(card, target.currentItem);
             return card;
         }
@@ -16438,6 +16464,7 @@
         card.innerHTML = mooncakeBuildMarketHistoryCardHtml(target.itemHrid, target.level, windows, stateText, { compact: isMobile });
         mooncakeBindMarketHistoryPriceTooltips(card, windows);
         if (isMobile) {
+            card.setAttribute('aria-expanded', 'true');
             mooncakeInstallMarketHistoryMobileControl(card);
             mooncakePositionMobileHistoryCard(card, target.currentItem);
         }
@@ -16707,7 +16734,7 @@
             if (toggle) {
                 const card = toggle.closest(`#${MOONCAKE_MARKET_HISTORY_MOBILE_ID}`);
                 if (card) {
-                    card.dataset.expanded = card.dataset.expanded === '1' ? '0' : '1';
+                    mooncakeSetMobileMarketHistoryExpanded(card, card.dataset.expanded !== '1');
                     const marketTarget = mooncakeGetCurrentMarketHistoryTarget();
                     const windows = card._mooncakeMarketHistoryWindows;
                     const stateText = card._mooncakeMarketHistoryStateText || '';
