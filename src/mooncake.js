@@ -839,8 +839,8 @@
         Object.assign(actions.style, { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' });
         const definitions = [
             ['data-mooncake-history-ranking', isZH ? '交易统计' : 'Trading stats', 'rgba(144,166,235,.35)', 'rgba(38,42,58,.68)', 'rgba(238,246,255,.9)'],
-            ['data-mooncake-shortage', isZH ? '缺货统计' : 'Shortage stats', 'rgba(235,166,144,.4)', 'rgba(80,48,38,.68)', 'rgba(255,232,220,.95)'],
-            ['data-mooncake-bargain', isZH ? '捡漏统计' : 'Bargain stats', 'rgba(236,190,112,.42)', 'rgba(92,67,35,.72)', 'rgba(255,239,201,.95)']
+            ['data-mooncake-koukou', isZH ? '扣扣小子' : 'Hourly scanner', 'rgba(92,220,234,.46)', 'rgba(26,83,93,.72)', 'rgba(220,251,255,.95)'],
+            ['data-mooncake-shortage', isZH ? '缺货统计' : 'Shortage stats', 'rgba(235,166,144,.4)', 'rgba(80,48,38,.68)', 'rgba(255,232,220,.95)']
         ];
         definitions.forEach(([attribute, label, borderColor, background, color]) => {
             const button = document.createElement('button');
@@ -14064,9 +14064,11 @@
     const MOONCAKE_MARKET_HISTORY_RANKING_ID = 'MooncakeMarketHistoryRankingPanel';
     const MOONCAKE_MARKET_SHORTAGE_ID = 'MooncakeMarketShortagePanel';
     const MOONCAKE_MARKET_BARGAIN_ID = 'MooncakeMarketBargainPanel';
+    const MOONCAKE_MARKET_KOUKOU_ID = 'MooncakeMarketKouKouPanel';
     const MOONCAKE_MARKET_HISTORY_RANKING_PREFS_KEY = 'Mooncake_marketHistory_ranking_preferences_v1';
     const MOONCAKE_MARKET_SHORTAGE_PREFS_KEY = 'Mooncake_marketShortage_preferences_v1';
     const MOONCAKE_MARKET_BARGAIN_PREFS_KEY = 'Mooncake_marketBargain_preferences_v1';
+    const MOONCAKE_MARKET_KOUKOU_PREFS_KEY = 'Mooncake_marketKouKou_preferences_v1';
     const MOONCAKE_MARKET_HISTORY_MAX_ENTRIES = 80;
     const MOONCAKE_MARKET_HISTORY_MEMORY_CACHE = new Map();
     const MOONCAKE_MARKET_HISTORY_DETAIL_MEMORY_CACHE = new Map();
@@ -14077,12 +14079,15 @@
     const MOONCAKE_BARGAIN_HISTORY_PRICE_MAX_ENTRIES = 300;
     const MOONCAKE_BARGAIN_GRID_COLUMNS = 'minmax(220px,1.5fr) repeat(7,minmax(104px,1fr))';
     const MOONCAKE_BARGAIN_MIN_WIDTH = '1120px';
+    const MOONCAKE_KOUKOU_GRID_COLUMNS = 'minmax(230px,1.5fr) minmax(106px,.72fr) minmax(116px,.82fr) minmax(122px,.88fr) minmax(122px,.88fr)';
+    const MOONCAKE_KOUKOU_MIN_WIDTH = '880px';
     let mooncakeMarketHistorySeq = 0;
     let mooncakeMarketHistoryRankingSort = 'turnover7';
     let mooncakeMarketHistoryRankingSeq = 0;
     let mooncakeMarketHistoryRankingAbortController = null;
     let mooncakeMarketBargainSeq = 0;
     let mooncakeMarketBargainAbortController = null;
+    let mooncakeMarketKouKouSeq = 0;
     let mooncakeMarketHistoryCardAbortController = null;
     let mooncakeMarketHistoryActiveRequestKey = '';
     let mooncakeMarketHistoryScheduleTimer = 0;
@@ -16725,9 +16730,10 @@
             }
             const rankPanel = mooncakeGetOpenMarketStatisticsPanel();
             const rankTrigger = target.closest?.('[data-mooncake-history-ranking]');
+            const koukouTrigger = target.closest?.('[data-mooncake-koukou]');
             const shortageTrigger = target.closest?.('[data-mooncake-shortage]');
             const bargainTrigger = target.closest?.('[data-mooncake-bargain]');
-            if (rankPanel && !rankTrigger && !shortageTrigger && !bargainTrigger && !target.closest?.(`#${MOONCAKE_MARKET_HISTORY_RANKING_ID}, #${MOONCAKE_MARKET_SHORTAGE_ID}, #${MOONCAKE_MARKET_BARGAIN_ID}`)) {
+            if (rankPanel && !rankTrigger && !koukouTrigger && !shortageTrigger && !bargainTrigger && !target.closest?.(`#${MOONCAKE_MARKET_HISTORY_RANKING_ID}, #${MOONCAKE_MARKET_KOUKOU_ID}, #${MOONCAKE_MARKET_SHORTAGE_ID}, #${MOONCAKE_MARKET_BARGAIN_ID}`)) {
                 mooncakeCloseMarketStatisticsPanels();
             }
             const toggle = target.closest?.('[data-mooncake-history-toggle]');
@@ -16764,6 +16770,12 @@
                 event.stopPropagation();
                 return;
             }
+            if (koukouTrigger) {
+                mooncakeOpenMarketKouKouPanel();
+                event.preventDefault();
+                event.stopPropagation();
+                return;
+            }
             if (shortageTrigger) {
                 mooncakeOpenMarketShortagePanel();
                 event.preventDefault();
@@ -16776,7 +16788,7 @@
                 event.stopPropagation();
                 return;
             }
-            const rankJump = target.closest?.('[data-mooncake-rank-jump], [data-mooncake-bargain-jump]');
+            const rankJump = target.closest?.('[data-mooncake-rank-jump], [data-mooncake-bargain-jump], [data-mooncake-koukou-jump]');
             if (rankJump) {
                 const hrid = rankJump.getAttribute('data-hrid');
                 const level = parseInt(rankJump.getAttribute('data-level') || '0', 10) || 0;
@@ -16814,7 +16826,28 @@
                 mooncakeRunMarketBargainScan({ force: true });
                 event.preventDefault();
                 event.stopPropagation();
+                return;
             }
+            if (target.closest?.('[data-mooncake-koukou-run]')) {
+                mooncakeRunMarketKouKou();
+                event.preventDefault();
+                event.stopPropagation();
+            }
+        }, true);
+        document.addEventListener('pointerdown', (event) => {
+            const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+            const activeMenu = target?.closest?.(
+                `#${MOONCAKE_MARKET_HISTORY_RANKING_ID} details[data-mooncake-rank-filter="item"], ` +
+                `#${MOONCAKE_MARKET_SHORTAGE_ID} details[data-mooncake-rank-filter="item"], ` +
+                `#${MOONCAKE_MARKET_KOUKOU_ID} details[data-mooncake-rank-filter="item"]`
+            );
+            document.querySelectorAll(
+                `#${MOONCAKE_MARKET_HISTORY_RANKING_ID} details[data-mooncake-rank-filter="item"], ` +
+                `#${MOONCAKE_MARKET_SHORTAGE_ID} details[data-mooncake-rank-filter="item"], ` +
+                `#${MOONCAKE_MARKET_KOUKOU_ID} details[data-mooncake-rank-filter="item"]`
+            ).forEach(menu => {
+                if (menu !== activeMenu) menu.open = false;
+            });
         }, true);
         document.addEventListener('pointerdown', mooncakeStartMobileMarketHistoryDrag, true);
         window.addEventListener('pointermove', mooncakeMoveMobileMarketHistoryDrag, { capture: true, passive: false });
@@ -16872,15 +16905,17 @@
             }
             const option = event.target.closest?.('[data-mooncake-rank-filter-option]');
             if (!option) return;
-            const panel = option.closest(`#${MOONCAKE_MARKET_HISTORY_RANKING_ID}, #${MOONCAKE_MARKET_SHORTAGE_ID}`);
+            const panel = option.closest(`#${MOONCAKE_MARKET_HISTORY_RANKING_ID}, #${MOONCAKE_MARKET_SHORTAGE_ID}, #${MOONCAKE_MARKET_KOUKOU_ID}`);
             const kind = option.getAttribute('data-mooncake-rank-filter-option');
             if (panel && kind) mooncakeUpdateRankingMultiSelectLabel(panel, kind);
         }, true);
         document.addEventListener('keydown', (event) => {
             const nameInput = event.target.closest?.('[data-mooncake-rank-item-name]');
             const bargainNameInput = event.target.closest?.('[data-mooncake-bargain-item-name]');
-            if ((!nameInput && !bargainNameInput) || event.key !== 'Enter' || event.isComposing) return;
-            if (bargainNameInput) mooncakeRunMarketBargainScan({ force: true });
+            const koukouInput = event.target.closest?.('[data-mooncake-koukou-item-name], [data-mooncake-koukou-target-hourly]');
+            if ((!nameInput && !bargainNameInput && !koukouInput) || event.key !== 'Enter' || event.isComposing) return;
+            if (koukouInput) mooncakeRunMarketKouKou();
+            else if (bargainNameInput) mooncakeRunMarketBargainScan({ force: true });
             else mooncakeRunMarketHistoryRanking({ force: true });
             event.preventDefault();
             event.stopPropagation();
@@ -16946,6 +16981,46 @@
 
     function mooncakeReadShortagePreferences() {
         return mooncakeReadRankingPreferences(MOONCAKE_MARKET_SHORTAGE_PREFS_KEY, [95, 90, 85, 60]);
+    }
+
+    function mooncakeReadKouKouPreferences() {
+        const defaults = {
+            itemLevels: [95],
+            enhancementLevel: 10,
+            nameQuery: '',
+            targetHourlyM: mooncakeGetOrderTargetHourlyM()
+        };
+        try {
+            const parsed = JSON.parse(localStorage.getItem(MOONCAKE_MARKET_KOUKOU_PREFS_KEY) || '{}');
+            const itemLevels = Array.isArray(parsed.itemLevels)
+                ? parsed.itemLevels.map(Number).filter(value => Number.isFinite(value) && value > 0)
+                : defaults.itemLevels;
+            const enhancementLevel = Number(parsed.enhancementLevel);
+            const targetHourlyM = Number(parsed.targetHourlyM);
+            return {
+                itemLevels: itemLevels.length ? [...new Set(itemLevels)] : defaults.itemLevels,
+                enhancementLevel: Number.isFinite(enhancementLevel) && enhancementLevel >= 0 && enhancementLevel <= 20
+                    ? Math.trunc(enhancementLevel)
+                    : defaults.enhancementLevel,
+                nameQuery: typeof parsed.nameQuery === 'string' ? parsed.nameQuery : defaults.nameQuery,
+                targetHourlyM: Number.isFinite(targetHourlyM) &&
+                    targetHourlyM >= MOONCAKE_ORDER_TARGET_HOURLY_MIN_M &&
+                    targetHourlyM <= MOONCAKE_ORDER_TARGET_HOURLY_MAX_M
+                    ? Math.round(targetHourlyM * 1000) / 1000
+                    : defaults.targetHourlyM
+            };
+        } catch (_) {
+            return defaults;
+        }
+    }
+
+    function mooncakeWriteKouKouPreferences(changes = {}) {
+        try {
+            localStorage.setItem(MOONCAKE_MARKET_KOUKOU_PREFS_KEY, JSON.stringify({
+                ...mooncakeReadKouKouPreferences(),
+                ...changes
+            }));
+        } catch (_) {}
     }
 
     function mooncakeWriteRankingPreferences(changes = {}, storageKey = MOONCAKE_MARKET_HISTORY_RANKING_PREFS_KEY) {
@@ -17077,8 +17152,10 @@
         const otherPanelId = mode === 'shortage' ? MOONCAKE_MARKET_HISTORY_RANKING_ID : MOONCAKE_MARKET_SHORTAGE_ID;
         document.getElementById(otherPanelId)?.remove();
         mooncakeMarketBargainSeq++;
+        mooncakeMarketKouKouSeq++;
         mooncakeMarketBargainAbortController?.abort();
         document.getElementById(MOONCAKE_MARKET_BARGAIN_ID)?.remove();
+        document.getElementById(MOONCAKE_MARKET_KOUKOU_ID)?.remove();
         let panel = document.getElementById(panelId);
         const target = mooncakeResolveMarketHistoryRankingTarget(trigger);
         const preferences = mode === 'shortage' ? mooncakeReadShortagePreferences() : mooncakeReadRankingPreferences();
@@ -17688,9 +17765,11 @@
 
     function mooncakeOpenMarketBargainPanel() {
         mooncakeMarketHistoryRankingSeq++;
+        mooncakeMarketKouKouSeq++;
         mooncakeMarketHistoryRankingAbortController?.abort();
         document.getElementById(MOONCAKE_MARKET_HISTORY_RANKING_ID)?.remove();
         document.getElementById(MOONCAKE_MARKET_SHORTAGE_ID)?.remove();
+        document.getElementById(MOONCAKE_MARKET_KOUKOU_ID)?.remove();
         let panel = document.getElementById(MOONCAKE_MARKET_BARGAIN_ID);
         if (!panel) {
             panel = document.createElement('div');
@@ -17883,18 +17962,210 @@
         }
     }
 
+    function mooncakeFormatKouKouHourly(value, color = '#7DFFB3') {
+        if (!Number.isFinite(Number(value))) return '<span style="color:rgba(230,238,255,.38);">-</span>';
+        return `<span style="color:${color};font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap;">${mooncakeFormatSignedHourlyWage(value)}/h</span>`;
+    }
+
+    function mooncakeFormatKouKouProfit(value) {
+        if (!Number.isFinite(Number(value))) return '<span style="color:rgba(230,238,255,.38);">-</span>';
+        const color = Number(value) >= 0 ? '#6DF6CB' : '#FF9A9A';
+        return `<span style="color:${color};font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap;">${mooncakeFormatSignedMoney(value)}</span>`;
+    }
+
+    function mooncakeBuildKouKouHeader() {
+        return `<div style="display:grid;grid-template-columns:${MOONCAKE_KOUKOU_GRID_COLUMNS};min-width:${MOONCAKE_KOUKOU_MIN_WIDTH};gap:7px;position:sticky;top:0;z-index:1;background:rgba(18,22,34,.98);padding:8px 0 7px;border-bottom:1px solid rgba(255,255,255,.08);color:rgba(230,238,255,.72);font-size:11px;font-weight:900;text-align:center;">
+            <div style="text-align:left;">装备</div>
+            <div>当前左一</div>
+            <div>当前工时</div>
+            <div>扣一档工时</div>
+            <div>扣一档利润</div>
+        </div>`;
+    }
+
+    function mooncakeRenderKouKouRows(rows) {
+        if (!rows.length) {
+            return `${mooncakeBuildKouKouHeader()}<div style="min-width:${MOONCAKE_KOUKOU_MIN_WIDTH};padding:18px;text-align:center;color:rgba(230,238,255,.62);">当前左一暂无达到目标工时费的装备</div>`;
+        }
+        return mooncakeBuildKouKouHeader() + rows.map(row => {
+            const displayName = `${getItemName(row.itemHrid)} +${row.level}`;
+            const itemLevel = Number(row.itemLevel) > 0 ? `装备等级 ${row.itemLevel}` : '';
+            const hourlyColor = row.evaluation?.combinedColor || '#7DFFB3';
+            const undercutTitle = row.undercutPrice > 0
+                ? `当前左一 ${formatMoney(row.ask)} → 扣一档 ${formatMoney(row.undercutPrice)}`
+                : '当前价格已无法再扣一档';
+            return `
+                <div data-mooncake-koukou-row="${mooncakeEscapeHtml(row.itemHrid)}|${row.level}" style="display:grid;grid-template-columns:${MOONCAKE_KOUKOU_GRID_COLUMNS};min-width:${MOONCAKE_KOUKOU_MIN_WIDTH};gap:7px;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.045);">
+                    <div style="display:flex;align-items:center;gap:6px;min-width:0;"><span data-icon="${mooncakeEscapeHtml(row.itemHrid)}"></span><button type="button" data-mooncake-koukou-jump="1" data-hrid="${mooncakeEscapeHtml(row.itemHrid)}" data-level="${row.level}" title="${mooncakeEscapeHtml(`${displayName}${itemLevel ? ` · ${itemLevel}` : ''}`)}" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:0;background:transparent;color:#eef6ff;font:inherit;font-weight:800;padding:0;cursor:pointer;text-align:left;">${mooncakeEscapeHtml(displayName)}</button></div>
+                    <div style="text-align:center;">${mooncakeFormatBargainPrice(row.ask, '#B9E6A3')}</div>
+                    <div style="text-align:center;">${mooncakeFormatKouKouHourly(row.hourlyWage, hourlyColor)}</div>
+                    <div style="text-align:center;" title="${mooncakeEscapeHtml(undercutTitle)}">${mooncakeFormatKouKouHourly(row.undercutHourlyWage, row.undercutEvaluation?.combinedColor || '#7DFFB3')}</div>
+                    <div style="text-align:center;" title="${mooncakeEscapeHtml(`${undercutTitle}；出售扣除 ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% 市场税后计算`)}">${mooncakeFormatKouKouProfit(row.undercutProfit)}</div>
+                </div>
+            `;
+        }).join('');
+    }
+
+    function mooncakeOpenMarketKouKouPanel() {
+        mooncakeMarketHistoryRankingSeq++;
+        mooncakeMarketBargainSeq++;
+        mooncakeMarketKouKouSeq++;
+        mooncakeMarketHistoryRankingAbortController?.abort();
+        mooncakeMarketBargainAbortController?.abort();
+        document.getElementById(MOONCAKE_MARKET_HISTORY_RANKING_ID)?.remove();
+        document.getElementById(MOONCAKE_MARKET_SHORTAGE_ID)?.remove();
+        document.getElementById(MOONCAKE_MARKET_BARGAIN_ID)?.remove();
+
+        let panel = document.getElementById(MOONCAKE_MARKET_KOUKOU_ID);
+        if (!panel) {
+            panel = document.createElement('div');
+            panel.id = MOONCAKE_MARKET_KOUKOU_ID;
+            document.body.appendChild(panel);
+        }
+        const preferences = mooncakeReadKouKouPreferences();
+        Object.assign(panel.style, {
+            position: 'fixed',
+            left: '50%',
+            top: '50%',
+            transform: 'translate(-50%, -50%)',
+            width: 'min(1080px, calc(100vw - 16px))',
+            maxHeight: 'min(720px, calc(100vh - 24px))',
+            overflow: 'hidden',
+            zIndex: '100000',
+            boxSizing: 'border-box',
+            border: '1px solid rgba(92,220,234,.42)',
+            borderRadius: '12px',
+            background: 'rgba(18,22,34,.98)',
+            boxShadow: '0 16px 42px rgba(0,0,0,.55)',
+            color: '#eef6ff',
+            fontSize: '12px',
+            display: 'flex',
+            flexDirection: 'column'
+        });
+        panel.innerHTML = `
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.08);">
+                <div style="font-size:15px;font-weight:900;color:#dcfbff;">扣扣小子</div>
+                <button type="button" data-mooncake-history-rank-close="1" style="cursor:pointer;border:0;background:transparent;color:rgba(238,246,255,.72);font-size:18px;line-height:1;">×</button>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 12px 7px;border-bottom:1px solid rgba(255,255,255,.08);">
+                <label style="display:flex;align-items:center;gap:4px;color:rgba(230,238,255,.72);"><span>装备名称</span>
+                    <input type="search" data-mooncake-koukou-item-name value="${mooncakeEscapeHtml(preferences.nameQuery)}" placeholder="输入名称" autocomplete="off" aria-label="装备名称" style="width:168px;background:rgba(255,255,255,.08);border:1px solid rgba(92,220,234,.34);border-radius:6px;color:#eef6ff;padding:4px 7px;box-sizing:border-box;">
+                </label>
+                ${mooncakeBuildRankingMultiSelect('item', '装备等级', mooncakeGetRankingItemLevelOptions(), preferences.itemLevels, 118)}
+                ${mooncakeBuildRankingSingleSelect('enhancement', '强化等级', mooncakeGetRankingEnhancementLevelOptions(), preferences.enhancementLevel, 94)}
+                <label style="display:flex;align-items:center;gap:4px;color:rgba(230,238,255,.72);"><span>目标工时</span>
+                    <input type="number" data-mooncake-koukou-target-hourly min="${MOONCAKE_ORDER_TARGET_HOURLY_MIN_M}" max="${MOONCAKE_ORDER_TARGET_HOURLY_MAX_M}" step="0.001" value="${preferences.targetHourlyM}" aria-label="目标工时费（M/h）" style="width:104px;background:rgba(255,255,255,.08);border:1px solid rgba(92,220,234,.34);border-radius:6px;color:#eef6ff;padding:4px 7px;box-sizing:border-box;">
+                    <span>M/h</span>
+                </label>
+                <button type="button" data-mooncake-koukou-run="1" style="cursor:pointer;border:1px solid rgba(92,220,234,.46);background:rgba(26,83,93,.72);color:#dcfbff;border-radius:7px;padding:5px 10px;font-weight:800;">筛选</button>
+                <span data-mooncake-koukou-status style="color:rgba(230,238,255,.58);font-size:11px;"></span>
+            </div>
+            <div style="padding:6px 12px;color:rgba(220,251,255,.65);font-size:11px;border-bottom:1px solid rgba(255,255,255,.06);">筛选仅使用当前左一报价；无左一或无法计算成本的装备不参与。扣一档按有效市场档位下调一格，利润已扣市场税。</div>
+            <div data-mooncake-koukou-body style="overflow:auto;overscroll-behavior:contain;padding:0 12px 16px;"></div>
+        `;
+        mooncakeRunMarketKouKou();
+    }
+
+    async function mooncakeRunMarketKouKou() {
+        const panel = document.getElementById(MOONCAKE_MARKET_KOUKOU_ID);
+        if (!panel) return;
+        const runSeq = ++mooncakeMarketKouKouSeq;
+        const body = panel.querySelector('[data-mooncake-koukou-body]');
+        const status = panel.querySelector('[data-mooncake-koukou-status]');
+        const nameQuery = panel.querySelector('[data-mooncake-koukou-item-name]')?.value?.trim() || '';
+        const itemLevels = mooncakeReadRankingMultiSelect(panel, 'item', [95]);
+        const enhancementLevel = mooncakeReadRankingSingleSelect(panel, 'enhancement', 10);
+        const targetInput = panel.querySelector('[data-mooncake-koukou-target-hourly]');
+        const inputTargetHourlyM = Number(targetInput?.value);
+        const preferences = mooncakeReadKouKouPreferences();
+        const targetHourlyM = Number.isFinite(inputTargetHourlyM) &&
+            inputTargetHourlyM >= MOONCAKE_ORDER_TARGET_HOURLY_MIN_M &&
+            inputTargetHourlyM <= MOONCAKE_ORDER_TARGET_HOURLY_MAX_M
+            ? Math.round(inputTargetHourlyM * 1000) / 1000
+            : preferences.targetHourlyM;
+        if (targetInput) targetInput.value = String(targetHourlyM);
+        mooncakeWriteKouKouPreferences({ itemLevels, enhancementLevel, nameQuery, targetHourlyM });
+
+        const marketData = getMarketData();
+        if (!marketData?.marketData) {
+            if (body) body.innerHTML = '<div style="padding:18px;text-align:center;color:#FF8A8A;">市场数据未加载</div>';
+            if (status) status.textContent = '市场数据未加载';
+            return;
+        }
+        if (body) body.innerHTML = '<div style="padding:18px;text-align:center;color:rgba(230,238,255,.62);">准备计算当前左一工时...</div>';
+
+        try {
+            const candidates = mooncakeFilterEquipmentHridsByName(
+                mooncakeGetEnhanceableEquipmentHrids(itemLevels),
+                nameQuery
+            ).map(itemHrid => ({
+                itemHrid,
+                ask: Number(marketData.marketData?.[itemHrid]?.[String(enhancementLevel)]?.a)
+            })).filter(candidate => candidate.ask > 0);
+            const targetHourly = targetHourlyM * 1e6;
+            const rows = [];
+            if (status) status.textContent = `计算 0 / ${candidates.length}`;
+
+            for (let index = 0; index < candidates.length; index++) {
+                if (runSeq !== mooncakeMarketKouKouSeq || !panel.isConnected) return;
+                const candidate = candidates[index];
+                const result = calcHourlyWageAndMetrics(candidate.itemHrid, enhancementLevel, marketData, candidate.ask);
+                const hourlyWage = Number(result?.hourlyWage);
+                if (Number.isFinite(hourlyWage) && hourlyWage >= targetHourly) {
+                    const undercutPrice = getPriceTier(candidate.ask, 'down');
+                    const undercutResult = undercutPrice > 0 && undercutPrice < candidate.ask
+                        ? calcHourlyWageAndMetrics(candidate.itemHrid, enhancementLevel, marketData, undercutPrice)
+                        : null;
+                    const undercutHourlyWage = Number(undercutResult?.hourlyWage);
+                    const undercutProfit = Number.isFinite(undercutHourlyWage)
+                        ? getProfitPerItem(undercutResult.metrics, undercutPrice)
+                        : null;
+                    const detail = itemDetailMap?.[candidate.itemHrid] || getInitClientData()?.itemDetailMap?.[candidate.itemHrid];
+                    rows.push({
+                        itemHrid: candidate.itemHrid,
+                        itemLevel: Number(detail?.itemLevel || 0),
+                        level: enhancementLevel,
+                        ask: candidate.ask,
+                        hourlyWage,
+                        evaluation: result?.evaluation || null,
+                        undercutPrice,
+                        undercutHourlyWage,
+                        undercutProfit,
+                        undercutEvaluation: undercutResult?.evaluation || null
+                    });
+                }
+                if (status) status.textContent = `计算 ${index + 1} / ${candidates.length}`;
+                if (index % 3 === 2) await new Promise(resolve => setTimeout(resolve, 0));
+            }
+            if (runSeq !== mooncakeMarketKouKouSeq || !panel.isConnected) return;
+            rows.sort((left, right) => right.hourlyWage - left.hourlyWage || right.ask - left.ask || getItemName(left.itemHrid).localeCompare(getItemName(right.itemHrid)));
+            if (body) {
+                body.innerHTML = mooncakeRenderKouKouRows(rows, targetHourly);
+                mooncakeHydrateRankingIcons(body);
+            }
+            if (status) status.textContent = `完成，左一 ${candidates.length} 项，达标 ${rows.length} 条`;
+        } catch (error) {
+            if (runSeq !== mooncakeMarketKouKouSeq) return;
+            console.warn('[MoonCake] 扣扣小子计算失败:', error);
+            if (body) body.innerHTML = '<div style="padding:18px;text-align:center;color:#FF8A8A;">计算失败</div>';
+            if (status) status.textContent = '计算失败';
+        }
+    }
+
     function mooncakeGetOpenMarketStatisticsPanel() {
         return document.getElementById(MOONCAKE_MARKET_HISTORY_RANKING_ID) ||
             document.getElementById(MOONCAKE_MARKET_SHORTAGE_ID) ||
-            document.getElementById(MOONCAKE_MARKET_BARGAIN_ID);
+            document.getElementById(MOONCAKE_MARKET_BARGAIN_ID) ||
+            document.getElementById(MOONCAKE_MARKET_KOUKOU_ID);
     }
 
     function mooncakeCloseMarketStatisticsPanels() {
         mooncakeMarketHistoryRankingSeq++;
         mooncakeMarketBargainSeq++;
+        mooncakeMarketKouKouSeq++;
         mooncakeMarketHistoryRankingAbortController?.abort();
         mooncakeMarketBargainAbortController?.abort();
-        [MOONCAKE_MARKET_HISTORY_RANKING_ID, MOONCAKE_MARKET_SHORTAGE_ID, MOONCAKE_MARKET_BARGAIN_ID]
+        [MOONCAKE_MARKET_HISTORY_RANKING_ID, MOONCAKE_MARKET_SHORTAGE_ID, MOONCAKE_MARKET_BARGAIN_ID, MOONCAKE_MARKET_KOUKOU_ID]
             .forEach(id => document.getElementById(id)?.remove());
     }
 
@@ -29605,15 +29876,77 @@
                 display: none !important;
             }
             [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-heading {
-                gap: 4px;
-                padding: 7px 8px 5px;
+                display: grid !important;
+                grid-template-columns: minmax(0, 1fr) auto !important;
+                align-items: center !important;
+                gap: 6px;
+                padding: 7px 8px;
+            }
+            [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-title-group {
+                min-width: 0 !important;
+                flex-wrap: nowrap !important;
+                overflow: hidden;
+            }
+            [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-title {
+                font-size: 13px !important;
+            }
+            [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-mobile-hint {
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-target {
+                flex-basis: auto !important;
+                min-width: 0;
+                padding: 2px 5px !important;
+            }
+            [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-subtitle,
+            [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-labels {
+                display: none !important;
             }
             [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-quote {
-                grid-template-columns: minmax(48px, 1fr) minmax(46px, 1fr) 36px !important;
+                grid-template-columns: 18px minmax(0, 1.15fr) minmax(0, 1fr) minmax(42px, .92fr) !important;
+                min-height: 30px;
                 column-gap: 4px !important;
+                padding: 2px 0 !important;
+                border-radius: 4px;
+                background: rgba(34, 42, 62, .42);
+            }
+            [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-quote::before {
+                content: attr(data-side-label);
+                justify-self: start;
+                color: rgba(216, 228, 255, .72);
+                font-size: 10px;
+                font-weight: 800;
+                line-height: 1;
+            }
+            [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-row {
+                grid-template-columns: 48px minmax(0, 1fr) !important;
+                grid-template-rows: auto auto !important;
+                row-gap: 4px !important;
+                padding: 7px 8px !important;
+            }
+            [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-level-cell {
+                grid-column: 1 !important;
+                grid-row: 1 / 3 !important;
+                gap: 3px;
+            }
+            [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-quote-ask {
+                grid-column: 2 !important;
+                grid-row: 1 !important;
+            }
+            [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-quote-bid {
+                grid-column: 2 !important;
+                grid-row: 2 !important;
+            }
+            [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-open-market {
+                width: 38px !important;
+                height: 30px !important;
+                font-size: 11px;
             }
             [${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-list {
-                max-height: min(38vh, 300px);
+                max-height: min(30vh, 250px);
+                scrollbar-width: thin;
             }
         `;
         document.head?.appendChild(style);
@@ -29849,6 +30182,10 @@
             const button = document.createElement('button');
             button.type = 'button';
             button.className = `mooncake-enh-market-plan-quote mooncake-enh-market-plan-quote-${side}`;
+            const sideLabel = side === 'ask'
+                ? (isZH ? '卖' : 'Ask')
+                : (isZH ? '买' : 'Bid');
+            button.dataset.sideLabel = sideLabel;
             const hasRoute = !!recommendation && price > 0;
             button.dataset.routeReady = hasRoute ? '1' : '0';
             button.disabled = !hasRoute || mooncakeEnhanceQuickApplyDepth > 0;
@@ -30029,6 +30366,7 @@
             whiteSpace: 'nowrap'
         });
         const title = document.createElement('strong');
+        title.className = 'mooncake-enh-market-plan-title';
         title.textContent = isZH ? '强化行情参考' : 'Enhancement market reference';
         Object.assign(title.style, {
             flex: '0 0 auto',
@@ -31273,8 +31611,8 @@
                         </span>
                     </div>
                     <button type="button" data-mooncake-history-ranking="1" style="cursor:pointer;border:1px solid rgba(144,166,235,.35);background:rgba(38,42,58,.68);color:rgba(238,246,255,.9);border-radius:7px;padding:5px 10px;font-size:12px;font-weight:800;">交易统计</button>
+                    <button type="button" data-mooncake-koukou="1" title="按当前左一价格筛选达到目标工时费的装备" style="cursor:pointer;border:1px solid rgba(92,220,234,.46);background:rgba(26,83,93,.72);color:#dcfbff;border-radius:7px;padding:5px 10px;font-size:12px;font-weight:800;">扣扣小子</button>
                     <button type="button" data-mooncake-shortage="1" style="cursor:pointer;border:1px solid rgba(235,166,144,.4);background:rgba(80,48,38,.68);color:rgba(255,232,220,.95);border-radius:7px;padding:5px 10px;font-size:12px;font-weight:800;">缺货统计</button>
-                    <button type="button" data-mooncake-bargain="1" style="cursor:pointer;border:1px solid rgba(236,190,112,.42);background:rgba(92,67,35,.72);color:rgba(255,239,201,.95);border-radius:7px;padding:5px 10px;font-size:12px;font-weight:800;">捡漏统计</button>
                 </div>
                 <div id="enhancement-market-info" style="background: var(--color-midnight-800); padding: 15px; border-radius: 8px;">
                     <div style="color: var(--color-disabled); text-align: center; line-height: 1.8;">
@@ -36110,6 +36448,11 @@
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-rows] { min-width:0; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row] { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:12px; min-height:48px; padding:8px 0; border-top:1px solid rgba(151,166,217,.10); box-sizing:border-box; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row]:first-child { border-top:0; }
+            #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-fab-shortcut] { display:flex; align-items:flex-start; gap:8px; min-width:0; margin:7px 0 2px; padding:8px 9px; box-sizing:border-box; border:1px solid rgba(138,160,229,.22); border-radius:5px; background:rgba(55,67,108,.20); color:rgba(220,228,248,.76); }
+            #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-fab-shortcut-icon] { flex:0 0 auto; font-size:15px; line-height:1.2; }
+            #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-fab-shortcut-copy] { min-width:0; display:grid; gap:2px; }
+            #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-fab-shortcut-copy] strong { color:rgba(242,246,255,.92); font-size:12px; line-height:1.25; }
+            #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-fab-shortcut-copy] small { color:rgba(220,228,248,.63); font-size:10px; line-height:1.38; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-copy] { min-width:0; display:grid; gap:2px; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-copy] strong { color:rgba(242,246,255,.96); font-size:13px; line-height:1.25; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-copy] small { color:rgba(220,228,248,.60); font-size:11px; line-height:1.36; }
@@ -36517,10 +36860,27 @@
         const marketHourlyControl = marketHourlyRow.querySelector('[data-mooncake-enhancement-settings-row-control]');
         const hourlyWageColorProfilePopover = mooncakeCreateHourlyWageColorProfilePopover();
         marketHourlyControl?.appendChild(hourlyWageColorProfilePopover);
+        const fabShortcutHint = document.createElement('div');
+        fabShortcutHint.setAttribute('data-mooncake-enhancement-settings-fab-shortcut', '1');
+        const fabShortcutIcon = document.createElement('span');
+        fabShortcutIcon.setAttribute('data-mooncake-enhancement-settings-fab-shortcut-icon', '1');
+        fabShortcutIcon.textContent = '🍭';
+        fabShortcutIcon.setAttribute('aria-hidden', 'true');
+        const fabShortcutCopy = document.createElement('span');
+        fabShortcutCopy.setAttribute('data-mooncake-enhancement-settings-fab-shortcut-copy', '1');
+        const fabShortcutTitle = document.createElement('strong');
+        fabShortcutTitle.textContent = isZH ? '棒棒糖按钮' : 'Lollipop button';
+        const fabShortcutDescription = document.createElement('small');
+        fabShortcutDescription.textContent = isZH
+            ? '按 Ctrl + Alt + D 可隐藏或恢复设置入口。'
+            : 'Press Ctrl + Alt + D to hide or restore the settings button.';
+        fabShortcutCopy.append(fabShortcutTitle, fabShortcutDescription);
+        fabShortcutHint.append(fabShortcutIcon, fabShortcutCopy);
         market.rows.append(
             marketHistoryRow,
             columnBlock,
             marketHourlyRow,
+            fabShortcutHint,
             mooncakeCreateEnhancementSettingsToggle('market-listing-age', isZH ? '挂单时长' : 'Listing age', isZH ? '在订单簿显示挂单已存在时长。' : 'Show listing age in order books.'),
             mooncakeCreateBaseItemCostPricePolicyControl(),
             mooncakeCreateEnhancementSettingsToggle('dungeon-token-listing-guide', isZH ? '地下城代币提示' : 'Dungeon token guide', isZH ? '收购挂牌时标记当前每代币买一最优的地下城兑换物。' : 'Mark dungeon redemptions that currently have the best bid value per token.'),
