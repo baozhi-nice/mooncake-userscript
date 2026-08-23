@@ -33186,15 +33186,22 @@
         collectable.addEventListener('click', event => {
             event.preventDefault();
             event.stopPropagation();
-            mooncakeMyListingsManagementState.collectable = !mooncakeMyListingsManagementState.collectable;
+            const enabled = !mooncakeMyListingsManagementState.collectable;
+            mooncakeMyListingsManagementState.collectable = enabled;
+            if (enabled && mooncakeMyListingsManagementState.undercut) {
+                mooncakeMyListingsManagementState.undercut = false;
+                mooncakeClearMyListingsLiveOrderBookCache();
+            }
             mooncakeSyncMyListingsManagementControl(control);
             mooncakeScheduleMyListingsManagement();
         });
         undercut.addEventListener('click', event => {
             event.preventDefault();
             event.stopPropagation();
-            mooncakeMyListingsManagementState.undercut = !mooncakeMyListingsManagementState.undercut;
-            if (!mooncakeMyListingsManagementState.undercut) mooncakeClearMyListingsLiveOrderBookCache();
+            const enabled = !mooncakeMyListingsManagementState.undercut;
+            mooncakeMyListingsManagementState.undercut = enabled;
+            if (enabled) mooncakeMyListingsManagementState.collectable = false;
+            if (!enabled || !mooncakeMyListingsManagementState.undercut) mooncakeClearMyListingsLiveOrderBookCache();
             mooncakeSyncMyListingsManagementControl(control);
             mooncakeScheduleMyListingsManagement();
         });
@@ -33650,6 +33657,35 @@
         return { priceCell, quantityCell };
     }
 
+    function mooncakeGetOrderBookActionCell(row) {
+        const cells = mooncakeGetNativeOrderBookCells(row);
+        return cells.find(cell => /(?:购买|出售|取消|buy|sell|cancel)/i.test(String(cell.textContent || '').trim())) ||
+            cells.at(-1) || null;
+    }
+
+    function mooncakePlaceOrderBookCellAfterPrice(row, cell, priceCell) {
+        if (!row || !cell) return;
+        if (priceCell?.parentElement === row) {
+            if (priceCell.nextElementSibling !== cell) {
+                priceCell.insertAdjacentElement('afterend', cell);
+            }
+            return;
+        }
+        row.appendChild(cell);
+    }
+
+    function mooncakePlaceOrderBookCellBeforeAction(row, cell) {
+        if (!row || !cell) return;
+        const actionCell = mooncakeGetOrderBookActionCell(row);
+        if (actionCell?.parentElement === row) {
+            if (cell.nextElementSibling !== actionCell) {
+                row.insertBefore(cell, actionCell);
+            }
+            return;
+        }
+        row.appendChild(cell);
+    }
+
     function mooncakeReadOrderBookRowListing(row) {
         const fromCandidate = (candidate, allowPlainId = true) => {
             if (!candidate || typeof candidate !== 'object') return null;
@@ -33823,16 +33859,16 @@
         }
         header.textContent = isZH ? '时长' : 'Age';
         header.title = isZH ? '挂单已存在时长' : 'Listing age';
-        const columnIndex = Array.from(headerRow.querySelectorAll('th')).indexOf(header);
 
         rows.forEach(row => {
             const existing = Array.from(row.querySelectorAll('.mooncake-listing-age-cell'));
             let cell = existing.shift() || document.createElement('td');
             existing.forEach(extra => extra.remove());
             cell.className = 'mooncake-listing-age-cell';
-            const rowCells = Array.from(row.children).filter(node => node.tagName === 'TD' && node !== cell);
-            const reference = rowCells[columnIndex] || null;
-            if (Array.from(row.children).indexOf(cell) !== columnIndex) row.insertBefore(cell, reference);
+            // The game can redraw a personal-listing row independently of the
+            // header after creating a listing. Anchor the age column to the
+            // native action cell instead of a transient child index.
+            mooncakePlaceOrderBookCellBeforeAction(row, cell);
             if (mooncakeIsOrderBookSeparatorRow(row)) {
                 cell.classList.add('mooncake-listing-age-separator');
                 delete cell.dataset.mooncakeListingAgeSignature;
@@ -34253,23 +34289,10 @@
             ? 'padding: 8px; text-align: center; font-size: 12px;'
             : 'padding: 8px; text-align: right; font-size: 12px;';
 
-        // 确定工时费表头在表头行中的列索引，用于精确插入单元格（避免与其他插件列冲突）
-        const allHeaderCells = Array.from(headerRow.querySelectorAll('th'));
-        const hourlyWageColIndex = allHeaderCells.indexOf(hourlyWageHeader);
-
         const objective = getEnhancementRouteObjective();
         const playerEnhanceSignature = `${mooncakeCharacterCalcSignature || 'live'}:${JSON.stringify(getPlayerEnhanceParams())}`;
         const rows = Array.from(tbody.querySelectorAll('tr'));
         const pendingRows = [];
-
-        const ensureCellPosition = (row, cell) => {
-            const rowCells = Array.from(row.children).filter(node => node.tagName === 'TD');
-            if (rowCells.indexOf(cell) === hourlyWageColIndex) return;
-            const cellsWithoutHourly = rowCells.filter(node => node !== cell);
-            const referenceCell = cellsWithoutHourly[hourlyWageColIndex] || null;
-            if (referenceCell) row.insertBefore(cell, referenceCell);
-            else row.appendChild(cell);
-        };
 
         rows.forEach((row, index) => {
             try {
@@ -34277,11 +34300,11 @@
                 let hourlyWageCell = existingCells.shift() || null;
                 existingCells.forEach(cell => cell.remove());
 
-                // The native order-book price remains the second cell. Exclude our
-                // injected cell so a misplaced column cannot shift that lookup.
-                const nativeCells = Array.from(row.querySelectorAll('td'))
-                    .filter(cell => cell !== hourlyWageCell && !cell.classList.contains('order-book-hourly-wage-cell'));
-                const priceCell = nativeCells[1];
+                // Keep our metric physically adjacent to the native price cell.
+                // A newly-created personal listing can briefly preserve one of
+                // our injected cells while React redraws the row, so a raw table
+                // index can otherwise put the action and age columns out of order.
+                const { priceCell } = mooncakeGetOrderBookRowCells(row);
                 if (!priceCell) {
                     hourlyWageCell?.remove();
                     return;
@@ -34304,7 +34327,7 @@
                 hourlyWageCell.style.padding = '8px';
                 hourlyWageCell.style.textAlign = isLevelZeroEconomics ? 'center' : 'right';
                 hourlyWageCell.style.cursor = 'pointer';
-                ensureCellPosition(row, hourlyWageCell);
+                mooncakePlaceOrderBookCellAfterPrice(row, hourlyWageCell, priceCell);
 
                 const signature = `${mooncakeMarketPricingRevision}|${mooncakeHourlyWageColorProfileRevision}|${objective}|${playerEnhanceSignature}|${itemHrid}|${enhancementLevel}|${normalizedSide}|${price}`;
                 if (hourlyWageCell.dataset.mooncakeOrderBookSignature === signature) return;
