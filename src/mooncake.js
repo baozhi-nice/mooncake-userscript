@@ -24818,9 +24818,16 @@
     }
 
     function mooncakeIsUpgradeSourceLabel(node) {
-        if (!(node instanceof Element) || node.children.length > 0) return false;
+        if (!(node instanceof Element)) return false;
         const text = String(node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-        return text === '升级自' || text === '升级来源' || text === 'upgrade from' || text === 'upgraded from';
+        if (!(text === '升级自' || text === '升级来源' || text === 'upgrade from' || text === 'upgraded from')) {
+            return false;
+        }
+        // React may wrap this label in an extra element. Prefer the innermost
+        // matching node so the same upgrade source is never handled twice.
+        return ![...node.children].some(child =>
+            String(child.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase() === text
+        );
     }
 
     function mooncakeGetUpgradeSourceItemHrid(itemContainer) {
@@ -24829,12 +24836,48 @@
             extractItemHridFromElement(itemContainer);
     }
 
+    function mooncakeGetUpgradeSourceItemCandidates(root) {
+        if (!(root instanceof Element)) return [];
+        const isItemNode = node => node?.matches?.('[class*="Item_itemContainer"], [class*="Item_item"]');
+        const nodes = [...new Set([
+            ...(isItemNode(root) ? [root] : []),
+            ...root.querySelectorAll('[class*="Item_itemContainer"]'),
+            ...root.querySelectorAll('[class*="Item_item"]')
+        ])];
+        return nodes
+            .filter(mooncakeIsVisibleElement)
+            .filter(item => !!mooncakeGetUpgradeSourceItemHrid(item))
+            .filter(item => !nodes.some(parent => parent !== item && parent.contains(item) &&
+                mooncakeGetUpgradeSourceItemHrid(parent) === mooncakeGetUpgradeSourceItemHrid(item)));
+    }
+
+    function mooncakePickUpgradeSourceItemNearLabel(label, candidates) {
+        if (!label || !candidates?.length) return null;
+        const labelRect = label.getBoundingClientRect();
+        const score = item => {
+            const rect = item.getBoundingClientRect();
+            const verticalGap = Math.max(labelRect.top - rect.bottom, rect.top - labelRect.bottom, 0);
+            const horizontalGap = rect.left >= labelRect.right - 4
+                ? Math.max(0, rect.left - labelRect.right)
+                : 180 + Math.max(0, labelRect.left - rect.right);
+            return verticalGap * 1000 + horizontalGap;
+        };
+        const sameRow = candidates.filter(item => {
+            const rect = item.getBoundingClientRect();
+            return Math.max(labelRect.top - rect.bottom, rect.top - labelRect.bottom, 0) <= 24;
+        });
+        return (sameRow.length ? sameRow : candidates)
+            .slice()
+            .sort((left, right) => score(left) - score(right))[0] || null;
+    }
+
     function mooncakeFindUpgradeSourceItemContainer(label) {
         let candidate = label?.parentElement || null;
         for (let depth = 0; candidate && candidate !== document.body && depth < 6; depth += 1, candidate = candidate.parentElement) {
-            const itemContainers = [...candidate.querySelectorAll('[class*="Item_itemContainer"]')]
-                .filter(item => mooncakeGetUpgradeSourceItemHrid(item));
+            const itemContainers = mooncakeGetUpgradeSourceItemCandidates(candidate);
             if (itemContainers.length === 1) return itemContainers[0];
+            const nearestItem = mooncakePickUpgradeSourceItemNearLabel(label, itemContainers);
+            if (nearestItem) return nearestItem;
         }
         return null;
     }
@@ -24878,7 +24921,7 @@
     }
 
     function mooncakeEnsureUpgradeSourceMarketButton(itemContainer, itemHrid) {
-        if (!itemContainer || !itemHrid || !mooncakeCanOpenMarketplaceForInventoryItem(itemHrid)) return;
+        if (!itemContainer || !itemHrid) return;
         const existing = [...itemContainer.querySelectorAll(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)];
         if (existing.some(button => button.dataset.itemHrid === itemHrid)) return;
         existing.forEach(button => button.remove());
@@ -24969,8 +25012,8 @@
             if (node.matches?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`) ||
                 node.closest?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)) return false;
             const className = typeof node.className === 'string' ? node.className : '';
-            return className.includes('SkillActionDetail') || className.includes('Item_itemContainer') ||
-                !!node.querySelector?.('[class*="SkillActionDetail"], [class*="Item_itemContainer"]');
+            return className.includes('ActionDetail') || className.includes('Item_itemContainer') ||
+                !!node.querySelector?.('[class*="ActionDetail"], [class*="Item_itemContainer"], [class*="Item_item"]');
         };
         mooncakeUpgradeSourceMarketUnsubscribe = subscribeDocumentMutations('upgrade-source-market', mutations => {
             for (const mutation of mutations) {
@@ -24983,7 +25026,7 @@
         });
         document.addEventListener('click', event => {
             if (event.target?.closest?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)) return;
-            if (event.target?.closest?.('[class*="SkillActionDetail"]')) {
+            if (event.target?.closest?.('[class*="ActionDetail"]')) {
                 scheduleMooncakeUpgradeSourceMarketButtons(120);
             }
         }, true);
