@@ -24882,21 +24882,8 @@
         return null;
     }
 
-    function mooncakeGetUpgradeSourceMarketPlacement(itemContainer) {
-        const sourceRow = itemContainer?.closest?.('[class*="SkillActionDetail_upgradeItemSelectorInput"]');
-        if (!sourceRow) return { host: itemContainer, before: null };
-        let anchor = itemContainer.closest?.('[class*="ItemSelector_itemSelector"]') || itemContainer;
-        while (anchor?.parentElement && anchor.parentElement !== sourceRow) {
-            anchor = anchor.parentElement;
-        }
-        return {
-            host: sourceRow,
-            before: anchor?.parentElement === sourceRow ? anchor.nextSibling : null
-        };
-    }
-
-    function mooncakeHasSelectedUpgradeSource(itemContainer) {
-        return !!itemContainer && !itemContainer.querySelector?.('[class*="Item_empty"]');
+    function mooncakeGetUpgradeSourceMarketHost(itemContainer) {
+        return itemContainer?.closest?.('[class*="SkillActionDetail_upgradeItemSelectorInput"]') || itemContainer;
     }
 
     function mooncakePrepareUpgradeSourceMarketHost(host) {
@@ -24933,12 +24920,7 @@
 
     function mooncakeEnsureUpgradeSourceMarketButton(itemContainer, itemHrid) {
         if (!itemContainer || !itemHrid) return;
-        const placement = mooncakeGetUpgradeSourceMarketPlacement(itemContainer);
-        const scope = placement.host || itemContainer;
-        if (!mooncakeHasSelectedUpgradeSource(itemContainer)) {
-            mooncakeRemoveUpgradeSourceMarketButtons(scope);
-            return;
-        }
+        const scope = mooncakeGetUpgradeSourceMarketHost(itemContainer) || itemContainer;
         const existing = [...scope.querySelectorAll(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)];
         if (existing.some(button => button.dataset.itemHrid === itemHrid && button.parentElement === scope)) return;
         mooncakeRemoveUpgradeSourceMarketButtons(scope);
@@ -24993,11 +24975,10 @@
                 mooncakeQueueQ7MarketReport(itemHrid, 0);
             }
         });
-        if (placement.before?.parentElement === host) {
-            host.insertBefore(button, placement.before);
-        } else {
-            host.appendChild(button);
-        }
+        // In the empty state the native warning is already in this flex row,
+        // so appending keeps the shortcut after that warning. With a selected
+        // source, it naturally sits immediately to the icon's right.
+        host.appendChild(button);
     }
 
     function ensureMooncakeUpgradeSourceMarketButtons(root = document) {
