@@ -24882,32 +24882,43 @@
         return null;
     }
 
-    function mooncakePrepareUpgradeSourceMarketHost(itemContainer) {
-        if (!itemContainer) return null;
-        if (!mooncakeUpgradeSourceMarketHostStyles.has(itemContainer)) {
-            mooncakeUpgradeSourceMarketHostStyles.set(itemContainer, {
-                position: itemContainer.style.position,
-                marginRight: itemContainer.style.marginRight,
-                overflow: itemContainer.style.overflow
-            });
+    function mooncakeGetUpgradeSourceMarketPlacement(itemContainer) {
+        const sourceRow = itemContainer?.closest?.('[class*="SkillActionDetail_upgradeItemSelectorInput"]');
+        if (!sourceRow) return { host: itemContainer, before: null };
+        let anchor = itemContainer.closest?.('[class*="ItemSelector_itemSelector"]') || itemContainer;
+        while (anchor?.parentElement && anchor.parentElement !== sourceRow) {
+            anchor = anchor.parentElement;
         }
-        Object.assign(itemContainer.style, {
-            position: 'relative',
-            marginRight: '28px',
-            overflow: 'visible'
-        });
-        itemContainer.setAttribute(MOONCAKE_UPGRADE_SOURCE_MARKET_HOST_ATTR, '1');
-        return itemContainer;
+        return {
+            host: sourceRow,
+            before: anchor?.parentElement === sourceRow ? anchor.nextSibling : null
+        };
     }
 
-    function mooncakeRestoreUpgradeSourceMarketHost(itemContainer) {
-        if (!itemContainer) return;
-        const style = mooncakeUpgradeSourceMarketHostStyles.get(itemContainer);
-        if (style) {
-            Object.assign(itemContainer.style, style);
-            mooncakeUpgradeSourceMarketHostStyles.delete(itemContainer);
+    function mooncakeHasSelectedUpgradeSource(itemContainer) {
+        return !!itemContainer && !itemContainer.querySelector?.('[class*="Item_empty"]');
+    }
+
+    function mooncakePrepareUpgradeSourceMarketHost(host) {
+        if (!host) return null;
+        if (!mooncakeUpgradeSourceMarketHostStyles.has(host)) {
+            mooncakeUpgradeSourceMarketHostStyles.set(host, {
+                overflow: host.style.overflow
+            });
         }
-        itemContainer.removeAttribute(MOONCAKE_UPGRADE_SOURCE_MARKET_HOST_ATTR);
+        host.style.overflow = 'visible';
+        host.setAttribute(MOONCAKE_UPGRADE_SOURCE_MARKET_HOST_ATTR, '1');
+        return host;
+    }
+
+    function mooncakeRestoreUpgradeSourceMarketHost(host) {
+        if (!host) return;
+        const style = mooncakeUpgradeSourceMarketHostStyles.get(host);
+        if (style) {
+            Object.assign(host.style, style);
+            mooncakeUpgradeSourceMarketHostStyles.delete(host);
+        }
+        host.removeAttribute(MOONCAKE_UPGRADE_SOURCE_MARKET_HOST_ATTR);
     }
 
     function mooncakeRemoveUpgradeSourceMarketButtons(root = document) {
@@ -24922,16 +24933,22 @@
 
     function mooncakeEnsureUpgradeSourceMarketButton(itemContainer, itemHrid) {
         if (!itemContainer || !itemHrid) return;
-        const existing = [...itemContainer.querySelectorAll(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)];
-        if (existing.some(button => button.dataset.itemHrid === itemHrid)) return;
-        existing.forEach(button => button.remove());
+        const placement = mooncakeGetUpgradeSourceMarketPlacement(itemContainer);
+        const scope = placement.host || itemContainer;
+        if (!mooncakeHasSelectedUpgradeSource(itemContainer)) {
+            mooncakeRemoveUpgradeSourceMarketButtons(scope);
+            return;
+        }
+        const existing = [...scope.querySelectorAll(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)];
+        if (existing.some(button => button.dataset.itemHrid === itemHrid && button.parentElement === scope)) return;
+        mooncakeRemoveUpgradeSourceMarketButtons(scope);
 
         const shopItem = mooncakeGetCoinShopItem(itemHrid);
         const itemName = getItemName(itemHrid) || (isZH ? '材料' : 'material');
         const label = shopItem
             ? (isZH ? `前往${itemName}系统商店` : `Open ${itemName} shop`)
             : (isZH ? `打开${itemName}市场` : `Open ${itemName} market`);
-        const host = mooncakePrepareUpgradeSourceMarketHost(itemContainer);
+        const host = mooncakePrepareUpgradeSourceMarketHost(scope);
         if (!host) return;
 
         const button = document.createElement('button');
@@ -24941,10 +24958,8 @@
         button.dataset.itemHrid = itemHrid;
         button.setAttribute('aria-label', label);
         Object.assign(button.style, {
-            position: 'absolute',
-            left: 'calc(100% + 4px)',
-            top: '50%',
-            transform: 'translateY(-50%)',
+            position: 'relative',
+            flex: '0 0 22px',
             zIndex: '2',
             width: '22px',
             minWidth: '22px',
@@ -24978,7 +24993,11 @@
                 mooncakeQueueQ7MarketReport(itemHrid, 0);
             }
         });
-        host.appendChild(button);
+        if (placement.before?.parentElement === host) {
+            host.insertBefore(button, placement.before);
+        } else {
+            host.appendChild(button);
+        }
     }
 
     function ensureMooncakeUpgradeSourceMarketButtons(root = document) {
