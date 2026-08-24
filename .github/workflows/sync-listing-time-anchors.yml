@@ -1,0 +1,50 @@
+name: Sync listing time anchors mirror
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sync-listing-time-anchors.yml'
+  schedule:
+    - cron: '*/10 * * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch and validate source data
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='data/listing-time-anchors-v1.json'
+          temporary="${RUNNER_TEMP}/listing-time-anchors-v1.json"
+          curl --fail --location --retry 3 --retry-all-errors --connect-timeout 15 --max-time 60 \
+            'https://gitee.com/baozhibaozhi/mooncake-data/raw/master/listing-time-anchors-v1.json' \
+            --output "$temporary"
+          node -e "const fs=require('fs');const data=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));if(data.schemaVersion!==1||!Number.isSafeInteger(data.updatedAtMs)||!Array.isArray(data.anchors))process.exit(1);" "$temporary"
+          mkdir -p data
+          if [[ -f "$target" ]] && cmp -s "$temporary" "$target"; then
+            echo 'Mirror is already current.'
+            exit 0
+          fi
+          mv "$temporary" "$target"
+
+      - name: Commit updated mirror
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='data/listing-time-anchors-v1.json'
+          git add "$target"
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore: sync listing time anchors mirror'
+          git push

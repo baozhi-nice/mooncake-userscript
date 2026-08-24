@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学学中秋月饼
 // @namespace    http://tampermonkey.net/
-// @version      1.6.128
+// @version      1.6.133
 // @description  曾经有一位强化师叫做中秋月饼一直超期望但是资产飞速增长，背后的秘诀就是靠高工时续命（几百工）。为了防止挂单的时候挂的太低，我开发了这个插件，让我们记住他学习他复刻他超越他，重铸高工时的荣光，纪念中秋月饼；希望往后的强化师能够不被超期望所伤害。  TachibanaHikari说过：不黑心怎么对冲多倍期望。
 // @author       design by baozhi;from PaperCat;感谢ColaCola倾情优化;感谢Q7大厨神的api接口;纪念Foreversunny的创意
 // @homepageURL  https://github.com/baozhi-nice/mooncake-userscript

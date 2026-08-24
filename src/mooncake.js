@@ -838,7 +838,6 @@
         const actions = document.createElement('div');
         Object.assign(actions.style, { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' });
         const definitions = [
-            ['data-mooncake-history-ranking', isZH ? '交易统计' : 'Trading stats', 'rgba(144,166,235,.35)', 'rgba(38,42,58,.68)', 'rgba(238,246,255,.9)'],
             ['data-mooncake-koukou', isZH ? '扣扣小子' : 'Hourly scanner', 'rgba(92,220,234,.46)', 'rgba(26,83,93,.72)', 'rgba(220,251,255,.95)'],
             ['data-mooncake-shortage', isZH ? '缺货统计' : 'Shortage stats', 'rgba(235,166,144,.4)', 'rgba(80,48,38,.68)', 'rgba(255,232,220,.95)']
         ];
@@ -2034,9 +2033,13 @@
     const MARKET_CACHE_KEY = 'MWITools_marketAPI_json';
     const MWI_CORE_MARKET_CACHE_KEY = 'MWICore_marketData';
     const OWN_CACHE_KEY = 'MoonCake_marketCache';
+    const MOONCAKE_Q7_MARKET_UPDATE_EVENT = 'mwi-q7-market-updated';
+    const MOONCAKE_Q7_MARKET_SNAPSHOT_KEY = 'mwi-q7-market-refresh.snapshot.v1';
     let marketDataCache = null;
     let marketDetailSnapshotCache = {};
     let mooncakeMarketPricingRevision = 0;
+    let mooncakeQ7MarketOverlay = null;
+    let mooncakeQ7MarketOverlayTimestamp = null;
 
     function getMarketApiUrl() {
         const host = location.hostname;
@@ -2049,6 +2052,106 @@
         }
         return "https://www.milkywayidle.com/game_data/marketplace.json";
     }
+
+    function mooncakeReadQ7MarketOverlay() {
+        try {
+            const snapshot = JSON.parse(localStorage.getItem(MOONCAKE_Q7_MARKET_SNAPSHOT_KEY) || 'null');
+            const marketData = snapshot?.marketData;
+            if (!marketData || typeof marketData !== 'object' || Array.isArray(marketData) ||
+                Object.keys(marketData).length === 0) {
+                return null;
+            }
+            const sourceTimestamp = Number(snapshot.sourceTimestamp);
+            const fetchedAt = Number(snapshot.fetchedAt);
+            return {
+                marketData,
+                timestamp: Number.isFinite(sourceTimestamp) && sourceTimestamp > 0
+                    ? Math.trunc(sourceTimestamp)
+                    : (Number.isFinite(fetchedAt) ? Math.floor(fetchedAt / 1000) : Math.floor(Date.now() / 1000))
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function mooncakeGetQ7MarketOverlayQuote(itemHrid, level) {
+        const quote = mooncakeQ7MarketOverlay?.[itemHrid]?.[String(level)];
+        if (!quote || typeof quote !== 'object') return null;
+        const ask = Number(quote.a);
+        const bid = Number(quote.b);
+        if (!Number.isFinite(ask) && !Number.isFinite(bid)) return null;
+        return {
+            a: Number.isFinite(ask) ? ask : -1,
+            b: Number.isFinite(bid) ? bid : -1
+        };
+    }
+
+    function mooncakeRefreshExternalMarketPricingSurfaces() {
+        mooncakeMarketPricingRevision++;
+        try { mooncakeClearEnhancementRouteCache(); } catch (_) {}
+        try { mooncakeEnhanceQuickRecommendationCache.clear(); } catch (_) {}
+        try { mooncakeRefreshOrderModalEconomics(); } catch (_) {}
+        try { mooncakeScheduleMyListingsTargetFilter(0, { showProgress: false }); } catch (_) {}
+        try {
+            if (mooncakeMyListingsManagementState?.undercut) {
+                mooncakeScheduleMyListingsManagement();
+            }
+        } catch (_) {}
+        try {
+            if (currentMarketItem?.itemHrid) {
+                mooncakeScheduleCurrentEnhancementMarketRefresh(currentMarketItem.itemHrid);
+                mooncakeMarketHistoryLastRenderKey = '';
+                scheduleMooncakeMarketHistoryCard(0, { force: true });
+            }
+        } catch (_) {}
+        try { scheduleMarketplaceHourlyWageRefresh(); } catch (_) {}
+        try { refreshMooncakeChatLabor(); } catch (_) {}
+    }
+
+    function mooncakeApplyQ7MarketCacheUpdate() {
+        const q7Snapshot = mooncakeReadQ7MarketOverlay();
+        if (!q7Snapshot) return false;
+        if (!marketDataCache) {
+            const externalMarket = readMWIToolsMarketData();
+            marketDataCache = externalMarket?.marketData || {};
+        }
+
+        mooncakeQ7MarketOverlay = q7Snapshot.marketData;
+        mooncakeQ7MarketOverlayTimestamp = q7Snapshot.timestamp;
+        for (const [itemHrid, levels] of Object.entries(mooncakeQ7MarketOverlay)) {
+            if (!levels || typeof levels !== 'object') continue;
+            if (!marketDataCache[itemHrid] || typeof marketDataCache[itemHrid] !== 'object') {
+                marketDataCache[itemHrid] = {};
+            }
+            for (const rawLevel of Object.keys(levels)) {
+                const q7Quote = mooncakeGetQ7MarketOverlayQuote(itemHrid, rawLevel);
+                if (!q7Quote) continue;
+                const level = String(rawLevel);
+                marketDataCache[itemHrid][level] = {
+                    ...(marketDataCache[itemHrid][level] || {}),
+                    a: q7Quote.a,
+                    b: q7Quote.b
+                };
+                const snapshotKey = `${itemHrid}:${level}`;
+                const previousSnapshot = marketDetailSnapshotCache[snapshotKey];
+                marketDetailSnapshotCache[snapshotKey] = {
+                    ...previousSnapshot,
+                    bid: q7Quote.b,
+                    ask: q7Quote.a,
+                    time: mooncakeQ7MarketOverlayTimestamp,
+                    priceBandMin: previousSnapshot?.priceBandMin,
+                    priceBandMax: previousSnapshot?.priceBandMax
+                };
+            }
+        }
+        mooncakeRefreshExternalMarketPricingSurfaces();
+        return true;
+    }
+
+    window.addEventListener(MOONCAKE_Q7_MARKET_UPDATE_EVENT, event => {
+        if (event?.detail?.success === false) return;
+        mooncakeApplyQ7MarketCacheUpdate();
+    });
 
     async function fetchMarketApi() {
         try {
@@ -2139,6 +2242,16 @@
 
     function mooncakeResolveEnhancementMarketQuotes(itemHrid, enhancementLevel, bid, ask, timestamp = null) {
         const level = Math.max(0, Math.min(20, Math.floor(Number(enhancementLevel) || 0)));
+        // A Q7 -1 is an explicit empty side of the order book, not a missing value
+        // that should fall back to a stale quote passed by an older render.
+        const q7Quote = mooncakeGetQ7MarketOverlayQuote(itemHrid, level);
+        if (q7Quote) {
+            return {
+                bid: q7Quote.b,
+                ask: q7Quote.a,
+                time: mooncakeQ7MarketOverlayTimestamp ?? timestamp
+            };
+        }
         const snapshot = marketDetailSnapshotCache?.[`${itemHrid}:${level}`];
         const marketLevel = getMarketData()?.marketData?.[itemHrid]?.[String(level)];
         return {
@@ -2380,6 +2493,11 @@
     }
 
     const MOONCAKE_LISTING_TIME_API_URL = 'https://gitee.com/api/v5/repos/baozhibaozhi/mooncake-data/contents/listing-time-anchors-v1.json?ref=master';
+    const MOONCAKE_LISTING_TIME_GITHUB_MIRROR_URL = 'https://raw.githubusercontent.com/baozhi-nice/mooncake-userscript/main/data/listing-time-anchors-v1.json';
+    const MOONCAKE_LISTING_TIME_READ_SOURCES = Object.freeze([
+        Object.freeze({ id: 'gitee-api', format: 'gitee-content', url: MOONCAKE_LISTING_TIME_API_URL }),
+        Object.freeze({ id: 'github-mirror', format: 'raw-json', url: MOONCAKE_LISTING_TIME_GITHUB_MIRROR_URL })
+    ]);
     // Use a dedicated Gitee account whose repository access is limited to
     // mooncake-data; every userscript user can inspect this client-side token.
     const MOONCAKE_LISTING_TIME_GITEE_TOKEN = 'f3b333fee9643e25cc81c09a8e8cf229';
@@ -2388,6 +2506,10 @@
     const MOONCAKE_LISTING_TIME_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
     const MOONCAKE_LISTING_TIME_ACCEPT_AGE_MS = 35 * 24 * 60 * 60 * 1000;
     const MOONCAKE_LISTING_TIME_CACHE_TTL_MS = 30 * 60 * 1000;
+    const MOONCAKE_LISTING_TIME_REMOTE_FAILURE_COOLDOWN_MS = 2 * 60 * 60 * 1000;
+    const MOONCAKE_LISTING_TIME_UPLOAD_IDLE_MIN_DELAY_MS = 2 * 60 * 1000;
+    const MOONCAKE_LISTING_TIME_UPLOAD_IDLE_MAX_DELAY_MS = 5 * 60 * 1000;
+    const MOONCAKE_LISTING_TIME_UPLOAD_MIN_INTERVAL_MS = 5 * 60 * 1000;
     const MOONCAKE_LISTING_TIME_MAINTENANCE_INTERVAL_MS = 12 * 60 * 60 * 1000;
     const MOONCAKE_LISTING_TIME_ACCURACY_WINDOW_MS = 12 * 60 * 60 * 1000;
     const MOONCAKE_LISTING_TIME_FUTURE_TOLERANCE_MS = 24 * 60 * 60 * 1000;
@@ -2396,6 +2518,8 @@
     const MOONCAKE_LISTING_TIME_NODE_SELECTOR = '.mooncake-listing-age-cell:not(.mooncake-listing-age-separator), .mooncake-market-inline-listing-age';
     const MOONCAKE_LISTING_TIME_LOCK_NAME = 'mooncake-listing-time-upload-v1';
     const MOONCAKE_LISTING_TIME_LEASE_KEY = 'Mooncake_listingTimeUploadLease_v1';
+    const MOONCAKE_LISTING_TIME_REMOTE_FAILURE_KEY = 'Mooncake_listingTimeRemoteFailure_v1';
+    const MOONCAKE_LISTING_TIME_READ_SOURCE_FAILURE_PREFIX = 'Mooncake_listingTimeReadFailure_';
     const mooncakeListingTimePending = new Map();
     const mooncakeListingTimeEstimateCache = new Map();
     let mooncakeListingTimeRemote = { anchors: [], sha: '', updatedAtMs: 0, fetchedAt: 0 };
@@ -2411,6 +2535,9 @@
     let mooncakeListingTimeMinuteTimer = 0;
     let mooncakeListingTimeLastMaintenanceAt = 0;
     let mooncakeListingTimeUploadBlockedUntil = 0;
+    let mooncakeListingTimeRemoteBlockedUntil = 0;
+    const mooncakeListingTimeReadSourceBlockedUntil = new Map();
+    let mooncakeListingTimeLastUploadAttemptAt = 0;
     let mooncakeListingTimeUploadFailureCount = 0;
     let mooncakeListingTimeMarketTouched = false;
     let mooncakeListingTimeStarted = false;
@@ -2425,6 +2552,81 @@
         clearTimeout(mooncakeListingTimeUploadTimer);
         mooncakeListingTimeUploadTimer = 0;
         mooncakeListingTimeUploadDueAt = 0;
+    }
+
+    function mooncakeGetListingTimeRemoteBlockedUntil() {
+        const now = Date.now();
+        let blockedUntil = mooncakeListingTimeRemoteBlockedUntil;
+        try {
+            const persisted = Number(localStorage.getItem(MOONCAKE_LISTING_TIME_REMOTE_FAILURE_KEY));
+            if (Number.isFinite(persisted)) blockedUntil = Math.max(blockedUntil, Math.trunc(persisted));
+            if (blockedUntil > now) {
+                mooncakeListingTimeRemoteBlockedUntil = blockedUntil;
+                return blockedUntil;
+            }
+            if (persisted) localStorage.removeItem(MOONCAKE_LISTING_TIME_REMOTE_FAILURE_KEY);
+        } catch (_) {}
+        mooncakeListingTimeRemoteBlockedUntil = 0;
+        return 0;
+    }
+
+    function mooncakeSetListingTimeRemoteFailureCooldown() {
+        const blockedUntil = Date.now() + MOONCAKE_LISTING_TIME_REMOTE_FAILURE_COOLDOWN_MS;
+        mooncakeListingTimeRemoteBlockedUntil = blockedUntil;
+        mooncakeListingTimeUploadBlockedUntil = Math.max(mooncakeListingTimeUploadBlockedUntil, blockedUntil);
+        mooncakeCancelListingTimeUploadTimer();
+        try {
+            localStorage.setItem(MOONCAKE_LISTING_TIME_REMOTE_FAILURE_KEY, String(blockedUntil));
+        } catch (_) {}
+        return blockedUntil;
+    }
+
+    function mooncakeClearListingTimeRemoteFailureCooldown() {
+        mooncakeListingTimeRemoteBlockedUntil = 0;
+        try {
+            localStorage.removeItem(MOONCAKE_LISTING_TIME_REMOTE_FAILURE_KEY);
+        } catch (_) {}
+    }
+
+    function mooncakeGetListingTimeReadSourceFailureKey(sourceId) {
+        return `${MOONCAKE_LISTING_TIME_READ_SOURCE_FAILURE_PREFIX}${String(sourceId || '').replace(/[^a-z0-9_-]/gi, '')}_v1`;
+    }
+
+    function mooncakeGetListingTimeReadSourceBlockedUntil(sourceId) {
+        const now = Date.now();
+        let blockedUntil = mooncakeListingTimeReadSourceBlockedUntil.get(sourceId) || 0;
+        const key = mooncakeGetListingTimeReadSourceFailureKey(sourceId);
+        try {
+            const persisted = Number(localStorage.getItem(key));
+            if (Number.isFinite(persisted)) blockedUntil = Math.max(blockedUntil, Math.trunc(persisted));
+            if (blockedUntil > now) {
+                mooncakeListingTimeReadSourceBlockedUntil.set(sourceId, blockedUntil);
+                return blockedUntil;
+            }
+            if (persisted) localStorage.removeItem(key);
+        } catch (_) {}
+        mooncakeListingTimeReadSourceBlockedUntil.delete(sourceId);
+        return 0;
+    }
+
+    function mooncakeSetListingTimeReadSourceFailureCooldown(sourceId) {
+        const blockedUntil = Date.now() + MOONCAKE_LISTING_TIME_REMOTE_FAILURE_COOLDOWN_MS;
+        mooncakeListingTimeReadSourceBlockedUntil.set(sourceId, blockedUntil);
+        if (sourceId === 'gitee-api') {
+            mooncakeListingTimeUploadBlockedUntil = Math.max(mooncakeListingTimeUploadBlockedUntil, blockedUntil);
+            mooncakeCancelListingTimeUploadTimer();
+        }
+        try {
+            localStorage.setItem(mooncakeGetListingTimeReadSourceFailureKey(sourceId), String(blockedUntil));
+        } catch (_) {}
+        return blockedUntil;
+    }
+
+    function mooncakeClearListingTimeReadSourceFailureCooldown(sourceId) {
+        mooncakeListingTimeReadSourceBlockedUntil.delete(sourceId);
+        try {
+            localStorage.removeItem(mooncakeGetListingTimeReadSourceFailureKey(sourceId));
+        } catch (_) {}
     }
 
     function mooncakeQueueListingTimePendingWrite(upsert = [], remove = []) {
@@ -2874,6 +3076,24 @@
         return btoa(binary);
     }
 
+    function mooncakeParseListingTimeData(data, referenceNow = Date.now(), sha = '') {
+        try {
+            if (data?.schemaVersion !== 1 || !Number.isSafeInteger(data.updatedAtMs) || data.updatedAtMs < 0) return null;
+            const anchors = mooncakeNormalizeListingTimeAnchors(data.anchors);
+            if (!anchors) return null;
+            const trustedNow = Number.isFinite(referenceNow) ? referenceNow : Date.now();
+            if (anchors.some(anchor => anchor[1] > trustedNow + MOONCAKE_LISTING_TIME_FUTURE_TOLERANCE_MS)) return null;
+            return {
+                anchors,
+                sha: typeof sha === 'string' ? sha : '',
+                updatedAtMs: data.updatedAtMs,
+                fetchedAt: Date.now()
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
     function mooncakeParseListingTimeFile(fileInfo, referenceNow = Date.now()) {
         try {
             const emptyResult = () => ({
@@ -2887,18 +3107,21 @@
             const text = mooncakeDecodeListingTimeContent(fileInfo?.content);
             if (!text) return null;
             if (!text.trim()) return emptyResult();
-            const data = JSON.parse(text);
-            if (data?.schemaVersion !== 1 || !Number.isSafeInteger(data.updatedAtMs) || data.updatedAtMs < 0) return null;
-            const anchors = mooncakeNormalizeListingTimeAnchors(data.anchors);
-            if (!anchors) return null;
-            const trustedNow = Number.isFinite(referenceNow) ? referenceNow : Date.now();
-            if (anchors.some(anchor => anchor[1] > trustedNow + MOONCAKE_LISTING_TIME_FUTURE_TOLERANCE_MS)) return null;
-            return {
-                anchors,
-                sha: typeof fileInfo.sha === 'string' ? fileInfo.sha : '',
-                updatedAtMs: data.updatedAtMs,
-                fetchedAt: Date.now()
-            };
+            return mooncakeParseListingTimeData(
+                JSON.parse(text),
+                referenceNow,
+                typeof fileInfo?.sha === 'string' ? fileInfo.sha : ''
+            );
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function mooncakeParseListingTimeRawText(text, referenceNow = Date.now()) {
+        try {
+            const normalized = String(text || '');
+            if (normalized.length > MOONCAKE_LISTING_TIME_MAX_BASE64_CHARS || !normalized.trim()) return null;
+            return mooncakeParseListingTimeData(JSON.parse(normalized), referenceNow);
         } catch (_) {
             return null;
         }
@@ -2931,34 +3154,67 @@
         return completed;
     }
 
+    async function mooncakeFetchListingTimeReadSource(source) {
+        const headers = { Accept: 'application/json' };
+        if (source.format === 'gitee-content') {
+            const token = mooncakeGetListingTimeGiteeToken();
+            if (token) headers.Authorization = `token ${token}`;
+        }
+        const response = await mooncakeFetchListingTime(source.url, {
+            method: 'GET',
+            cache: 'no-store',
+            credentials: 'omit',
+            headers
+        }, 15000);
+        if (!response.ok) return { status: response.status, parsed: null };
+        const responseDate = Date.parse(response.headers.get('date') || '');
+        const referenceNow = Number.isFinite(responseDate) ? responseDate : Date.now();
+        const parsed = source.format === 'raw-json'
+            ? mooncakeParseListingTimeRawText(await response.text(), referenceNow)
+            : mooncakeParseListingTimeFile(await response.json(), referenceNow);
+        return { status: response.status, parsed };
+    }
+
     async function mooncakeFetchListingTimeRemote(options = {}) {
         const force = options.force === true;
+        if (mooncakeGetListingTimeRemoteBlockedUntil() > Date.now()) return mooncakeListingTimeRemote;
         if (!force && mooncakeListingTimeRemote.fetchedAt &&
             Date.now() - mooncakeListingTimeRemote.fetchedAt < MOONCAKE_LISTING_TIME_CACHE_TTL_MS) {
             return mooncakeListingTimeRemote;
         }
         if (mooncakeListingTimeRequest) return mooncakeListingTimeRequest;
         mooncakeListingTimeRequest = (async () => {
+            let sawAccessFailure = false;
+            let attemptedSource = false;
             try {
-                const response = await mooncakeFetchListingTime(MOONCAKE_LISTING_TIME_API_URL, {
-                    method: 'GET',
-                    cache: 'no-store',
-                    credentials: 'omit',
-                    headers: { Accept: 'application/json' }
-                }, 15000);
-                if (!response.ok) return null;
-                const responseDate = Date.parse(response.headers.get('date') || '');
-                const parsed = mooncakeParseListingTimeFile(
-                    await response.json(),
-                    Number.isFinite(responseDate) ? responseDate : Date.now()
-                );
-                if (!parsed) return null;
-                mooncakeListingTimeRemote = parsed;
-                await mooncakeReconcileListingTimePending();
-                mooncakeRebuildListingTimeAnchors();
-                await mooncakePersistListingTimeRemote();
-                scheduleMarketplaceOrderBookHourlyWageRefresh();
-                return parsed;
+                for (const source of MOONCAKE_LISTING_TIME_READ_SOURCES) {
+                    if (mooncakeGetListingTimeReadSourceBlockedUntil(source.id) > Date.now()) continue;
+                    attemptedSource = true;
+                    try {
+                        const result = await mooncakeFetchListingTimeReadSource(source);
+                        if (!result.parsed) {
+                            if (result.status === 401 || result.status === 403) {
+                                sawAccessFailure = true;
+                                mooncakeSetListingTimeReadSourceFailureCooldown(source.id);
+                            }
+                            continue;
+                        }
+                        mooncakeListingTimeRemote = result.parsed;
+                        mooncakeClearListingTimeReadSourceFailureCooldown(source.id);
+                        mooncakeClearListingTimeRemoteFailureCooldown();
+                        await mooncakeReconcileListingTimePending();
+                        mooncakeRebuildListingTimeAnchors();
+                        await mooncakePersistListingTimeRemote();
+                        scheduleMarketplaceOrderBookHourlyWageRefresh();
+                        return result.parsed;
+                    } catch (_) {}
+                }
+                if (sawAccessFailure) mooncakeSetListingTimeRemoteFailureCooldown();
+                if (attemptedSource) {
+                    mooncakeListingTimeRemote = { ...mooncakeListingTimeRemote, fetchedAt: Date.now() };
+                    await mooncakePersistListingTimeRemote();
+                }
+                return null;
             } catch (_) {
                 return null;
             } finally {
@@ -3014,7 +3270,10 @@
                     try { mooncakeListingTimeChannel?.postMessage({ type: 'pending', anchors: captured }); } catch (_) {}
                 }
                 if (options.uploadAfterPersist === true || mooncakeListingTimeMarketTouched) {
-                    mooncakeScheduleListingTimeUpload(3000, 10000);
+                    mooncakeScheduleListingTimeUpload(
+                        MOONCAKE_LISTING_TIME_UPLOAD_IDLE_MIN_DELAY_MS,
+                        MOONCAKE_LISTING_TIME_UPLOAD_IDLE_MAX_DELAY_MS
+                    );
                 }
             }).catch(() => {});
             scheduleMarketplaceOrderBookHourlyWageRefresh();
@@ -3150,7 +3409,9 @@
     }
 
     async function mooncakeUploadListingTimeAnchors() {
-        if (!mooncakeIsMarketListingAgeUploadEnabled() || Date.now() < mooncakeListingTimeUploadBlockedUntil) return false;
+        const remoteBlockedUntil = mooncakeGetListingTimeRemoteBlockedUntil();
+        if (!mooncakeIsMarketListingAgeUploadEnabled() ||
+            Date.now() < Math.max(mooncakeListingTimeUploadBlockedUntil, remoteBlockedUntil)) return false;
         const token = mooncakeGetListingTimeGiteeToken();
         if (!token) return false;
         return mooncakeUploadListingTimeWithLock(async () => {
@@ -3228,7 +3489,8 @@
                         return true;
                     }
                     if (response.status === 401 || response.status === 403) {
-                        mooncakeListingTimeUploadBlockedUntil = now + 6 * 60 * 60 * 1000;
+                        mooncakeSetListingTimeReadSourceFailureCooldown('gitee-api');
+                        mooncakeSetListingTimeRemoteFailureCooldown();
                         return false;
                     }
                     if (![400, 409, 422].includes(response.status)) return false;
@@ -3241,14 +3503,35 @@
         });
     }
 
-    function mooncakeScheduleListingTimeUpload(minDelayMs = 5000, maxDelayMs = 12000) {
+    function mooncakeScheduleListingTimeUpload(
+        minDelayMs = MOONCAKE_LISTING_TIME_UPLOAD_IDLE_MIN_DELAY_MS,
+        maxDelayMs = MOONCAKE_LISTING_TIME_UPLOAD_IDLE_MAX_DELAY_MS
+    ) {
         if (!mooncakeIsMarketListingAgeUploadEnabled() || !mooncakeGetListingTimeGiteeToken()) return;
         const now = Date.now();
-        const needsMaintenance = now - mooncakeListingTimeLastMaintenanceAt >= MOONCAKE_LISTING_TIME_MAINTENANCE_INTERVAL_MS;
-        if (!mooncakeListingTimePending.size && !needsMaintenance) return;
-        const blockedDelay = Math.max(0, mooncakeListingTimeUploadBlockedUntil - now);
-        const lowerDelay = Math.max(0, minDelayMs, blockedDelay);
-        const upperDelay = Math.max(lowerDelay, maxDelayMs, blockedDelay + 5000);
+        if (!mooncakeListingTimePending.size) return;
+        const blockedUntil = Math.max(
+            mooncakeListingTimeUploadBlockedUntil,
+            mooncakeGetListingTimeRemoteBlockedUntil()
+        );
+        const blockedDelay = Math.max(0, blockedUntil - now);
+        const intervalDelay = Math.max(
+            0,
+            mooncakeListingTimeLastUploadAttemptAt + MOONCAKE_LISTING_TIME_UPLOAD_MIN_INTERVAL_MS - now
+        );
+        const lowerDelay = Math.max(
+            MOONCAKE_LISTING_TIME_UPLOAD_IDLE_MIN_DELAY_MS,
+            minDelayMs,
+            blockedDelay,
+            intervalDelay
+        );
+        const upperDelay = Math.max(
+            lowerDelay,
+            MOONCAKE_LISTING_TIME_UPLOAD_IDLE_MAX_DELAY_MS,
+            maxDelayMs,
+            blockedDelay + 5000,
+            intervalDelay + 5000
+        );
         const delay = lowerDelay + Math.random() * (upperDelay - lowerDelay);
         const dueAt = now + delay;
         if (mooncakeListingTimeUploadTimer && mooncakeListingTimeUploadDueAt <= dueAt) return;
@@ -3261,7 +3544,16 @@
                 mooncakeScheduleListingTimeUpload(1000, 3000);
                 return;
             }
+            if (!mooncakeListingTimePending.size) return;
+            if (document.hidden || navigator.onLine === false) {
+                mooncakeScheduleListingTimeUpload(
+                    MOONCAKE_LISTING_TIME_UPLOAD_IDLE_MIN_DELAY_MS,
+                    MOONCAKE_LISTING_TIME_UPLOAD_IDLE_MAX_DELAY_MS
+                );
+                return;
+            }
             let succeeded = false;
+            mooncakeListingTimeLastUploadAttemptAt = Date.now();
             mooncakeListingTimeUploadPromise = mooncakeUploadListingTimeAnchors()
                 .then(result => {
                     succeeded = result === true;
@@ -3345,7 +3637,10 @@
             if (document.hidden) mooncakeStopListingAgeMinuteTimer();
             else {
                 scheduleMarketplaceOrderBookHourlyWageRefresh();
-                if (mooncakeListingTimeMarketTouched) mooncakeFetchListingTimeRemote();
+                if (mooncakeListingTimeMarketTouched) {
+                    mooncakeFetchListingTimeRemote();
+                    mooncakeScheduleListingTimeUpload();
+                }
             }
         });
         window.addEventListener('storage', event => {
@@ -4092,22 +4387,27 @@
 
             const askPrice = mooncakeGetOrderBookBestPrice(book, 'asks');
             const bidPrice = mooncakeGetOrderBookBestPrice(book, 'bids');
+            // Keep Q7's explicit quote (including -1 for no orders) authoritative
+            // for MoonCake calculations after the game sends another order-book update.
+            const q7Quote = mooncakeGetQ7MarketOverlayQuote(itemHrid, level);
+            const effectiveAsk = q7Quote ? q7Quote.a : askPrice;
+            const effectiveBid = q7Quote ? q7Quote.b : bidPrice;
             const previous = marketDataCache[itemHrid][level];
             const previousSnapshot = marketDetailSnapshotCache[`${itemHrid}:${level}`];
             const priceBandMin = mooncakeGetOrderBookPriceBandValue(priceBandMins, level);
             const priceBandMax = mooncakeGetOrderBookPriceBandValue(priceBandMaxs, level);
             const hasPriceBand = priceBandMin !== null && priceBandMax !== null && priceBandMin <= priceBandMax;
-            if (!previous || previous.a !== askPrice || previous.b !== bidPrice) {
+            if (!previous || previous.a !== effectiveAsk || previous.b !== effectiveBid) {
                 priceChanged = true;
                 changedLevels.add(level);
             }
-            if (!previousSnapshot || previousSnapshot.ask !== askPrice || previousSnapshot.bid !== bidPrice) {
+            if (!previousSnapshot || previousSnapshot.ask !== effectiveAsk || previousSnapshot.bid !== effectiveBid) {
                 snapshotQuotesChanged = true;
             }
-            marketDataCache[itemHrid][level] = { a: askPrice, b: bidPrice };
+            marketDataCache[itemHrid][level] = { a: effectiveAsk, b: effectiveBid };
             marketDetailSnapshotCache[`${itemHrid}:${level}`] = {
-                bid: bidPrice,
-                ask: askPrice,
+                bid: effectiveBid,
+                ask: effectiveAsk,
                 time: snapshotTime,
                 // Preserve a prior valid band if this particular payload only
                 // contains order-book quotes.
@@ -12245,7 +12545,10 @@
 
         let returnedInputCount = 0;
         let totalOutput = 0;
-        const missingItems = [];
+        // Some alchemy outputs (for example artisan crates) cannot be quoted on
+        // the market.  They must not make an otherwise valid record disappear:
+        // keep the quoted-output subtotal, but mark the profit as incomplete.
+        const missingOutputItems = [];
         for (const output of alchemyData.outputs || []) {
             if (actionKey === 'transmute' && output.itemHrid === alchemyData.inputItemHrid) {
                 returnedInputCount += output.count;
@@ -12259,14 +12562,10 @@
                 priceSides.outputSide
             );
             if (!(outputPrice > 0)) {
-                missingItems.push(output);
+                missingOutputItems.push(output);
                 continue;
             }
             totalOutput += outputPrice * output.count * mooncakeGetAlchemyOutputNetFactor(output.itemHrid);
-        }
-
-        if (missingItems.length) {
-            return { ok: false, reason: 'missing-price', missingItems };
         }
 
         const netInputCount = Math.max(0, grossInputCount - Math.min(grossInputCount, returnedInputCount));
@@ -12283,7 +12582,9 @@
             actionCoinCost,
             totalCost,
             totalOutput,
-            profit: totalOutput - totalCost
+            profit: totalOutput - totalCost,
+            hasMissingOutputPrices: missingOutputItems.length > 0,
+            missingOutputItems
         };
     }
 
@@ -12431,11 +12732,24 @@
             return;
         }
 
+        const hasMissingOutputPrices = economics.hasMissingOutputPrices === true;
         const profitColor = economics.profit >= 0 ? 'rgb(100, 255, 100)' : 'rgb(255, 100, 100)';
         const costLabel = isZH ? '基础成本' : 'Base cost';
-        const outputLabel = isZH ? '实际产出' : 'Actual output';
+        const outputLabel = hasMissingOutputPrices
+            ? (isZH ? '已估产出' : 'Quoted output')
+            : (isZH ? '实际产出' : 'Actual output');
         const profitLabel = isZH ? '基础收益' : 'Base profit';
         const catalystNote = isZH ? '未含催化剂' : 'Catalyst excluded';
+        const missingOutputNames = mooncakeFormatAlchemyMissingItems(economics.missingOutputItems);
+        const outputValue = `${hasMissingOutputPrices ? '≥' : ''}${formatNumber(economics.totalOutput)}`;
+        const profitValue = hasMissingOutputPrices
+            ? (isZH ? '待报价' : 'Quote pending')
+            : formatNumber(economics.profit);
+        const partialOutputNote = hasMissingOutputPrices
+            ? (isZH
+                ? `未估 ${missingOutputNames || '无报价产物'}`
+                : `Unpriced: ${missingOutputNames || 'output'}`)
+            : '';
         const returnedText = economics.returnedInputCount > 0
             ? (isZH
                 ? `；返还抵扣 ${formatNumber(economics.returnedInputCount)}`
@@ -12443,13 +12757,14 @@
             : '';
         titleInfo.innerHTML = `
             <span style="margin-left:8px;color:#e0e0e0;">${costLabel}: ${formatNumber(economics.totalCost)}</span>
-            <span style="margin-left:8px;color:#e0e0e0;">${outputLabel}: ${formatNumber(economics.totalOutput)}</span>
-            <span style="margin-left:8px;color:${profitColor};">${profitLabel}: ${formatNumber(economics.profit)}</span>
+            <span style="margin-left:8px;color:#e0e0e0;">${outputLabel}: ${outputValue}</span>
+            <span style="margin-left:8px;color:${hasMissingOutputPrices ? 'var(--color-disabled, #9aa0ad)' : profitColor};">${profitLabel}: ${profitValue}</span>
             <span style="margin-left:6px;color:var(--color-disabled, #9aa0ad);font-size:11px;">(${catalystNote})</span>
+            ${partialOutputNote ? `<span style="margin-left:6px;color:#ffb86b;font-size:11px;">${mooncakeEscapeHtml(partialOutputNote)}</span>` : ''}
         `;
         titleInfo.title = isZH
-            ? `动作 ${formatNumber(alchemyData.attempts)} 次 × 批量 ${formatNumber(economics.bulkMultiplier)}；原料 ${formatNumber(economics.netInputCount)}，行动金币 ${formatNumber(economics.actionCoinCost)}${returnedText}。实际产出逐项按市场税后估值；历史掉落无法可靠获知催化剂，故未计入。`
-            : `${formatNumber(alchemyData.attempts)} actions × bulk ${formatNumber(economics.bulkMultiplier)}; input ${formatNumber(economics.netInputCount)}, action coins ${formatNumber(economics.actionCoinCost)}${returnedText}. Outputs are valued after their individual market taxes; catalysts are unknown in historical loot logs and are excluded.`;
+            ? `动作 ${formatNumber(alchemyData.attempts)} 次 × 批量 ${formatNumber(economics.bulkMultiplier)}；原料 ${formatNumber(economics.netInputCount)}，行动金币 ${formatNumber(economics.actionCoinCost)}${returnedText}。已报价产物按市场税后估值；历史掉落无法可靠获知催化剂，故未计入。${hasMissingOutputPrices ? ` ${missingOutputNames || '部分产物'}暂无市场报价，未计入产出估值，收益暂不展示。` : ''}`
+            : `${formatNumber(alchemyData.attempts)} actions × bulk ${formatNumber(economics.bulkMultiplier)}; input ${formatNumber(economics.netInputCount)}, action coins ${formatNumber(economics.actionCoinCost)}${returnedText}. Quoted outputs are valued after their individual market taxes; catalysts are unknown in historical loot logs and are excluded.${hasMissingOutputPrices ? ` ${missingOutputNames || 'Some outputs'} have no market quote, so they are excluded and profit is hidden.` : ''}`;
         titleSpan.after(titleInfo);
     }
 
@@ -14079,8 +14394,10 @@
     const MOONCAKE_BARGAIN_HISTORY_PRICE_MAX_ENTRIES = 300;
     const MOONCAKE_BARGAIN_GRID_COLUMNS = 'minmax(220px,1.5fr) repeat(7,minmax(104px,1fr))';
     const MOONCAKE_BARGAIN_MIN_WIDTH = '1120px';
-    const MOONCAKE_KOUKOU_GRID_COLUMNS = 'minmax(230px,1.5fr) minmax(106px,.72fr) minmax(116px,.82fr) minmax(122px,.88fr) minmax(122px,.88fr)';
-    const MOONCAKE_KOUKOU_MIN_WIDTH = '880px';
+    // The combined report keeps the actionable current-market figures at the
+    // left and the historic trading figures at the right.
+    const MOONCAKE_KOUKOU_GRID_COLUMNS = 'minmax(230px,1.5fr) minmax(106px,.72fr) minmax(116px,.82fr) minmax(122px,.88fr) minmax(122px,.88fr) repeat(3,72px 128px 86px)';
+    const MOONCAKE_KOUKOU_MIN_WIDTH = '1560px';
     let mooncakeMarketHistorySeq = 0;
     let mooncakeMarketHistoryRankingSort = 'turnover7';
     let mooncakeMarketHistoryRankingSeq = 0;
@@ -14088,6 +14405,7 @@
     let mooncakeMarketBargainSeq = 0;
     let mooncakeMarketBargainAbortController = null;
     let mooncakeMarketKouKouSeq = 0;
+    let mooncakeMarketKouKouAbortController = null;
     let mooncakeMarketHistoryCardAbortController = null;
     let mooncakeMarketHistoryActiveRequestKey = '';
     let mooncakeMarketHistoryScheduleTimer = 0;
@@ -16804,8 +17122,13 @@
             }
             const rankSort = target.closest?.('[data-mooncake-history-sort]');
             if (rankSort) {
-                mooncakeSetMarketHistoryRankingSort(rankSort.getAttribute('data-mooncake-history-sort'));
-                mooncakeRunMarketHistoryRanking();
+                const combinedKouKouPanel = rankSort.closest?.(`#${MOONCAKE_MARKET_KOUKOU_ID}`);
+                mooncakeSetMarketHistoryRankingSort(
+                    rankSort.getAttribute('data-mooncake-history-sort'),
+                    combinedKouKouPanel ? mooncakeWriteKouKouPreferences : null
+                );
+                if (combinedKouKouPanel) mooncakeRunMarketKouKou();
+                else mooncakeRunMarketHistoryRanking();
                 event.preventDefault();
                 event.stopPropagation();
                 return;
@@ -16829,7 +17152,7 @@
                 return;
             }
             if (target.closest?.('[data-mooncake-koukou-run]')) {
-                mooncakeRunMarketKouKou();
+                mooncakeRunMarketKouKou({ force: true });
                 event.preventDefault();
                 event.stopPropagation();
             }
@@ -16912,7 +17235,7 @@
         document.addEventListener('keydown', (event) => {
             const nameInput = event.target.closest?.('[data-mooncake-rank-item-name]');
             const bargainNameInput = event.target.closest?.('[data-mooncake-bargain-item-name]');
-            const koukouInput = event.target.closest?.('[data-mooncake-koukou-item-name], [data-mooncake-koukou-target-hourly]');
+            const koukouInput = event.target.closest?.('[data-mooncake-koukou-item-name], [data-mooncake-koukou-target-hourly], [data-mooncake-koukou-min-volume]');
             if ((!nameInput && !bargainNameInput && !koukouInput) || event.key !== 'Enter' || event.isComposing) return;
             if (koukouInput) mooncakeRunMarketKouKou();
             else if (bargainNameInput) mooncakeRunMarketBargainScan({ force: true });
@@ -16940,7 +17263,7 @@
         }, true);
     }
 
-    function mooncakeSetMarketHistoryRankingSort(requestedKey) {
+    function mooncakeSetMarketHistoryRankingSort(requestedKey, preferenceWriter = null) {
         if (!requestedKey) return;
         if (requestedKey === 'currentHourly' && mooncakeMarketHistoryRankingSort === 'currentHourly') {
             requestedKey = 'opportunity';
@@ -16951,7 +17274,11 @@
         mooncakeMarketHistoryRankingSort = mooncakeMarketHistoryRankingSort === requestedKey && avgHourlyMap[requestedKey]
             ? avgHourlyMap[requestedKey]
             : requestedKey;
-        mooncakeWriteRankingPreferences({ sort: mooncakeMarketHistoryRankingSort });
+        if (typeof preferenceWriter === 'function') {
+            preferenceWriter({ sort: mooncakeMarketHistoryRankingSort });
+        } else {
+            mooncakeWriteRankingPreferences({ sort: mooncakeMarketHistoryRankingSort });
+        }
     }
 
     function mooncakeReadRankingPreferences(storageKey = MOONCAKE_MARKET_HISTORY_RANKING_PREFS_KEY, defaultItemLevels = [95]) {
@@ -16988,7 +17315,10 @@
             itemLevels: [95],
             enhancementLevel: 10,
             nameQuery: '',
-            targetHourlyM: mooncakeGetOrderTargetHourlyM()
+            minVolume: 0,
+            targetHourlyM: mooncakeGetOrderTargetHourlyM(),
+            onlyKouKou: true,
+            sort: 'koukouHourly'
         };
         try {
             const parsed = JSON.parse(localStorage.getItem(MOONCAKE_MARKET_KOUKOU_PREFS_KEY) || '{}');
@@ -16996,18 +17326,28 @@
                 ? parsed.itemLevels.map(Number).filter(value => Number.isFinite(value) && value > 0)
                 : defaults.itemLevels;
             const enhancementLevel = Number(parsed.enhancementLevel);
+            const minVolume = Number(parsed.minVolume);
             const targetHourlyM = Number(parsed.targetHourlyM);
+            const validSort = [
+                'name', 'koukouHourly', 'undercutHourly', 'undercutProfit',
+                'volume1', 'avg1', 'avgHourly1', 'turnover1',
+                'volume3', 'avg3', 'avgHourly3', 'turnover3',
+                'volume7', 'avg7', 'avgHourly7', 'turnover7'
+            ];
             return {
                 itemLevels: itemLevels.length ? [...new Set(itemLevels)] : defaults.itemLevels,
                 enhancementLevel: Number.isFinite(enhancementLevel) && enhancementLevel >= 0 && enhancementLevel <= 20
                     ? Math.trunc(enhancementLevel)
                     : defaults.enhancementLevel,
                 nameQuery: typeof parsed.nameQuery === 'string' ? parsed.nameQuery : defaults.nameQuery,
+                minVolume: Number.isFinite(minVolume) && minVolume >= 0 ? minVolume : defaults.minVolume,
                 targetHourlyM: Number.isFinite(targetHourlyM) &&
                     targetHourlyM >= MOONCAKE_ORDER_TARGET_HOURLY_MIN_M &&
                     targetHourlyM <= MOONCAKE_ORDER_TARGET_HOURLY_MAX_M
                     ? Math.round(targetHourlyM * 1000) / 1000
-                    : defaults.targetHourlyM
+                    : defaults.targetHourlyM,
+                onlyKouKou: parsed.onlyKouKou !== false,
+                sort: validSort.includes(parsed.sort) ? parsed.sort : defaults.sort
             };
         } catch (_) {
             return defaults;
@@ -17154,6 +17494,7 @@
         mooncakeMarketBargainSeq++;
         mooncakeMarketKouKouSeq++;
         mooncakeMarketBargainAbortController?.abort();
+        mooncakeMarketKouKouAbortController?.abort();
         document.getElementById(MOONCAKE_MARKET_BARGAIN_ID)?.remove();
         document.getElementById(MOONCAKE_MARKET_KOUKOU_ID)?.remove();
         let panel = document.getElementById(panelId);
@@ -17767,6 +18108,7 @@
         mooncakeMarketHistoryRankingSeq++;
         mooncakeMarketKouKouSeq++;
         mooncakeMarketHistoryRankingAbortController?.abort();
+        mooncakeMarketKouKouAbortController?.abort();
         document.getElementById(MOONCAKE_MARKET_HISTORY_RANKING_ID)?.remove();
         document.getElementById(MOONCAKE_MARKET_SHORTAGE_ID)?.remove();
         document.getElementById(MOONCAKE_MARKET_KOUKOU_ID)?.remove();
@@ -17974,18 +18316,41 @@
     }
 
     function mooncakeBuildKouKouHeader() {
-        return `<div style="display:grid;grid-template-columns:${MOONCAKE_KOUKOU_GRID_COLUMNS};min-width:${MOONCAKE_KOUKOU_MIN_WIDTH};gap:7px;position:sticky;top:0;z-index:1;background:rgba(18,22,34,.98);padding:8px 0 7px;border-bottom:1px solid rgba(255,255,255,.08);color:rgba(230,238,255,.72);font-size:11px;font-weight:900;text-align:center;">
-            <div style="text-align:left;">装备</div>
-            <div>当前左一</div>
-            <div>当前工时</div>
-            <div>扣一档工时</div>
-            <div>扣一档利润</div>
+        const columns = MOONCAKE_KOUKOU_GRID_COLUMNS;
+        const activeSort = mooncakeMarketHistoryRankingSort;
+        const divider = 'border-left:1px solid rgba(255,255,255,.08);padding-left:8px;';
+        const groupStyle = 'text-align:center;color:rgba(230,238,255,.78);font-size:11px;font-weight:900;letter-spacing:.02em;';
+        const sortButton = (key, label, gridColumn, color = 'rgba(230,238,255,.62)', extraStyle = '') => `
+            <button type="button" data-mooncake-history-sort="${key}" style="grid-column:${gridColumn};grid-row:2;cursor:pointer;text-align:center;border:0;background:transparent;color:${activeSort === key ? '#FFD27A' : color};font-size:11px;font-weight:800;padding:0;${extraStyle}">${label}</button>
+        `;
+        return `<div style="display:grid;grid-template-columns:${columns};min-width:${MOONCAKE_KOUKOU_MIN_WIDTH};gap:5px;position:sticky;top:0;z-index:1;background:rgba(18,22,34,.98);padding:8px 0 7px;border-bottom:1px solid rgba(255,255,255,.08);color:rgba(230,238,255,.72);font-size:11px;font-weight:900;text-align:center;">
+            <button type="button" data-mooncake-history-sort="name" style="grid-column:1;grid-row:1 / span 2;align-self:center;cursor:pointer;text-align:left;border:0;background:transparent;color:${activeSort === 'name' ? '#FFD27A' : 'rgba(230,238,255,.72)'};font-size:11px;font-weight:900;padding:0;">装备</button>
+            <div style="grid-column:2 / span 4;${groupStyle}${divider}">扣扣小子</div>
+            <div style="grid-column:6 / span 3;${groupStyle}${divider}">1d</div>
+            <div style="grid-column:9 / span 3;${groupStyle}${divider}">3d</div>
+            <div style="grid-column:12 / span 3;${groupStyle}${divider}">7d</div>
+            <div style="grid-column:2;grid-row:2;${divider}">当前左一</div>
+            ${sortButton('koukouHourly', '当前工时', 3, '#B9E6A3')}
+            ${sortButton('undercutHourly', '扣一档工时', 4, '#8DE7F2')}
+            ${sortButton('undercutProfit', '扣一档利润', 5, '#6DF6CB')}
+            ${sortButton('volume1', '数量', 6, '#87CEEB', divider)}
+            ${sortButton('avg1', '均价/工时', 7, '#B9E6A3')}
+            ${sortButton('turnover1', '总额', 8, '#FFD27A')}
+            ${sortButton('volume3', '数量', 9, '#87CEEB', divider)}
+            ${sortButton('avg3', '均价/工时', 10, '#B9E6A3')}
+            ${sortButton('turnover3', '总额', 11, '#FFD27A')}
+            ${sortButton('volume7', '数量', 12, '#87CEEB', divider)}
+            ${sortButton('avg7', '均价/工时', 13, '#B9E6A3')}
+            ${sortButton('turnover7', '总额', 14, '#FFD27A')}
         </div>`;
     }
 
-    function mooncakeRenderKouKouRows(rows) {
+    function mooncakeRenderKouKouRows(rows, options = {}) {
         if (!rows.length) {
-            return `${mooncakeBuildKouKouHeader()}<div style="min-width:${MOONCAKE_KOUKOU_MIN_WIDTH};padding:18px;text-align:center;color:rgba(230,238,255,.62);">当前左一暂无达到目标工时费的装备</div>`;
+            const message = options.onlyKouKou
+                ? '当前左一暂无达到目标工时费的装备'
+                : '没有符合筛选条件的交易记录';
+            return `${mooncakeBuildKouKouHeader()}<div style="min-width:${MOONCAKE_KOUKOU_MIN_WIDTH};padding:18px;text-align:center;color:rgba(230,238,255,.62);">${message}</div>`;
         }
         return mooncakeBuildKouKouHeader() + rows.map(row => {
             const displayName = `${getItemName(row.itemHrid)} +${row.level}`;
@@ -17995,12 +18360,21 @@
                 ? `当前左一 ${formatMoney(row.ask)} → 扣一档 ${formatMoney(row.undercutPrice)}`
                 : '当前价格已无法再扣一档';
             return `
-                <div data-mooncake-koukou-row="${mooncakeEscapeHtml(row.itemHrid)}|${row.level}" style="display:grid;grid-template-columns:${MOONCAKE_KOUKOU_GRID_COLUMNS};min-width:${MOONCAKE_KOUKOU_MIN_WIDTH};gap:7px;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.045);">
+                <div data-mooncake-koukou-row="${mooncakeEscapeHtml(row.itemHrid)}|${row.level}" style="display:grid;grid-template-columns:${MOONCAKE_KOUKOU_GRID_COLUMNS};min-width:${MOONCAKE_KOUKOU_MIN_WIDTH};gap:5px;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.045);">
                     <div style="display:flex;align-items:center;gap:6px;min-width:0;"><span data-icon="${mooncakeEscapeHtml(row.itemHrid)}"></span><button type="button" data-mooncake-koukou-jump="1" data-hrid="${mooncakeEscapeHtml(row.itemHrid)}" data-level="${row.level}" title="${mooncakeEscapeHtml(`${displayName}${itemLevel ? ` · ${itemLevel}` : ''}`)}" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:0;background:transparent;color:#eef6ff;font:inherit;font-weight:800;padding:0;cursor:pointer;text-align:left;">${mooncakeEscapeHtml(displayName)}</button></div>
-                    <div style="text-align:center;">${mooncakeFormatBargainPrice(row.ask, '#B9E6A3')}</div>
+                    <div style="text-align:center;border-left:1px solid rgba(255,255,255,.08);padding-left:8px;">${mooncakeFormatBargainPrice(row.ask, '#B9E6A3')}</div>
                     <div style="text-align:center;">${mooncakeFormatKouKouHourly(row.hourlyWage, hourlyColor)}</div>
                     <div style="text-align:center;" title="${mooncakeEscapeHtml(undercutTitle)}">${mooncakeFormatKouKouHourly(row.undercutHourlyWage, row.undercutEvaluation?.combinedColor || '#7DFFB3')}</div>
                     <div style="text-align:center;" title="${mooncakeEscapeHtml(`${undercutTitle}；出售扣除 ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% 市场税后计算`)}">${mooncakeFormatKouKouProfit(row.undercutProfit)}</div>
+                    <div style="text-align:center;color:#87CEEB;font-weight:700;border-left:1px solid rgba(255,255,255,.08);padding-left:8px;">${mooncakeFormatCompactNumber(row.volume1)}</div>
+                    <div style="text-align:center;white-space:nowrap;">${mooncakeFormatRankingAvgHourly(row.avg1, row.avgHourly1, row.avgHourly1Color)}</div>
+                    <div style="text-align:center;color:#FFD27A;font-weight:700;">${mooncakeFormatMarketPrice(row.turnover1)}</div>
+                    <div style="text-align:center;color:#87CEEB;font-weight:700;border-left:1px solid rgba(255,255,255,.08);padding-left:8px;">${mooncakeFormatCompactNumber(row.volume3)}</div>
+                    <div style="text-align:center;white-space:nowrap;">${mooncakeFormatRankingAvgHourly(row.avg3, row.avgHourly3, row.avgHourly3Color)}</div>
+                    <div style="text-align:center;color:#FFD27A;font-weight:700;">${mooncakeFormatMarketPrice(row.turnover3)}</div>
+                    <div style="text-align:center;color:#87CEEB;font-weight:700;border-left:1px solid rgba(255,255,255,.08);padding-left:8px;">${mooncakeFormatCompactNumber(row.volume7)}</div>
+                    <div style="text-align:center;white-space:nowrap;">${mooncakeFormatRankingAvgHourly(row.avg7, row.avgHourly7, row.avgHourly7Color)}</div>
+                    <div style="text-align:center;color:#FFD27A;font-weight:700;">${mooncakeFormatMarketPrice(row.turnover7)}</div>
                 </div>
             `;
         }).join('');
@@ -18012,6 +18386,7 @@
         mooncakeMarketKouKouSeq++;
         mooncakeMarketHistoryRankingAbortController?.abort();
         mooncakeMarketBargainAbortController?.abort();
+        mooncakeMarketKouKouAbortController?.abort();
         document.getElementById(MOONCAKE_MARKET_HISTORY_RANKING_ID)?.remove();
         document.getElementById(MOONCAKE_MARKET_SHORTAGE_ID)?.remove();
         document.getElementById(MOONCAKE_MARKET_BARGAIN_ID)?.remove();
@@ -18023,12 +18398,13 @@
             document.body.appendChild(panel);
         }
         const preferences = mooncakeReadKouKouPreferences();
+        mooncakeMarketHistoryRankingSort = preferences.sort;
         Object.assign(panel.style, {
             position: 'fixed',
             left: '50%',
             top: '50%',
             transform: 'translate(-50%, -50%)',
-            width: 'min(1080px, calc(100vw - 16px))',
+            width: 'min(1800px, calc(100vw - 16px))',
             maxHeight: 'min(720px, calc(100vh - 24px))',
             overflow: 'hidden',
             zIndex: '100000',
@@ -18044,7 +18420,10 @@
         });
         panel.innerHTML = `
             <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.08);">
-                <div style="font-size:15px;font-weight:900;color:#dcfbff;">扣扣小子</div>
+                <div style="display:flex;align-items:baseline;gap:10px;min-width:0;flex-wrap:wrap;">
+                    <span style="font-size:15px;font-weight:900;color:#dcfbff;">扣还是不扣这是个选择~~~~</span>
+                    <span style="font-size:11px;color:rgba(220,251,255,.58);white-space:nowrap;">致敬大佬cancannide</span>
+                </div>
                 <button type="button" data-mooncake-history-rank-close="1" style="cursor:pointer;border:0;background:transparent;color:rgba(238,246,255,.72);font-size:18px;line-height:1;">×</button>
             </div>
             <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 12px 7px;border-bottom:1px solid rgba(255,255,255,.08);">
@@ -18053,38 +18432,64 @@
                 </label>
                 ${mooncakeBuildRankingMultiSelect('item', '装备等级', mooncakeGetRankingItemLevelOptions(), preferences.itemLevels, 118)}
                 ${mooncakeBuildRankingSingleSelect('enhancement', '强化等级', mooncakeGetRankingEnhancementLevelOptions(), preferences.enhancementLevel, 94)}
+                <label style="display:flex;align-items:center;gap:4px;color:rgba(230,238,255,.72);"><span>最低7日量</span>
+                    <input type="number" data-mooncake-koukou-min-volume min="0" step="1" value="${preferences.minVolume}" aria-label="最低7日成交量" style="width:92px;background:rgba(255,255,255,.08);border:1px solid rgba(92,220,234,.34);border-radius:6px;color:#eef6ff;padding:4px 7px;box-sizing:border-box;">
+                </label>
                 <label style="display:flex;align-items:center;gap:4px;color:rgba(230,238,255,.72);"><span>目标工时</span>
                     <input type="number" data-mooncake-koukou-target-hourly min="${MOONCAKE_ORDER_TARGET_HOURLY_MIN_M}" max="${MOONCAKE_ORDER_TARGET_HOURLY_MAX_M}" step="0.001" value="${preferences.targetHourlyM}" aria-label="目标工时费（M/h）" style="width:104px;background:rgba(255,255,255,.08);border:1px solid rgba(92,220,234,.34);border-radius:6px;color:#eef6ff;padding:4px 7px;box-sizing:border-box;">
                     <span>M/h</span>
                 </label>
-                <button type="button" data-mooncake-koukou-run="1" style="cursor:pointer;border:1px solid rgba(92,220,234,.46);background:rgba(26,83,93,.72);color:#dcfbff;border-radius:7px;padding:5px 10px;font-weight:800;">筛选</button>
+                <label title="勾选后仅显示当前左一工时达到目标的装备" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;border:1px solid rgba(92,220,234,.46);background:rgba(26,83,93,.72);color:#dcfbff;border-radius:7px;padding:5px 9px;font-weight:800;">
+                    <input type="checkbox" data-mooncake-koukou-only="1" ${preferences.onlyKouKou ? 'checked' : ''}>
+                    <span>扣扣小子</span>
+                </label>
+                <button type="button" data-mooncake-koukou-run="1" style="cursor:pointer;border:1px solid rgba(92,220,234,.46);background:rgba(26,83,93,.72);color:#dcfbff;border-radius:7px;padding:5px 10px;font-weight:800;">刷新</button>
                 <span data-mooncake-koukou-status style="color:rgba(230,238,255,.58);font-size:11px;"></span>
             </div>
-            <div style="padding:6px 12px;color:rgba(220,251,255,.65);font-size:11px;border-bottom:1px solid rgba(255,255,255,.06);">筛选仅使用当前左一报价；无左一或无法计算成本的装备不参与。扣一档按有效市场档位下调一格，利润已扣市场税。</div>
+            <div style="padding:6px 12px;color:rgba(220,251,255,.65);font-size:11px;border-bottom:1px solid rgba(255,255,255,.06);">左侧按当前左一报价计算扣一档工时与利润，右侧保留 1/3/7 日交易统计。勾选“扣扣小子”后，只保留当前工时达到目标的装备；扣一档利润已扣市场税。</div>
             <div data-mooncake-koukou-body style="overflow:auto;overscroll-behavior:contain;padding:0 12px 16px;"></div>
         `;
         mooncakeRunMarketKouKou();
     }
 
-    async function mooncakeRunMarketKouKou() {
+    async function mooncakeRunMarketKouKou(options = {}) {
         const panel = document.getElementById(MOONCAKE_MARKET_KOUKOU_ID);
         if (!panel) return;
         const runSeq = ++mooncakeMarketKouKouSeq;
+        mooncakeMarketKouKouAbortController?.abort();
+        const abortController = new AbortController();
+        mooncakeMarketKouKouAbortController = abortController;
         const body = panel.querySelector('[data-mooncake-koukou-body]');
         const status = panel.querySelector('[data-mooncake-koukou-status]');
         const nameQuery = panel.querySelector('[data-mooncake-koukou-item-name]')?.value?.trim() || '';
         const itemLevels = mooncakeReadRankingMultiSelect(panel, 'item', [95]);
         const enhancementLevel = mooncakeReadRankingSingleSelect(panel, 'enhancement', 10);
         const targetInput = panel.querySelector('[data-mooncake-koukou-target-hourly]');
+        const minVolumeInput = panel.querySelector('[data-mooncake-koukou-min-volume]');
+        const onlyKouKouInput = panel.querySelector('[data-mooncake-koukou-only]');
         const inputTargetHourlyM = Number(targetInput?.value);
+        const inputMinVolume = Number(minVolumeInput?.value);
         const preferences = mooncakeReadKouKouPreferences();
         const targetHourlyM = Number.isFinite(inputTargetHourlyM) &&
             inputTargetHourlyM >= MOONCAKE_ORDER_TARGET_HOURLY_MIN_M &&
             inputTargetHourlyM <= MOONCAKE_ORDER_TARGET_HOURLY_MAX_M
             ? Math.round(inputTargetHourlyM * 1000) / 1000
             : preferences.targetHourlyM;
+        const minVolume = Number.isFinite(inputMinVolume) && inputMinVolume > 0
+            ? Math.floor(inputMinVolume)
+            : 0;
+        const onlyKouKou = onlyKouKouInput ? onlyKouKouInput.checked : preferences.onlyKouKou;
         if (targetInput) targetInput.value = String(targetHourlyM);
-        mooncakeWriteKouKouPreferences({ itemLevels, enhancementLevel, nameQuery, targetHourlyM });
+        if (minVolumeInput) minVolumeInput.value = String(minVolume);
+        mooncakeWriteKouKouPreferences({
+            itemLevels,
+            enhancementLevel,
+            nameQuery,
+            minVolume,
+            targetHourlyM,
+            onlyKouKou,
+            sort: mooncakeMarketHistoryRankingSort
+        });
 
         const marketData = getMarketData();
         if (!marketData?.marketData) {
@@ -18092,63 +18497,151 @@
             if (status) status.textContent = '市场数据未加载';
             return;
         }
+
+        const allHrids = mooncakeFilterEquipmentHridsByName(
+            mooncakeGetEnhanceableEquipmentHrids(itemLevels),
+            nameQuery
+        );
+        // Keep the historical query bounded just like the original trading
+        // statistics panel. The status text makes truncation visible.
+        const hrids = allHrids.slice(0, 120);
+        const targetHourly = targetHourlyM * 1e6;
         if (body) body.innerHTML = '<div style="padding:18px;text-align:center;color:rgba(230,238,255,.62);">准备计算当前左一工时...</div>';
 
         try {
-            const candidates = mooncakeFilterEquipmentHridsByName(
-                mooncakeGetEnhanceableEquipmentHrids(itemLevels),
-                nameQuery
-            ).map(itemHrid => ({
-                itemHrid,
-                ask: Number(marketData.marketData?.[itemHrid]?.[String(enhancementLevel)]?.a)
-            })).filter(candidate => candidate.ask > 0);
-            const targetHourly = targetHourlyM * 1e6;
-            const rows = [];
-            if (status) status.textContent = `计算 0 / ${candidates.length}`;
+            const candidates = [];
+            let qualifiedCount = 0;
+            if (status) status.textContent = `计算 0 / ${hrids.length}`;
+            for (let index = 0; index < hrids.length; index++) {
+                if (runSeq !== mooncakeMarketKouKouSeq || !panel.isConnected || abortController.signal.aborted) return;
+                const itemHrid = hrids[index];
+                const ask = Number(marketData.marketData?.[itemHrid]?.[String(enhancementLevel)]?.a);
+                const detail = itemDetailMap?.[itemHrid] || getInitClientData()?.itemDetailMap?.[itemHrid];
+                let hourlyWage = null;
+                let evaluation = null;
+                let undercutPrice = 0;
+                let undercutHourlyWage = null;
+                let undercutProfit = null;
+                let undercutEvaluation = null;
 
-            for (let index = 0; index < candidates.length; index++) {
-                if (runSeq !== mooncakeMarketKouKouSeq || !panel.isConnected) return;
-                const candidate = candidates[index];
-                const result = calcHourlyWageAndMetrics(candidate.itemHrid, enhancementLevel, marketData, candidate.ask);
-                const hourlyWage = Number(result?.hourlyWage);
-                if (Number.isFinite(hourlyWage) && hourlyWage >= targetHourly) {
-                    const undercutPrice = getPriceTier(candidate.ask, 'down');
-                    const undercutResult = undercutPrice > 0 && undercutPrice < candidate.ask
-                        ? calcHourlyWageAndMetrics(candidate.itemHrid, enhancementLevel, marketData, undercutPrice)
-                        : null;
-                    const undercutHourlyWage = Number(undercutResult?.hourlyWage);
-                    const undercutProfit = Number.isFinite(undercutHourlyWage)
-                        ? getProfitPerItem(undercutResult.metrics, undercutPrice)
-                        : null;
-                    const detail = itemDetailMap?.[candidate.itemHrid] || getInitClientData()?.itemDetailMap?.[candidate.itemHrid];
-                    rows.push({
-                        itemHrid: candidate.itemHrid,
+                if (ask > 0) {
+                    const result = calcHourlyWageAndMetrics(itemHrid, enhancementLevel, marketData, ask);
+                    const calculatedHourlyWage = Number(result?.hourlyWage);
+                    if (Number.isFinite(calculatedHourlyWage)) {
+                        hourlyWage = calculatedHourlyWage;
+                        evaluation = result?.evaluation || null;
+                        undercutPrice = getPriceTier(ask, 'down');
+                        const undercutResult = undercutPrice > 0 && undercutPrice < ask
+                            ? calcHourlyWageAndMetrics(itemHrid, enhancementLevel, marketData, undercutPrice)
+                            : null;
+                        const calculatedUndercutHourly = Number(undercutResult?.hourlyWage);
+                        if (Number.isFinite(calculatedUndercutHourly)) {
+                            undercutHourlyWage = calculatedUndercutHourly;
+                            undercutProfit = getProfitPerItem(undercutResult.metrics, undercutPrice);
+                            undercutEvaluation = undercutResult?.evaluation || null;
+                        }
+                    }
+                }
+
+                const isKouKouMatch = Number.isFinite(hourlyWage) && hourlyWage >= targetHourly;
+                if (isKouKouMatch) qualifiedCount += 1;
+                if (!onlyKouKou || isKouKouMatch) {
+                    candidates.push({
+                        itemHrid,
                         itemLevel: Number(detail?.itemLevel || 0),
                         level: enhancementLevel,
-                        ask: candidate.ask,
+                        ask,
                         hourlyWage,
-                        evaluation: result?.evaluation || null,
+                        evaluation,
                         undercutPrice,
                         undercutHourlyWage,
                         undercutProfit,
-                        undercutEvaluation: undercutResult?.evaluation || null
+                        undercutEvaluation,
+                        isKouKouMatch
                     });
                 }
-                if (status) status.textContent = `计算 ${index + 1} / ${candidates.length}`;
+                if (status) status.textContent = `计算 ${index + 1} / ${hrids.length}`;
                 if (index % 3 === 2) await new Promise(resolve => setTimeout(resolve, 0));
             }
-            if (runSeq !== mooncakeMarketKouKouSeq || !panel.isConnected) return;
-            rows.sort((left, right) => right.hourlyWage - left.hourlyWage || right.ask - left.ask || getItemName(left.itemHrid).localeCompare(getItemName(right.itemHrid)));
+            if (runSeq !== mooncakeMarketKouKouSeq || !panel.isConnected || abortController.signal.aborted) return;
+
+            const rows = [];
+            const batchSize = 20;
+            for (let offset = 0; offset < candidates.length; offset += batchSize) {
+                const batch = candidates.slice(offset, offset + batchSize);
+                if (status) status.textContent = `加载交易 ${Math.min(offset + batch.length, candidates.length)} / ${candidates.length}`;
+                const data = await fetchMarketHistories(
+                    batch.map(candidate => candidate.itemHrid),
+                    [enhancementLevel],
+                    7,
+                    { force: !!options.force, signal: abortController.signal }
+                );
+                if (runSeq !== mooncakeMarketKouKouSeq || !panel.isConnected || abortController.signal.aborted) return;
+                for (const candidate of batch) {
+                    const windows = data?.[candidate.itemHrid]?.[String(enhancementLevel)] || {};
+                    const avgHourly1Result = mooncakeCalcHourlyWageResultByPrice(candidate.itemHrid, enhancementLevel, windows[1]?.avgPrice || 0, marketData);
+                    const avgHourly3Result = mooncakeCalcHourlyWageResultByPrice(candidate.itemHrid, enhancementLevel, windows[3]?.avgPrice || 0, marketData);
+                    const avgHourly7Result = mooncakeCalcHourlyWageResultByPrice(candidate.itemHrid, enhancementLevel, windows[7]?.avgPrice || 0, marketData);
+                    const row = {
+                        ...candidate,
+                        name: getItemName(candidate.itemHrid),
+                        volume1: windows[1]?.volume || 0,
+                        avg1: windows[1]?.avgPrice || 0,
+                        avgHourly1: avgHourly1Result?.hourlyWage ?? null,
+                        avgHourly1Color: avgHourly1Result?.evaluation?.combinedColor || null,
+                        turnover1: windows[1]?.turnover || 0,
+                        volume3: windows[3]?.volume || 0,
+                        avg3: windows[3]?.avgPrice || 0,
+                        avgHourly3: avgHourly3Result?.hourlyWage ?? null,
+                        avgHourly3Color: avgHourly3Result?.evaluation?.combinedColor || null,
+                        turnover3: windows[3]?.turnover || 0,
+                        volume7: windows[7]?.volume || 0,
+                        avg7: windows[7]?.avgPrice || 0,
+                        avgHourly7: avgHourly7Result?.hourlyWage ?? null,
+                        avgHourly7Color: avgHourly7Result?.evaluation?.combinedColor || null,
+                        turnover7: windows[7]?.turnover || 0
+                    };
+                    const hasHistory = Number(row.volume7) > 0 || Number(row.turnover7) > 0;
+                    if (Number(row.volume7) < minVolume) continue;
+                    // In normal statistics mode, retain the old rule that a
+                    // row must have recent trading. In 扣扣小子 mode, useful
+                    // live opportunities remain visible even without history.
+                    if (!onlyKouKou && !hasHistory) continue;
+                    rows.push(row);
+                }
+            }
+
+            const sortKey = mooncakeMarketHistoryRankingSort;
+            const sortValue = (row, key) => {
+                const value = Number(row[key]);
+                return Number.isFinite(value) ? value : -Infinity;
+            };
+            rows.sort((left, right) => {
+                if (sortKey === 'name') {
+                    return left.name.localeCompare(right.name) || (Number(right.level) || 0) - (Number(left.level) || 0);
+                }
+                const difference = sortValue(right, sortKey) - sortValue(left, sortKey);
+                if (difference) return difference;
+                return sortValue(right, 'hourlyWage') - sortValue(left, 'hourlyWage') ||
+                    sortValue(right, 'ask') - sortValue(left, 'ask') ||
+                    left.name.localeCompare(right.name);
+            });
+
             if (body) {
-                body.innerHTML = mooncakeRenderKouKouRows(rows, targetHourly);
+                body.innerHTML = mooncakeRenderKouKouRows(rows, { onlyKouKou });
                 mooncakeHydrateRankingIcons(body);
             }
-            if (status) status.textContent = `完成，左一 ${candidates.length} 项，达标 ${rows.length} 条`;
+            const limitText = allHrids.length > hrids.length ? `/${allHrids.length}` : '';
+            if (status) status.textContent = `完成，装备 ${hrids.length}${limitText} 项，扣扣达标 ${qualifiedCount} 条，显示 ${rows.length} 条`;
         } catch (error) {
-            if (runSeq !== mooncakeMarketKouKouSeq) return;
-            console.warn('[MoonCake] 扣扣小子计算失败:', error);
-            if (body) body.innerHTML = '<div style="padding:18px;text-align:center;color:#FF8A8A;">计算失败</div>';
-            if (status) status.textContent = '计算失败';
+            if (runSeq !== mooncakeMarketKouKouSeq || error?.name === 'AbortError') return;
+            console.warn('[MoonCake] 扣扣小子与交易统计加载失败:', error);
+            if (body) body.innerHTML = '<div style="padding:18px;text-align:center;color:#FF8A8A;">加载失败</div>';
+            if (status) status.textContent = '加载失败';
+        } finally {
+            if (mooncakeMarketKouKouAbortController === abortController) {
+                mooncakeMarketKouKouAbortController = null;
+            }
         }
     }
 
@@ -18165,6 +18658,7 @@
         mooncakeMarketKouKouSeq++;
         mooncakeMarketHistoryRankingAbortController?.abort();
         mooncakeMarketBargainAbortController?.abort();
+        mooncakeMarketKouKouAbortController?.abort();
         [MOONCAKE_MARKET_HISTORY_RANKING_ID, MOONCAKE_MARKET_SHORTAGE_ID, MOONCAKE_MARKET_BARGAIN_ID, MOONCAKE_MARKET_KOUKOU_ID]
             .forEach(id => document.getElementById(id)?.remove());
     }
@@ -31610,8 +32104,7 @@
                             <select data-mooncake-material-equipment-level="1" aria-label="${materialEquipmentJumpTitle}" title="${materialEquipmentJumpTitle}" ${marketJumpEnabled ? '' : 'disabled'} aria-disabled="${!marketJumpEnabled}" style="cursor:${marketJumpEnabled ? 'pointer' : 'not-allowed'};min-width:48px;border:0;background:rgba(10,30,31,.68);color:inherit;border-radius:4px;padding:2px 3px;font-size:12px;font-weight:800;opacity:${marketJumpEnabled ? '1' : '.52'};">${materialEquipmentJumpOptions}</select>
                         </span>
                     </div>
-                    <button type="button" data-mooncake-history-ranking="1" style="cursor:pointer;border:1px solid rgba(144,166,235,.35);background:rgba(38,42,58,.68);color:rgba(238,246,255,.9);border-radius:7px;padding:5px 10px;font-size:12px;font-weight:800;">交易统计</button>
-                    <button type="button" data-mooncake-koukou="1" title="按当前左一价格筛选达到目标工时费的装备" style="cursor:pointer;border:1px solid rgba(92,220,234,.46);background:rgba(26,83,93,.72);color:#dcfbff;border-radius:7px;padding:5px 10px;font-size:12px;font-weight:800;">扣扣小子</button>
+                    <button type="button" data-mooncake-koukou="1" title="查看扣扣筛选与交易统计" style="cursor:pointer;border:1px solid rgba(92,220,234,.46);background:rgba(26,83,93,.72);color:#dcfbff;border-radius:7px;padding:5px 10px;font-size:12px;font-weight:800;">扣扣小子</button>
                     <button type="button" data-mooncake-shortage="1" style="cursor:pointer;border:1px solid rgba(235,166,144,.4);background:rgba(80,48,38,.68);color:rgba(255,232,220,.95);border-radius:7px;padding:5px 10px;font-size:12px;font-weight:800;">缺货统计</button>
                 </div>
                 <div id="enhancement-market-info" style="background: var(--color-midnight-800); padding: 15px; border-radius: 8px;">
@@ -35251,6 +35744,8 @@
         if (!getMarketData()) {
             await fetchMarketApi();
         }
+        // The standalone Q7 script may have refreshed before MoonCake initialized.
+        mooncakeApplyQ7MarketCacheUpdate();
 
         injectTooltipStyle();
         mooncakeStartEnhancementLevelStyle();
