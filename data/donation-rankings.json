@@ -1,0 +1,59 @@
+{
+  "updatedAt": "2026-08-19T00:02:00+08:00",
+  "rankings": [
+    {
+      "name": "包您馒意",
+      "amount": 666.66,
+      "currency": "CNY",
+      "note": "包的包的，包您馒意，欢迎再来",
+      "nameStyle": {
+        "color": "#87CEEB",
+        "glow": "#ADD8E6",
+        "weight": 800
+      }
+    },
+    {
+      "name": "Joey",
+      "amount": 88.88,
+      "currency": "CNY",
+      "note": "对你爱~爱~爱~不完~",
+      "nameStyle": {
+        "color": "#FFF0A6",
+        "glow": "#FF4D34",
+        "weight": 800
+      }
+    },
+    {
+      "name": "perfectpure",
+      "amount": 10.5,
+      "currency": "CNY",
+      "note": "致敬最好的10/10.5档位～",
+      "nameStyle": {
+        "color": "#8FC8FF",
+        "glow": "#4EA9FF",
+        "weight": 700
+      }
+    },
+    {
+      "name": "BBC",
+      "amount": 10.55,
+      "currency": "CNY",
+      "note": "我要扣草莓头一档",
+      "nameStyle": {
+        "color": "#C6DCFF",
+        "weight": 700
+      }
+    },
+    {
+      "name": "SukiSukiDaiSuki",
+      "amount": 5.2,
+      "currency": "CNY",
+      "note": "进强化最好的时间是现在",
+      "nameStyle": {
+        "color": "#D2E8F9",
+        "glow": "#77BAEC",
+        "weight": 600
+      }
+    }
+  ]
+}

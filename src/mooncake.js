@@ -767,13 +767,14 @@
 
     ]);
     // Built-in records are an offline fallback. The live acknowledgement list
-    // is read from the public Gitee file below and cached locally.
+    // is read from the GitHub mirror and cached locally.
     const MOONCAKE_ENHANCEMENT_SETTINGS_DONATION_RANKINGS = Object.freeze([
         Object.freeze({ name: '包您馒意', amount: 666.66, currency: 'CNY', note: '包的包的，包您馒意' }),
         Object.freeze({ name: 'BBC', amount: 10.55, currency: 'CNY', note: '我要扣草莓头一档 致敬最新档位' }),
         Object.freeze({ name: 'perfectpure', amount: 10.5, currency: 'CNY', note: '致敬最好的10/10.5档位～' })
     ]);
-    const MOONCAKE_DONATION_RANKINGS_SOURCE_URL = 'https://gitee.com/api/v5/repos/baozhibaozhi/mooncake-data/contents/donation-rankings.json?ref=master';
+    const MOONCAKE_DONATION_RANKINGS_SOURCE_URL = 'https://raw.githubusercontent.com/baozhi-nice/mooncake-userscript/main/data/donation-rankings.json';
+    const MOONCAKE_DONATION_RANKINGS_SOURCE_FORMAT = 'raw-json';
     const MOONCAKE_DONATION_RANKINGS_CACHE_KEY = 'Mooncake_donationRankings_v2';
     const MOONCAKE_DONATION_RANKINGS_CACHE_TTL_MS = 30 * 60 * 1000;
     const MOONCAKE_DONATION_RANKINGS_MAX_ENTRIES = 200;
@@ -2495,8 +2496,8 @@
     const MOONCAKE_LISTING_TIME_API_URL = 'https://gitee.com/api/v5/repos/baozhibaozhi/mooncake-data/contents/listing-time-anchors-v1.json?ref=master';
     const MOONCAKE_LISTING_TIME_GITHUB_MIRROR_URL = 'https://raw.githubusercontent.com/baozhi-nice/mooncake-userscript/main/data/listing-time-anchors-v1.json';
     const MOONCAKE_LISTING_TIME_READ_SOURCES = Object.freeze([
-        Object.freeze({ id: 'gitee-api', format: 'gitee-content', url: MOONCAKE_LISTING_TIME_API_URL }),
-        Object.freeze({ id: 'github-mirror', format: 'raw-json', url: MOONCAKE_LISTING_TIME_GITHUB_MIRROR_URL })
+        Object.freeze({ id: 'github-mirror', format: 'raw-json', url: MOONCAKE_LISTING_TIME_GITHUB_MIRROR_URL }),
+        Object.freeze({ id: 'gitee-api', format: 'gitee-content', url: MOONCAKE_LISTING_TIME_API_URL })
     ]);
     // Use a dedicated Gitee account whose repository access is limited to
     // mooncake-data; every userscript user can inspect this client-side token.
@@ -3185,6 +3186,7 @@
         if (mooncakeListingTimeRequest) return mooncakeListingTimeRequest;
         mooncakeListingTimeRequest = (async () => {
             let sawAccessFailure = false;
+            let sawConnectionFailure = false;
             let attemptedSource = false;
             try {
                 for (const source of MOONCAKE_LISTING_TIME_READ_SOURCES) {
@@ -3195,6 +3197,9 @@
                         if (!result.parsed) {
                             if (result.status === 401 || result.status === 403) {
                                 sawAccessFailure = true;
+                                mooncakeSetListingTimeReadSourceFailureCooldown(source.id);
+                            } else if (result.status >= 500 || result.status === 0) {
+                                sawConnectionFailure = true;
                                 mooncakeSetListingTimeReadSourceFailureCooldown(source.id);
                             }
                             continue;
@@ -3207,9 +3212,12 @@
                         await mooncakePersistListingTimeRemote();
                         scheduleMarketplaceOrderBookHourlyWageRefresh();
                         return result.parsed;
-                    } catch (_) {}
+                    } catch (_) {
+                        sawConnectionFailure = true;
+                        mooncakeSetListingTimeReadSourceFailureCooldown(source.id);
+                    }
                 }
-                if (sawAccessFailure) mooncakeSetListingTimeRemoteFailureCooldown();
+                if (sawAccessFailure || sawConnectionFailure) mooncakeSetListingTimeRemoteFailureCooldown();
                 if (attemptedSource) {
                     mooncakeListingTimeRemote = { ...mooncakeListingTimeRemote, fetchedAt: Date.now() };
                     await mooncakePersistListingTimeRemote();
@@ -3493,9 +3501,15 @@
                         mooncakeSetListingTimeRemoteFailureCooldown();
                         return false;
                     }
-                    if (![400, 409, 422].includes(response.status)) return false;
+                    if (![400, 409, 422].includes(response.status)) {
+                        mooncakeSetListingTimeReadSourceFailureCooldown('gitee-api');
+                        mooncakeSetListingTimeRemoteFailureCooldown();
+                        return false;
+                    }
                     await new Promise(resolve => setTimeout(resolve, 250 + Math.random() * 750));
                 } catch (_) {
+                    mooncakeSetListingTimeReadSourceFailureCooldown('gitee-api');
+                    mooncakeSetListingTimeRemoteFailureCooldown();
                     return false;
                 }
             }
@@ -36635,8 +36649,9 @@
                     credentials: 'omit'
                 });
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                const contentResponse = await response.json();
-                const sourceText = mooncakeDecodeDonationRankingsContent(contentResponse?.content);
+                const sourceText = MOONCAKE_DONATION_RANKINGS_SOURCE_FORMAT === 'raw-json'
+                    ? await response.text()
+                    : mooncakeDecodeDonationRankingsContent((await response.json())?.content);
                 const parsed = mooncakeParseDonationRankingsPayload(JSON.parse(sourceText));
                 if (!parsed) throw new Error('Invalid donation rankings payload');
                 const state = {

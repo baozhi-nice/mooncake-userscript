@@ -1,4 +1,4 @@
-name: Sync listing time anchors mirror
+name: Sync community data mirrors
 
 on:
   workflow_dispatch:
@@ -35,12 +35,28 @@ jobs:
           fi
           mv "$temporary" "$target"
 
+      - name: Fetch and validate donation rankings
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='data/donation-rankings.json'
+          temporary="${RUNNER_TEMP}/donation-rankings.json"
+          curl --fail --location --retry 3 --retry-all-errors --connect-timeout 15 --max-time 60 \
+            'https://gitee.com/baozhibaozhi/mooncake-data/raw/master/donation-rankings.json' \
+            --output "$temporary"
+          node -e "const fs=require('fs');const data=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));if(!Array.isArray(data.rankings))process.exit(1);" "$temporary"
+          mkdir -p data
+          if [[ -f "$target" ]] && cmp -s "$temporary" "$target"; then
+            echo 'Donation rankings mirror is already current.'
+            exit 0
+          fi
+          mv "$temporary" "$target"
+
       - name: Commit updated mirror
         shell: bash
         run: |
           set -euo pipefail
-          target='data/listing-time-anchors-v1.json'
-          git add "$target"
+          git add data/listing-time-anchors-v1.json data/donation-rankings.json
           if git diff --cached --quiet; then
             exit 0
           fi
