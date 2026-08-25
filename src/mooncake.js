@@ -30456,6 +30456,158 @@
                 max-height: min(30vh, 250px);
                 scrollbar-width: thin;
             }
+            /* Phone layout: keep every quote readable as one wrap-safe summary
+               instead of squeezing the desktop price/wage/protection columns. */
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-mobile-title,
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-mobile-target-label,
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID} .mooncake-enh-market-plan-quote-mobile-summary {
+                display: none;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-heading {
+                display: grid !important;
+                grid-template-columns: minmax(0, 1fr) auto !important;
+                align-items: center !important;
+                gap: 6px !important;
+                padding: 7px 8px !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-title-group {
+                display: inline-flex !important;
+                align-items: center !important;
+                gap: 0 !important;
+                min-width: 0 !important;
+                overflow: visible !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-title,
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-desktop-hint,
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-mobile-hint,
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-subtitle,
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-target-label,
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-labels {
+                display: none !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-mobile-title,
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-mobile-target-label {
+                display: inline !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-mobile-title {
+                color: #eef4ff;
+                font-size: 13px;
+                font-weight: 800;
+                white-space: nowrap;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-target {
+                flex-basis: auto !important;
+                gap: 3px !important;
+                padding: 2px 5px !important;
+                border-radius: 999px !important;
+                background: rgba(18, 34, 57, .80) !important;
+                white-space: nowrap !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-target input {
+                width: 46px !important;
+                height: 21px !important;
+                font-size: 11px !important;
+                line-height: 16px !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-row {
+                grid-template-columns: 43px minmax(0, 1fr) !important;
+                grid-template-rows: auto auto !important;
+                align-items: stretch !important;
+                column-gap: 7px !important;
+                row-gap: 2px !important;
+                padding: 6px 7px !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-level-cell {
+                grid-column: 1 !important;
+                grid-row: 1 / 3 !important;
+                grid-template-rows: minmax(0, 1fr) 28px !important;
+                justify-items: center !important;
+                align-items: center !important;
+                gap: 2px !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-level {
+                font-size: 15px !important;
+                line-height: 1 !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote {
+                display: grid !important;
+                grid-template-columns: 17px minmax(0, 1fr) !important;
+                align-items: start !important;
+                justify-items: stretch !important;
+                min-height: 25px !important;
+                column-gap: 4px !important;
+                padding: 2px 0 !important;
+                overflow: visible !important;
+                border-radius: 0 !important;
+                background: transparent !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-ask {
+                grid-column: 2 !important;
+                grid-row: 1 !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-bid {
+                grid-column: 2 !important;
+                grid-row: 2 !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote::before {
+                grid-column: 1 !important;
+                grid-row: 1 !important;
+                align-self: baseline !important;
+                justify-self: start !important;
+                color: rgba(216, 228, 255, .72) !important;
+                font-size: 10px !important;
+                font-weight: 800 !important;
+                line-height: 1.35 !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-price,
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-hourly,
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-protection {
+                display: none !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-mobile-summary {
+                grid-column: 2 !important;
+                grid-row: 1 !important;
+                display: flex !important;
+                flex-wrap: wrap !important;
+                align-items: baseline !important;
+                column-gap: 3px;
+                row-gap: 0;
+                min-width: 0 !important;
+                max-width: 100% !important;
+                overflow: visible !important;
+                color: rgba(224, 234, 255, .82);
+                font-size: 11px;
+                line-height: 1.35;
+                text-align: left;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-mobile-price,
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-mobile-hourly,
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-mobile-protection {
+                flex: 0 0 auto;
+                white-space: nowrap;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-mobile-price {
+                font-size: 12px;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-mobile-protection {
+                font-size: 10px;
+                font-weight: 700;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-mobile-separator {
+                flex: 0 0 auto;
+                color: rgba(184, 201, 240, .48);
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-open-market {
+                display: inline-flex !important;
+                width: 32px !important;
+                height: 28px !important;
+                font-size: 11px !important;
+                line-height: 1 !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-list {
+                max-height: min(34vh, 280px) !important;
+                scrollbar-width: thin;
+            }
         `;
         document.head?.appendChild(style);
     }
@@ -30643,7 +30795,7 @@
 
     function mooncakeUpdateEnhanceMarketPlanHourlyTones(column) {
         const targetHourlyWage = mooncakeGetEnhanceMarketPlanTargetHourlyWage();
-        column?.querySelectorAll('.mooncake-enh-market-plan-quote-hourly').forEach(hourly => {
+        column?.querySelectorAll('.mooncake-enh-market-plan-quote-hourly, .mooncake-enh-market-plan-quote-mobile-hourly').forEach(hourly => {
             mooncakeApplyEnhanceMarketPlanHourlyTone(hourly, targetHourlyWage);
         });
     }
@@ -30770,8 +30922,40 @@
                 justifySelf: 'end',
                 textAlign: 'right'
             });
-            button.append(priceLine, hourly, protect);
+            // A phone row has room for one semantic summary, not the desktop
+            // price/hourly/protection grid. Keep the original cells for wide
+            // layouts and give the mobile stylesheet a complete wrap-safe view.
+            const mobileSummary = document.createElement('span');
+            mobileSummary.className = 'mooncake-enh-market-plan-quote-mobile-summary';
+            mobileSummary.setAttribute('aria-hidden', 'true');
+            const mobilePrice = document.createElement('strong');
+            mobilePrice.className = 'mooncake-enh-market-plan-quote-mobile-price';
+            mobilePrice.textContent = price > 0 ? formatMoney(price) : '-';
+            mobilePrice.style.color = priceColor;
+            mobilePrice.style.opacity = isHistorical ? '.62' : '1';
+            const mobileHourly = document.createElement('span');
+            mobileHourly.className = 'mooncake-enh-market-plan-quote-mobile-hourly';
+            mobileHourly.textContent = hasRoute && Number.isFinite(hourlyWage)
+                ? mooncakeFormatHourlyWage(hourlyWage)
+                : '-';
+            mobileHourly.dataset.hourlyWage = Number.isFinite(hourlyWage) ? String(hourlyWage) : 'NaN';
+            mobileHourly.dataset.historical = isHistorical ? '1' : '0';
+            const mobileProtect = document.createElement('span');
+            mobileProtect.className = 'mooncake-enh-market-plan-quote-mobile-protection';
+            mobileProtect.textContent = hasRoute ? protectionText : '-';
+            mobileProtect.style.color = protects > 1e-9 ? '#85e9aa' : 'rgba(215, 224, 247, .60)';
+            mobileProtect.style.opacity = isHistorical ? '.68' : '1';
+            const createSeparator = () => {
+                const separator = document.createElement('span');
+                separator.className = 'mooncake-enh-market-plan-quote-mobile-separator';
+                separator.textContent = '·';
+                separator.setAttribute('aria-hidden', 'true');
+                return separator;
+            };
+            mobileSummary.append(mobilePrice, createSeparator(), mobileHourly, createSeparator(), mobileProtect);
+            button.append(priceLine, hourly, protect, mobileSummary);
             mooncakeApplyEnhanceMarketPlanHourlyTone(hourly, targetHourlyWage);
+            mooncakeApplyEnhanceMarketPlanHourlyTone(mobileHourly, targetHourlyWage);
 
             if (hasRoute) {
                 const sideLabel = side === 'ask' ? (isZH ? '卖一' : 'Ask') : (isZH ? '买一' : 'Bid');
@@ -30882,6 +31066,9 @@
             color: '#eef4ff',
             whiteSpace: 'nowrap'
         });
+        const mobileTitle = document.createElement('strong');
+        mobileTitle.className = 'mooncake-enh-market-plan-mobile-title';
+        mobileTitle.textContent = isZH ? '行情' : 'Market';
         const hint = document.createElement('span');
         hint.className = 'mooncake-enh-market-plan-desktop-hint';
         hint.textContent = isZH ? '左键套用 · 右键看市场' : 'Left: apply · Right: market';
@@ -30900,7 +31087,7 @@
             fontWeight: '600',
             whiteSpace: 'nowrap'
         });
-        titleGroup.append(title, hint, mobileHint);
+        titleGroup.append(title, mobileTitle, hint, mobileHint);
         const target = document.createElement('label');
         target.className = 'mooncake-enh-market-plan-target';
         target.setAttribute('aria-label', isZH ? '挂单目标工时费' : 'Listing target hourly wage');
@@ -30921,7 +31108,11 @@
             fontVariantNumeric: 'tabular-nums'
         });
         const targetLabel = document.createElement('span');
+        targetLabel.className = 'mooncake-enh-market-plan-target-label';
         targetLabel.textContent = isZH ? '挂单目标' : 'Target';
+        const mobileTargetLabel = document.createElement('span');
+        mobileTargetLabel.className = 'mooncake-enh-market-plan-mobile-target-label';
+        mobileTargetLabel.textContent = isZH ? '目标' : 'Target';
         const targetInput = document.createElement('input');
         targetInput.type = 'number';
         targetInput.min = String(MOONCAKE_ORDER_TARGET_HOURLY_MIN_M);
@@ -30978,7 +31169,7 @@
                 targetInput.blur();
             }
         });
-        target.append(targetLabel, targetInput, targetUnit);
+        target.append(targetLabel, mobileTargetLabel, targetInput, targetUnit);
         const subtitle = document.createElement('span');
         subtitle.className = 'mooncake-enh-market-plan-subtitle';
         Object.assign(subtitle.style, {
