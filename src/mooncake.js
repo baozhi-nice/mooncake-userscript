@@ -30608,6 +30608,94 @@
                 max-height: min(34vh, 280px) !important;
                 scrollbar-width: thin;
             }
+            /* Visual hierarchy for the compact phone quote cards. */
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-mobile-title::before {
+                content: "◆";
+                margin-right: 5px;
+                color: #65d9e8;
+                font-size: 8px;
+                vertical-align: 1px;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-row {
+                padding: 7px !important;
+                row-gap: 4px !important;
+                background: linear-gradient(90deg, rgba(20, 24, 37, .88), rgba(25, 30, 47, .70)) !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-row.is-current {
+                background: linear-gradient(90deg, rgba(33, 82, 102, .74), rgba(29, 53, 77, .76)) !important;
+                box-shadow: inset 3px 0 0 #65d9e8;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-level-cell {
+                align-self: stretch;
+                padding: 3px 0;
+                border: 1px solid rgba(128, 153, 219, .30);
+                border-radius: 6px;
+                background: rgba(34, 42, 66, .68);
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote {
+                box-sizing: border-box;
+                min-height: 30px !important;
+                padding: 4px 5px !important;
+                border: 1px solid rgba(137, 157, 218, .14) !important;
+                border-left-width: 2px !important;
+                border-radius: 5px !important;
+                text-align: left !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-ask {
+                border-left-color: rgba(246, 206, 100, .82) !important;
+                background: linear-gradient(90deg, rgba(105, 78, 26, .26), rgba(36, 37, 49, .28)) !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-bid {
+                border-left-color: rgba(116, 220, 239, .82) !important;
+                background: linear-gradient(90deg, rgba(29, 86, 101, .27), rgba(36, 37, 49, .28)) !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-ask::before,
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-bid::before {
+                content: attr(data-side-label) !important;
+                display: grid !important;
+                width: 16px;
+                height: 16px;
+                place-items: center;
+                border: 1px solid currentColor;
+                border-radius: 3px;
+                font-size: 9px !important;
+                font-weight: 800;
+                line-height: 1 !important;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-ask::before {
+                color: #f6ce64 !important;
+                background: rgba(110, 82, 28, .40);
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-bid::before {
+                color: #9fdcf0 !important;
+                background: rgba(28, 81, 97, .42);
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-mobile-summary {
+                padding-top: 1px;
+                column-gap: 4px;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-mobile-price {
+                min-width: 48px;
+                font-size: 13px;
+                letter-spacing: 0;
+                text-shadow: 0 0 8px rgba(239, 223, 151, .16);
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-mobile-hourly,
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-mobile-protection {
+                padding: 1px 4px;
+                border: 1px solid rgba(148, 172, 229, .22);
+                border-radius: 3px;
+                background: rgba(12, 18, 31, .32);
+                line-height: 1.2;
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-mobile-protection {
+                border-color: rgba(102, 220, 160, .26);
+                background: rgba(35, 92, 65, .18);
+            }
+            #${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}="mobile"] .mooncake-enh-market-plan-quote-under-target {
+                border-left-color: rgba(150, 158, 177, .62) !important;
+                background: rgba(42, 45, 55, .34) !important;
+            }
         `;
         document.head?.appendChild(style);
     }
@@ -31068,7 +31156,7 @@
         });
         const mobileTitle = document.createElement('strong');
         mobileTitle.className = 'mooncake-enh-market-plan-mobile-title';
-        mobileTitle.textContent = isZH ? '行情' : 'Market';
+        mobileTitle.textContent = isZH ? '强化行情' : 'Market';
         const hint = document.createElement('span');
         hint.className = 'mooncake-enh-market-plan-desktop-hint';
         hint.textContent = isZH ? '左键套用 · 右键看市场' : 'Left: apply · Right: market';
