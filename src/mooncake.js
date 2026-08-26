@@ -124,7 +124,7 @@
         community_enhancing_speed_level: 'system'
     };
     const MOONCAKE_VIRTUAL_PROFILE_MAX_COUNT = 16;
-    const MOONCAKE_VIRTUAL_RIVAL_MAX_COUNT = 3;
+    const MOONCAKE_VIRTUAL_RIVAL_MAX_COUNT = 8;
     const MOONCAKE_VIRTUAL_PROFILE_NAME_MAX_LENGTH = 28;
     const MOONCAKE_VIRTUAL_PROFILE_UNSAFE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
     // This is intentionally profile-only: virtual values remain separate from
@@ -4541,6 +4541,7 @@
 
     let tooltipStyleInjected = false;
     let tooltipEl = null;
+    let tooltipRivalSidecarEl = null;
     const tooltipListenerDocs = new WeakSet();
 
     function mooncakeClearTooltipHideTimer(tip = tooltipEl) {
@@ -4665,19 +4666,43 @@
                 min-width: 0;
                 white-space: pre-line;
             }
-            .mooncake-tooltip .mooncake-tooltip-rival-panel {
-                float: right;
-                width: 142px;
+            .mooncake-tooltip-rival-sidecar {
+                position: fixed;
+                z-index: 100000;
+                display: none;
+                width: 158px;
+                max-height: min(220px, calc(100dvh - 24px));
+                overflow-y: auto;
+                pointer-events: none;
+                color: #e0e0e0;
+                font-size: 12px;
+                line-height: 1.6;
+                white-space: normal;
+            }
+            .mooncake-tooltip-rival-sidecar.is-visible { display: block; }
+            .mooncake-tooltip .mooncake-tooltip-rival-panel,
+            .mooncake-tooltip-rival-sidecar .mooncake-tooltip-rival-panel {
+                box-sizing: border-box;
                 min-width: 0;
-                margin: 0 0 7px 10px;
                 padding: 5px 7px;
                 border: 1px solid rgba(93, 193, 226, .42);
                 border-radius: 4px;
-                background: rgba(17, 46, 60, .72);
+                background: rgba(10, 31, 43, .94);
                 box-shadow: inset 0 1px 0 rgba(146, 238, 255, .12);
                 font-variant-numeric: tabular-nums;
             }
-            .mooncake-tooltip .mooncake-tooltip-rival-title {
+            .mooncake-tooltip .mooncake-tooltip-rival-panel {
+                float: right;
+                width: 142px;
+                margin: 0 0 7px 10px;
+            }
+            .mooncake-tooltip-rival-sidecar .mooncake-tooltip-rival-panel {
+                float: none;
+                width: 100%;
+                margin: 0;
+            }
+            .mooncake-tooltip .mooncake-tooltip-rival-title,
+            .mooncake-tooltip-rival-sidecar .mooncake-tooltip-rival-title {
                 padding-bottom: 3px;
                 margin-bottom: 2px;
                 border-bottom: 1px solid rgba(93, 193, 226, .26);
@@ -4686,7 +4711,8 @@
                 font-weight: 900;
                 letter-spacing: .04em;
             }
-            .mooncake-tooltip .mooncake-tooltip-rival-row {
+            .mooncake-tooltip .mooncake-tooltip-rival-row,
+            .mooncake-tooltip-rival-sidecar .mooncake-tooltip-rival-row {
                 display: flex;
                 align-items: baseline;
                 justify-content: space-between;
@@ -4696,25 +4722,29 @@
                 font-size: 11px;
                 white-space: nowrap;
             }
-            .mooncake-tooltip .mooncake-tooltip-rival-label {
+            .mooncake-tooltip .mooncake-tooltip-rival-label,
+            .mooncake-tooltip-rival-sidecar .mooncake-tooltip-rival-label {
                 display: flex;
                 min-width: 0;
                 align-items: baseline;
                 gap: 4px;
             }
-            .mooncake-tooltip .mooncake-tooltip-rival-name {
+            .mooncake-tooltip .mooncake-tooltip-rival-name,
+            .mooncake-tooltip-rival-sidecar .mooncake-tooltip-rival-name {
                 min-width: 0;
                 overflow: hidden;
                 text-overflow: ellipsis;
                 white-space: nowrap;
             }
-            .mooncake-tooltip .mooncake-tooltip-rival-protect {
+            .mooncake-tooltip .mooncake-tooltip-rival-protect,
+            .mooncake-tooltip-rival-sidecar .mooncake-tooltip-rival-protect {
                 flex: 0 0 auto;
                 color: rgba(170, 231, 195, .9);
                 font-size: 10px;
                 font-weight: 800;
             }
-            .mooncake-tooltip .mooncake-tooltip-rival-row strong { font-size: 12px; }
+            .mooncake-tooltip .mooncake-tooltip-rival-row strong,
+            .mooncake-tooltip-rival-sidecar .mooncake-tooltip-rival-row strong { font-size: 12px; }
             @media (max-width: 440px) {
                 .mooncake-tooltip .mooncake-tooltip-rival-panel {
                     float: none;
@@ -4928,6 +4958,76 @@
         return tooltipEl;
     }
 
+    function mooncakeGetVirtualRivalTooltipSidecar() {
+        if (tooltipRivalSidecarEl?.isConnected) return tooltipRivalSidecarEl;
+        const sidecar = document.createElement('div');
+        sidecar.className = 'mooncake-tooltip-rival-sidecar';
+        sidecar.setAttribute('aria-hidden', 'true');
+        document.body.appendChild(sidecar);
+        tooltipRivalSidecarEl = sidecar;
+        return sidecar;
+    }
+
+    function mooncakeHideVirtualRivalTooltipSidecar() {
+        const sidecar = tooltipRivalSidecarEl;
+        if (!sidecar) return;
+        sidecar.classList.remove('is-visible');
+        sidecar.style.visibility = '';
+        sidecar.replaceChildren();
+    }
+
+    function mooncakeGetTooltipViewportBounds() {
+        const viewport = window.visualViewport;
+        const left = Math.max(0, Number(viewport?.offsetLeft) || 0);
+        const top = Math.max(0, Number(viewport?.offsetTop) || 0);
+        const width = Math.max(1, Number(viewport?.width) || window.innerWidth || 1);
+        const height = Math.max(1, Number(viewport?.height) || window.innerHeight || 1);
+        return { left, top, right: left + width, bottom: top + height, width, height };
+    }
+
+    function mooncakeMoveVirtualRivalTooltipToSidecar(tip) {
+        const panel = tip?.querySelector?.('.mooncake-tooltip-rival-panel');
+        if (!panel) return false;
+        const viewport = mooncakeGetTooltipViewportBounds();
+        const pad = 12;
+        const gap = 8;
+        const sidecarWidth = 158;
+        const tipRect = tip.getBoundingClientRect();
+        const canFitRight = tipRect.right + gap + sidecarWidth <= viewport.right - pad;
+        const canFitLeft = tipRect.left - gap - sidecarWidth >= viewport.left + pad;
+        // A sidecar needs real horizontal space. On phone-sized viewports the
+        // in-tooltip compact layout remains easier to scan and avoids overlap.
+        if (viewport.width < 580 || (!canFitRight && !canFitLeft)) return false;
+
+        const sidecar = mooncakeGetVirtualRivalTooltipSidecar();
+        sidecar.style.left = '-10000px';
+        sidecar.style.top = '-10000px';
+        sidecar.style.visibility = 'hidden';
+        sidecar.replaceChildren(panel);
+        sidecar.classList.add('is-visible');
+        return true;
+    }
+
+    function mooncakePositionVirtualRivalTooltipSidecar(tip) {
+        const sidecar = tooltipRivalSidecarEl;
+        if (!sidecar?.classList.contains('is-visible') || !tip) return;
+        const viewport = mooncakeGetTooltipViewportBounds();
+        const pad = 12;
+        const gap = 8;
+        const tipRect = tip.getBoundingClientRect();
+        const sidecarRect = sidecar.getBoundingClientRect();
+        const fitsRight = tipRect.right + gap + sidecarRect.width <= viewport.right - pad;
+        const x = fitsRight
+            ? tipRect.right + gap
+            : Math.max(viewport.left + pad, tipRect.left - gap - sidecarRect.width);
+        const preferredY = tipRect.top;
+        const maxY = Math.max(viewport.top + pad, viewport.bottom - sidecarRect.height - pad);
+        const y = Math.min(Math.max(viewport.top + pad, preferredY), maxY);
+        sidecar.style.left = `${Math.round(x)}px`;
+        sidecar.style.top = `${Math.round(y)}px`;
+        sidecar.style.visibility = '';
+    }
+
     function getEventPoint(e) {
         let point = null;
         if (e?.touches?.[0]) {
@@ -4958,6 +5058,7 @@
     function showTooltip(e, html, anchorEl = null) {
         const tip = getTooltipEl();
         mooncakeClearTooltipHideTimer(tip);
+        mooncakeHideVirtualRivalTooltipSidecar();
         // The tooltip DOM is shared. Invalidate delayed history-wage work
         // before replacing it so an old callback cannot paint a new tooltip.
         tip._mooncakeHistoryHourlySession = (Number(tip._mooncakeHistoryHourlySession) || 0) + 1;
@@ -4967,6 +5068,10 @@
         tip.classList.toggle('mooncake-tooltip-interactive', anchorEl?._mooncakeTooltipInteractive === true);
         tip.classList.add("visible");
         positionTooltip(e, tip, anchorEl);
+        if (mooncakeMoveVirtualRivalTooltipToSidecar(tip)) {
+            positionTooltip(e, tip, anchorEl);
+            mooncakePositionVirtualRivalTooltipSidecar(tip);
+        }
         mooncakeHydrateMarketHistoryTimelineHourlyWages(tip);
     }
 
@@ -5008,6 +5113,7 @@
         const tip = tooltipEl;
         if (!tip) return;
         mooncakeClearTooltipHideTimer(tip);
+        mooncakeHideVirtualRivalTooltipSidecar();
         tip.classList.remove("visible", "mooncake-tooltip-interactive");
         tip._mooncakeTooltipAnchor = null;
         mooncakeSetTooltipPinned(tip, false);
@@ -5099,6 +5205,7 @@
             mooncakeSetTooltipPinned(tip, true);
             mooncakeClearTooltipHideTimer(tip);
             positionTooltip(e, tip, cell);
+            mooncakePositionVirtualRivalTooltipSidecar(tip);
         } else {
             const tooltipHtml = mooncakeResolveTooltipHtml(cell);
             if (!tooltipHtml) return;
@@ -37728,7 +37835,9 @@
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue] { min-width:0; display:grid; gap:6px; margin:0 0 8px; padding:8px 9px; border:1px solid rgba(93,193,226,.28); border-radius:6px; background:rgba(16,39,55,.28); box-shadow:inset 0 1px 0 rgba(152,232,255,.06); }
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue-header] { min-width:0; display:flex; align-items:center; justify-content:space-between; gap:10px; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue-copy] { min-width:0; display:grid; gap:1px; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue-title-line] { min-width:0; display:flex; align-items:baseline; flex-wrap:wrap; gap:7px; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue-copy] strong { color:#a8edff; font-size:12px; line-height:1.25; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue-quote] { color:rgba(186,222,238,.62); font-size:10px; font-style:italic; line-height:1.25; white-space:nowrap; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue-copy] small { color:rgba(214,231,244,.58); font-size:10px; line-height:1.35; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-add] { flex:0 0 auto; min-height:28px; cursor:pointer; border:1px solid rgba(91,206,235,.48); border-radius:5px; background:rgba(30,99,124,.52); color:#d9f7ff; padding:4px 8px; font:inherit; font-size:11px; font-weight:850; white-space:nowrap; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-add]:disabled { cursor:default; opacity:.44; }
@@ -38404,13 +38513,19 @@
         virtualRivalQueueHeader.setAttribute('data-mooncake-virtual-rival-queue-header', '1');
         const virtualRivalQueueCopy = document.createElement('div');
         virtualRivalQueueCopy.setAttribute('data-mooncake-virtual-rival-queue-copy', '1');
+        const virtualRivalQueueTitleLine = document.createElement('div');
+        virtualRivalQueueTitleLine.setAttribute('data-mooncake-virtual-rival-queue-title-line', '1');
         const virtualRivalQueueTitle = document.createElement('strong');
         virtualRivalQueueTitle.textContent = isZH ? '宿敌来犯' : 'Rival queue';
+        const virtualRivalQueueQuote = document.createElement('span');
+        virtualRivalQueueQuote.setAttribute('data-mooncake-virtual-rival-queue-quote', '1');
+        virtualRivalQueueQuote.textContent = isZH ? '当恩怨各一半，我怎么圈揽' : 'When grudges divide evenly, whom do I recruit?';
         const virtualRivalQueueHint = document.createElement('small');
         virtualRivalQueueHint.textContent = isZH
-            ? '最多三位，仅显示各方案的工时费，不会覆盖当前虚拟配置。拖拽调整顺序。'
-            : 'Up to three profiles; shows only hourly wage and never replaces the active virtual setup. Drag to reorder.';
-        virtualRivalQueueCopy.append(virtualRivalQueueTitle, virtualRivalQueueHint);
+            ? '最多八位，仅显示各方案的工时费，不会覆盖当前虚拟配置。拖拽调整顺序。'
+            : 'Up to eight profiles; shows only hourly wage and never replaces the active virtual setup. Drag to reorder.';
+        virtualRivalQueueTitleLine.append(virtualRivalQueueTitle, virtualRivalQueueQuote);
+        virtualRivalQueueCopy.append(virtualRivalQueueTitleLine, virtualRivalQueueHint);
         const virtualRivalAdd = document.createElement('button');
         virtualRivalAdd.type = 'button';
         virtualRivalAdd.setAttribute('data-mooncake-virtual-rival-add', '1');
