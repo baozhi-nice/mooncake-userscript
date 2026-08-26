@@ -6066,7 +6066,7 @@
         const cacheKey = [
             mooncakeMarketPricingRevision,
             mooncakeHourlyWageColorProfileRevision,
-            mooncakeGetEnhancementRouteObjective(),
+            getEnhancementRouteObjective(),
             mooncakeGetLiveEnhancingCommunityBuffLevel(),
             mooncakeIsEnhancingCommunityBuffEnabled(),
             itemHrid,
@@ -37701,14 +37701,14 @@
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue-copy] small { color:rgba(214,231,244,.58); font-size:10px; line-height:1.35; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-add] { flex:0 0 auto; min-height:28px; cursor:pointer; border:1px solid rgba(91,206,235,.48); border-radius:5px; background:rgba(30,99,124,.52); color:#d9f7ff; padding:4px 8px; font:inherit; font-size:11px; font-weight:850; white-space:nowrap; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-add]:disabled { cursor:default; opacity:.44; }
-            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-list] { min-width:0; display:grid; gap:4px; }
-            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-row] { min-width:0; display:grid; grid-template-columns:22px 50px minmax(0,1fr) auto; align-items:center; gap:6px; min-height:31px; padding:3px 4px; border:1px solid rgba(132,177,204,.20); border-radius:4px; background:rgba(10,16,27,.48); box-sizing:border-box; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-list] { min-width:0; display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,240px)); gap:5px; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-row] { min-width:0; display:grid; grid-template-columns:18px 42px minmax(0,1fr) auto; align-items:center; gap:5px; min-height:31px; padding:3px 4px; border:1px solid rgba(132,177,204,.20); border-radius:4px; background:rgba(10,16,27,.48); box-sizing:border-box; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-row][data-mooncake-virtual-rival-dragging] { opacity:.56; border-style:dashed; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-row][data-mooncake-virtual-rival-drop-target] { border-color:rgba(105,221,255,.8); box-shadow:0 0 0 1px rgba(105,221,255,.18); }
-            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-drag-handle] { width:22px; height:24px; cursor:grab; border:0; border-radius:3px; background:transparent; color:rgba(186,222,238,.7); font:inherit; font-size:15px; line-height:1; padding:0; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-drag-handle] { width:18px; height:24px; cursor:grab; border:0; border-radius:3px; background:transparent; color:rgba(186,222,238,.7); font:inherit; font-size:15px; line-height:1; padding:0; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-drag-handle]:active { cursor:grabbing; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-order] { color:rgba(182,232,247,.82); font-size:10px; font-weight:850; white-space:nowrap; }
-            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-select] { min-width:0; min-height:25px; box-sizing:border-box; border:1px solid rgba(123,185,214,.35); border-radius:4px; background:rgba(12,22,34,.9); color:#edf7ff; padding:3px 5px; font:inherit; font-size:11px; font-weight:700; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-select] { width:100%; min-width:0; min-height:25px; box-sizing:border-box; border:1px solid rgba(123,185,214,.35); border-radius:4px; background:rgba(12,22,34,.9); color:#edf7ff; padding:3px 5px; font:inherit; font-size:11px; font-weight:700; text-overflow:ellipsis; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-remove] { min-width:28px; min-height:25px; cursor:pointer; border:1px solid rgba(230,110,130,.45); border-radius:4px; background:rgba(112,42,55,.54); color:#ffd7df; padding:3px 6px; font:inherit; font-size:12px; font-weight:900; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-rival-empty] { padding:4px 2px 1px; color:rgba(214,231,244,.48); font-size:10px; line-height:1.35; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-profile-section] { padding-top:10px; padding-bottom:7px; }
@@ -37770,7 +37770,8 @@
                 #better-loot-tracker-config-panel [data-mooncake-virtual-equipment-preset] { grid-template-columns:1fr; }
                 #better-loot-tracker-config-panel [data-mooncake-virtual-equipment-preset-controls] { grid-template-columns:minmax(0,1fr) auto auto; }
                 #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue-header] { align-items:flex-start; }
-                #better-loot-tracker-config-panel [data-mooncake-virtual-rival-row] { grid-template-columns:20px 48px minmax(0,1fr) auto; gap:4px; }
+                #better-loot-tracker-config-panel [data-mooncake-virtual-rival-list] { grid-template-columns:1fr; }
+                #better-loot-tracker-config-panel [data-mooncake-virtual-rival-row] { grid-template-columns:18px 42px minmax(0,1fr) auto; gap:4px; }
                 #better-loot-tracker-config-panel [data-mooncake-virtual-community-buff-summary] { flex-basis:100%; white-space:normal; }
                 #better-loot-tracker-config-panel [data-mooncake-virtual-profile-section] > [data-mooncake-enhancement-settings-section-heading] { padding-right:0; }
                 #better-loot-tracker-config-panel [data-mooncake-virtual-profile-easter-egg] { position:static; max-width:none; margin:-1px 0 7px; text-align:right; }
@@ -38387,7 +38388,7 @@
         const virtualRivalList = document.createElement('div');
         virtualRivalList.setAttribute('data-mooncake-virtual-rival-list', '1');
         virtualRivalQueue.append(virtualRivalQueueHeader, virtualRivalList);
-        virtual.rows.append(virtualRivalQueue, virtualPreset, virtualHeader, virtualBody);
+        virtual.rows.append(virtualPreset, virtualRivalQueue, virtualHeader, virtualBody);
 
         const donation = mooncakeCreateEnhancementSettingsSection(isZH ? '打赏' : 'Support', '请包子吃个早饭~    记得备注名字哦');
         donation.section.setAttribute('data-mooncake-enhancement-settings-section', 'wide');
