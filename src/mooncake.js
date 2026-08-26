@@ -124,6 +124,7 @@
         community_enhancing_speed_level: 'system'
     };
     const MOONCAKE_VIRTUAL_PROFILE_MAX_COUNT = 16;
+    const MOONCAKE_VIRTUAL_RIVAL_MAX_COUNT = 3;
     const MOONCAKE_VIRTUAL_PROFILE_NAME_MAX_LENGTH = 28;
     const MOONCAKE_VIRTUAL_PROFILE_UNSAFE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
     // This is intentionally profile-only: virtual values remain separate from
@@ -299,9 +300,62 @@
         return null;
     }
 
-    function mooncakePopulateVirtualProfileSelect(select, selectedValue = '') {
+    function mooncakeGetVirtualProfileChoiceValues() {
+        return [
+            ...MOONCAKE_VIRTUAL_EQUIPMENT_PRESETS.map(preset => `built-in:${preset.id}`),
+            ...mooncakeGetCustomVirtualProfiles().map(profile => `custom:${profile.id}`)
+        ];
+    }
+
+    // Rivals deliberately point at saved virtual profiles instead of copying
+    // their values. Updating a profile therefore updates every place that
+    // profile is used, while the active virtual setup remains untouched.
+    function mooncakeGetVirtualRivalProfileValues() {
+        const seen = new Set();
+        const values = [];
+        const source = Array.isArray(config?.virtualRivals) ? config.virtualRivals : [];
+        source.forEach(entry => {
+            if (values.length >= MOONCAKE_VIRTUAL_RIVAL_MAX_COUNT) return;
+            const value = typeof entry === 'string' ? entry : entry?.profile;
+            const choice = mooncakeGetVirtualProfileChoice(value);
+            if (!choice || seen.has(value)) return;
+            seen.add(value);
+            values.push(value);
+        });
+        return values;
+    }
+
+    function mooncakeGetVirtualRivalChoices() {
+        return mooncakeGetVirtualRivalProfileValues()
+            .map(value => {
+                const choice = mooncakeGetVirtualProfileChoice(value);
+                return choice ? { value, choice } : null;
+            })
+            .filter(Boolean);
+    }
+
+    function mooncakeSetVirtualRivalProfileValues(values) {
+        const source = Array.isArray(values) ? values : [];
+        const seen = new Set();
+        config.virtualRivals = source.reduce((result, entry) => {
+            if (result.length >= MOONCAKE_VIRTUAL_RIVAL_MAX_COUNT) return result;
+            const value = typeof entry === 'string' ? entry : entry?.profile;
+            const choice = mooncakeGetVirtualProfileChoice(value);
+            if (!choice || seen.has(value)) return result;
+            seen.add(value);
+            result.push(value);
+            return result;
+        }, []);
+        saveConfig();
+        try { mooncakeClearEnhancementRouteCache(); } catch (_) {}
+        try { mooncakeVirtualRivalHourlyCache.clear(); } catch (_) {}
+        return config.virtualRivals;
+    }
+
+    function mooncakePopulateVirtualProfileSelect(select, selectedValue = '', options = {}) {
         if (!select) return;
         const wantedValue = selectedValue || select.value || '';
+        const disabledValues = options?.disabledValues instanceof Set ? options.disabledValues : new Set();
         select.replaceChildren();
         const placeholder = document.createElement('option');
         placeholder.value = '';
@@ -314,6 +368,7 @@
             const option = document.createElement('option');
             option.value = `built-in:${preset.id}`;
             option.textContent = preset.label;
+            option.disabled = disabledValues.has(option.value) && option.value !== wantedValue;
             builtInGroup.appendChild(option);
         });
         select.appendChild(builtInGroup);
@@ -326,6 +381,7 @@
                 const option = document.createElement('option');
                 option.value = `custom:${profile.id}`;
                 option.textContent = profile.name;
+                option.disabled = disabledValues.has(option.value) && option.value !== wantedValue;
                 customGroup.appendChild(option);
             });
             select.appendChild(customGroup);
@@ -415,6 +471,7 @@
     const config = {
         ...storedConfig,
         virtual: { ...DEFAULT_VIRTUAL_CONFIG, ...(storedConfig.virtual || {}) },
+        virtualRivals: Array.isArray(storedConfig.virtualRivals) ? storedConfig.virtualRivals : [],
         ui: { fabPosition: null, fabVisible: true, ...(storedConfig.ui || {}) },
         preferences: { ...DEFAULT_PREFERENCES, ...(storedConfig.preferences || {}) },
         lazyEnhancementPresets: Array.isArray(storedConfig.lazyEnhancementPresets)
@@ -4594,6 +4651,52 @@
                 border-bottom: 1px solid #444;
                 padding-bottom: 4px;
             }
+            .mooncake-tooltip .mooncake-tooltip-rival-layout {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) minmax(112px, auto);
+                gap: 10px;
+                align-items: stretch;
+                min-width: 0;
+                white-space: normal;
+            }
+            .mooncake-tooltip .mooncake-tooltip-rival-primary {
+                min-width: 0;
+                white-space: pre-line;
+            }
+            .mooncake-tooltip .mooncake-tooltip-rival-panel {
+                align-self: stretch;
+                min-width: 112px;
+                padding: 5px 7px;
+                border: 1px solid rgba(93, 193, 226, .42);
+                border-radius: 4px;
+                background: rgba(17, 46, 60, .72);
+                box-shadow: inset 0 1px 0 rgba(146, 238, 255, .12);
+                font-variant-numeric: tabular-nums;
+            }
+            .mooncake-tooltip .mooncake-tooltip-rival-title {
+                padding-bottom: 3px;
+                margin-bottom: 2px;
+                border-bottom: 1px solid rgba(93, 193, 226, .26);
+                color: #9ee9ff;
+                font-size: 11px;
+                font-weight: 900;
+                letter-spacing: .04em;
+            }
+            .mooncake-tooltip .mooncake-tooltip-rival-row {
+                display: flex;
+                align-items: baseline;
+                justify-content: space-between;
+                gap: 8px;
+                min-height: 19px;
+                color: rgba(223, 239, 247, .72);
+                font-size: 11px;
+                white-space: nowrap;
+            }
+            .mooncake-tooltip .mooncake-tooltip-rival-row strong { font-size: 12px; }
+            @media (max-width: 440px) {
+                .mooncake-tooltip .mooncake-tooltip-rival-layout { grid-template-columns: 1fr; gap: 7px; }
+                .mooncake-tooltip .mooncake-tooltip-rival-panel { min-width: 0; }
+            }
             /* Keep the amount aligned even when a protection suffix is present. */
             .order-book-hourly-wage-header {
                 padding-right: 54px !important;
@@ -5650,6 +5753,12 @@
                 + `<span class="tt-label">${counterpartLabel}:</span> <span class="tt-value">${counterpartPrice === null ? 'N/A' : formatMoney(counterpartPrice)}</span>\n`;
         }
 
+        const rivalPanel = options.includeRivalHourly === true && options.itemHrid
+            ? mooncakeBuildVirtualRivalHourlyTooltip(options.itemHrid, enhancementLevel, tooltipMarketData, price)
+            : '';
+        if (rivalPanel) {
+            return `<div class="mooncake-tooltip-rival-layout"><div class="mooncake-tooltip-rival-primary">${html}</div>${rivalPanel}</div>`;
+        }
         return html;
     }
 
@@ -5901,19 +6010,21 @@
         };
     }
 
-    function calcHourlyWageAndMetrics(itemHrid, enhancementLevel, marketData, price) {
+    function calcHourlyWageAndMetrics(itemHrid, enhancementLevel, marketData, price, options = {}) {
         if (price <= 0) return null;
         try {
             const route = mooncakeCalculateEnhancementRouteAtPrice(itemHrid, enhancementLevel, marketData, price);
             if (!route || !(route.totalCost > 0) || !(route.totalTimeHours > 0)) return null;
             const hourlyWage = route.hourlyWage;
-            const routePair = mooncakeResolveObjectiveRoutePair(
-                itemHrid,
-                enhancementLevel,
-                marketData,
-                price,
-                route
-            );
+            const routePair = options.includeRoutePair === false
+                ? null
+                : mooncakeResolveObjectiveRoutePair(
+                    itemHrid,
+                    enhancementLevel,
+                    marketData,
+                    price,
+                    route
+                );
             const metricsData = {
                 ...route,
                 hourlyWage,
@@ -5937,6 +6048,73 @@
         } catch (err) {
             return null;
         }
+    }
+
+    const MOONCAKE_VIRTUAL_RIVAL_HOURLY_CACHE_LIMIT = 128;
+    const mooncakeVirtualRivalHourlyCache = new Map();
+
+    function mooncakeGetVirtualRivalHourlyWages(itemHrid, enhancementLevel, marketData, price) {
+        const level = Number(enhancementLevel);
+        const quote = Number(price);
+        const rivals = mooncakeGetVirtualRivalChoices();
+        if (!itemHrid || !Number.isInteger(level) || level <= 0 || !(quote > 0) || !marketData || !rivals.length) return [];
+
+        const rivalSignature = JSON.stringify(rivals.map(({ value, choice }) => ({
+            value,
+            values: choice.values
+        })));
+        const cacheKey = [
+            mooncakeMarketPricingRevision,
+            mooncakeHourlyWageColorProfileRevision,
+            mooncakeGetEnhancementRouteObjective(),
+            mooncakeGetLiveEnhancingCommunityBuffLevel(),
+            mooncakeIsEnhancingCommunityBuffEnabled(),
+            itemHrid,
+            level,
+            quote,
+            rivalSignature
+        ].join('::');
+        const cached = mooncakeVirtualRivalHourlyCache.get(cacheKey);
+        if (cached) {
+            mooncakeVirtualRivalHourlyCache.delete(cacheKey);
+            mooncakeVirtualRivalHourlyCache.set(cacheKey, cached);
+            return cached;
+        }
+
+        const results = rivals.map(({ value, choice }, index) => {
+            const params = mooncakeBuildVirtualEnhanceParams(choice.values);
+            let result = null;
+            try {
+                result = mooncakeWithEnhancementParamsOverride(params, () => calcHourlyWageAndMetrics(
+                    itemHrid,
+                    level,
+                    marketData,
+                    quote,
+                    { includeRoutePair: false }
+                ));
+            } catch (_) {}
+            return {
+                value,
+                index,
+                hourlyWage: Number(result?.hourlyWage)
+            };
+        }).filter(result => Number.isFinite(result.hourlyWage));
+
+        mooncakeVirtualRivalHourlyCache.set(cacheKey, results);
+        while (mooncakeVirtualRivalHourlyCache.size > MOONCAKE_VIRTUAL_RIVAL_HOURLY_CACHE_LIMIT) {
+            mooncakeVirtualRivalHourlyCache.delete(mooncakeVirtualRivalHourlyCache.keys().next().value);
+        }
+        return results;
+    }
+
+    function mooncakeBuildVirtualRivalHourlyTooltip(itemHrid, enhancementLevel, marketData, price) {
+        const rivals = mooncakeGetVirtualRivalHourlyWages(itemHrid, enhancementLevel, marketData, price);
+        if (!rivals.length) return '';
+        const rows = rivals.map(rival => {
+            const color = mooncakeGetProfitabilityColor(mooncakeGetHourlyWageTier(rival.hourlyWage));
+            return `<div class="mooncake-tooltip-rival-row"><span>宿敌${rival.index + 1}</span><strong style="color:${color};">${mooncakeFormatSignedHourlyWage(rival.hourlyWage)}/h</strong></div>`;
+        }).join('');
+        return `<aside class="mooncake-tooltip-rival-panel"><div class="mooncake-tooltip-rival-title">宿敌来犯</div>${rows}</aside>`;
     }
 
     function mooncakeCalculateLevelZeroManufactureProfit(itemHrid, price, marketData, knownManufacturingCost) {
@@ -7901,6 +8079,7 @@
     let mooncakePlayerEnhanceParamsCacheKey = '';
     let mooncakePlayerEnhanceParamsCacheItemDetailMap = null;
     let mooncakePlayerEnhanceParamsCache = null;
+    let mooncakeEnhancementParamsOverride = null;
     let mooncakeCharacterStateSyncTimer = 0;
     let mooncakeCharacterRefreshTimer = 0;
     let mooncakeInventoryLiveSyncAt = 0;
@@ -9553,9 +9732,108 @@
         return 0;
     }
 
+    function mooncakeBuildVirtualEnhanceParams(profileValues) {
+        const virtual = {
+            ...DEFAULT_VIRTUAL_CONFIG,
+            ...mooncakeCloneVirtualProfileValues(profileValues)
+        };
+        const profileCommunityBuffEnabled = mooncakeGetVirtualProfileCommunityBuffEnabled(profileValues);
+        const configuredCommunityLevel = mooncakeNormalizeVirtualEnhancingCommunityBuffLevel(
+            virtual.community_enhancing_speed_level
+        );
+        const communityBuffEnabled = profileCommunityBuffEnabled === null
+            ? mooncakeIsEnhancingCommunityBuffEnabled()
+            : profileCommunityBuffEnabled;
+        const communityEnhancingSpeedLevel = configuredCommunityLevel !== 'system'
+            ? configuredCommunityLevel
+            : (communityBuffEnabled ? mooncakeGetLiveEnhancingCommunityBuffLevel() : 0);
+        const communityEnhancingSpeedBonus = mooncakeGetCommunityEnhancingSpeedBonusForLevel(communityEnhancingSpeedLevel);
+        const getEnhancerTopBaseSpeed = () => {
+            const itemDetail = itemDetailMap?.['/items/enhancers_top'];
+            return itemDetail?.equipmentDetail?.noncombatStats?.enhancingSpeed || 0.5;
+        };
+        const getEnhancerBottomBaseSpeed = () => {
+            const itemDetail = itemDetailMap?.['/items/enhancers_bottoms'];
+            return itemDetail?.equipmentDetail?.noncombatStats?.enhancingSpeed || 0.5;
+        };
+        const getNecklaceBaseSpeed = () => {
+            const philosopherNecklace = itemDetailMap?.['/items/philosophers_necklace'];
+            const speedNecklace = itemDetailMap?.['/items/necklace_of_speed'];
+            return (philosopherNecklace?.equipmentDetail?.noncombatStats?.skillingSpeed ||
+                speedNecklace?.equipmentDetail?.noncombatStats?.skillingSpeed) || 0.3;
+        };
+        const getGloveBaseBonus = () => {
+            for (const key in itemDetailMap) {
+                if (!key.includes('glove') && !key.includes('gloves') && !key.includes('gauntlets')) continue;
+                const itemDetail = itemDetailMap[key];
+                if (itemDetail?.equipmentDetail?.noncombatStats?.enhancingSpeed) {
+                    return itemDetail.equipmentDetail.noncombatStats.enhancingSpeed;
+                }
+            }
+            return 0.1;
+        };
+        const getChanceCapeBaseSpeed = type => {
+            if (type === 'none') return 0;
+            const itemDetail = itemDetailMap?.[type === 'refined' ? '/items/chance_cape_refined' : '/items/chance_cape'];
+            return itemDetail?.equipmentDetail?.noncombatStats?.enhancingSpeed || 0.05;
+        };
+        const getDrinkConcentrationBase = () => {
+            const itemDetail = itemDetailMap?.['/items/guzzling_pouch'];
+            return itemDetail?.equipmentDetail?.noncombatStats?.drinkConcentration || 0.05;
+        };
+        const calculateEnhancerBonus = (type, level) => {
+            const enhancerHrid = type === 'divine' ? '/items/holy_enhancer' : '/items/celestial_enhancer';
+            const itemDetail = itemDetailMap?.[enhancerHrid];
+            const baseFraction = itemDetail?.equipmentDetail?.noncombatStats?.enhancingSuccess || 0;
+            const instanceLevel = Math.min(Math.max(Number(level) || 0, 0), 20);
+            const multiplier = instanceLevel >= 1
+                ? 1 + (ITEM_ENHANCE_LEVEL_TO_BUFF_BONUS_MAP[instanceLevel] || 0) / 100
+                : 1;
+            return Number((baseFraction * multiplier * 100).toFixed(4));
+        };
+        const calculateStandardSpeed = (level, baseSpeed, multiplier = 1) => {
+            if (Number(level) === -1) return 0;
+            const enhanceBonus = 1 + (ITEM_ENHANCE_LEVEL_TO_BUFF_BONUS_MAP[Number(level) || 0] || 0) * multiplier / 100;
+            return baseSpeed * enhanceBonus * 100;
+        };
+        const calculateChanceCapeSpeed = (level, type) => type === 'none'
+            ? 0
+            : calculateStandardSpeed(level, getChanceCapeBaseSpeed(type), 5);
+
+        return {
+            ...ENHANCE_DEFAULT_PARAMS,
+            enhancing_level: Number(virtual.enhancing_level) || 0,
+            laboratory_level: Number(virtual.laboratory_level) || 0,
+            enhancer_bonus: calculateEnhancerBonus(virtual.enhancer_type, virtual.enhancer_level),
+            enhancers_top_speed: calculateStandardSpeed(virtual.enhancers_top_level, getEnhancerTopBaseSpeed()),
+            enhancers_bottom_speed: calculateStandardSpeed(virtual.enhancers_bottom_level, getEnhancerBottomBaseSpeed()),
+            necklace_speed: calculateStandardSpeed(virtual.necklace_level, getNecklaceBaseSpeed(), 5),
+            glove_bonus: calculateStandardSpeed(virtual.glove_level, getGloveBaseBonus()),
+            chance_cape_speed: calculateChanceCapeSpeed(virtual.chance_cape_level, virtual.chance_cape_type),
+            drink_concentration_bonus: calculateStandardSpeed(virtual.drink_pouch_level, getDrinkConcentrationBase()),
+            community_enhancing_speed_level: communityEnhancingSpeedLevel,
+            community_enhancing_speed_bonus: communityEnhancingSpeedBonus,
+            tea_enhancing: virtual.tea_type === 'basic',
+            tea_super_enhancing: virtual.tea_type === 'super',
+            tea_ultra_enhancing: virtual.tea_type === 'ultra',
+            champion_achievement: virtual.champion_achievement === true
+        };
+    }
+
+    function mooncakeWithEnhancementParamsOverride(params, callback) {
+        const previous = mooncakeEnhancementParamsOverride;
+        mooncakeEnhancementParamsOverride = params && typeof params === 'object' ? params : null;
+        try {
+            return typeof callback === 'function' ? callback() : null;
+        } finally {
+            mooncakeEnhancementParamsOverride = previous;
+        }
+    }
+
     // 获取强化等级
     function getPlayerEnhanceParams() {
         try {
+            if (mooncakeEnhancementParamsOverride) return mooncakeEnhancementParamsOverride;
             if (!config.virtual.enabled) mooncakeEnsureCharacterData();
             const communityEnhancingSpeedLevel = mooncakeGetEffectiveEnhancingCommunityBuffLevel();
             const communityEnhancingSpeedBonus = mooncakeGetCommunityEnhancingSpeedBonusForLevel(communityEnhancingSpeedLevel);
@@ -11321,6 +11599,7 @@
         mooncakeEnhancementRouteCandidateCache.clear();
         mooncakeEnhancementRoutePairCache.clear();
         mooncakeClearTraditionalEnhancementRiskPriceCaches();
+        try { mooncakeVirtualRivalHourlyCache.clear(); } catch (_) {}
     }
 
     function mooncakeClearEnhancementRoutePrewarmState() {
@@ -35251,7 +35530,8 @@
             itemHrid,
             marketData,
             evaluation: result.evaluation,
-            includeRiskComparison: true
+            includeRiskComparison: true,
+            includeRivalHourly: true
         }));
         return result;
     }
@@ -35580,7 +35860,8 @@
                                 itemHrid,
                                 marketData,
                                 evaluation: result.evaluation,
-                                includeRiskComparison: true
+                                includeRiskComparison: true,
+                                includeRivalHourly: true
                             }));
                         }
                     }
@@ -35891,7 +36172,8 @@
                             itemHrid,
                             marketData,
                             evaluation: sellResult.evaluation,
-                            includeRiskComparison: true
+                            includeRiskComparison: true,
+                            includeRivalHourly: true
                         }));
                     } else {
                         sellHourlyWageCell.textContent = '-';
@@ -35906,7 +36188,8 @@
                             itemHrid,
                             marketData,
                             evaluation: buyResult.evaluation,
-                            includeRiskComparison: true
+                            includeRiskComparison: true,
+                            includeRivalHourly: true
                         }));
                     } else {
                         buyHourlyWageCell.textContent = '-';
@@ -37411,6 +37694,23 @@
             #better-loot-tracker-config-panel [data-mooncake-virtual-equipment-preset-delete] { border-color:rgba(235,115,133,.48); background:rgba(119,47,60,.62); }
             #better-loot-tracker-config-panel [data-mooncake-virtual-equipment-preset-save]:disabled, #better-loot-tracker-config-panel [data-mooncake-virtual-equipment-preset-delete]:disabled { cursor:default; opacity:.48; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-equipment-preset-status] { grid-column:1 / -1; min-width:0; color:rgba(175,233,203,.88); font-size:10px; line-height:1.25; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue] { min-width:0; display:grid; gap:6px; margin:0 0 8px; padding:8px 9px; border:1px solid rgba(93,193,226,.28); border-radius:6px; background:rgba(16,39,55,.28); box-shadow:inset 0 1px 0 rgba(152,232,255,.06); }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue-header] { min-width:0; display:flex; align-items:center; justify-content:space-between; gap:10px; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue-copy] { min-width:0; display:grid; gap:1px; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue-copy] strong { color:#a8edff; font-size:12px; line-height:1.25; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue-copy] small { color:rgba(214,231,244,.58); font-size:10px; line-height:1.35; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-add] { flex:0 0 auto; min-height:28px; cursor:pointer; border:1px solid rgba(91,206,235,.48); border-radius:5px; background:rgba(30,99,124,.52); color:#d9f7ff; padding:4px 8px; font:inherit; font-size:11px; font-weight:850; white-space:nowrap; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-add]:disabled { cursor:default; opacity:.44; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-list] { min-width:0; display:grid; gap:4px; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-row] { min-width:0; display:grid; grid-template-columns:22px 50px minmax(0,1fr) auto; align-items:center; gap:6px; min-height:31px; padding:3px 4px; border:1px solid rgba(132,177,204,.20); border-radius:4px; background:rgba(10,16,27,.48); box-sizing:border-box; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-row][data-mooncake-virtual-rival-dragging] { opacity:.56; border-style:dashed; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-row][data-mooncake-virtual-rival-drop-target] { border-color:rgba(105,221,255,.8); box-shadow:0 0 0 1px rgba(105,221,255,.18); }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-drag-handle] { width:22px; height:24px; cursor:grab; border:0; border-radius:3px; background:transparent; color:rgba(186,222,238,.7); font:inherit; font-size:15px; line-height:1; padding:0; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-drag-handle]:active { cursor:grabbing; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-order] { color:rgba(182,232,247,.82); font-size:10px; font-weight:850; white-space:nowrap; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-select] { min-width:0; min-height:25px; box-sizing:border-box; border:1px solid rgba(123,185,214,.35); border-radius:4px; background:rgba(12,22,34,.9); color:#edf7ff; padding:3px 5px; font:inherit; font-size:11px; font-weight:700; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-remove] { min-width:28px; min-height:25px; cursor:pointer; border:1px solid rgba(230,110,130,.45); border-radius:4px; background:rgba(112,42,55,.54); color:#ffd7df; padding:3px 6px; font:inherit; font-size:12px; font-weight:900; }
+            #better-loot-tracker-config-panel [data-mooncake-virtual-rival-empty] { padding:4px 2px 1px; color:rgba(214,231,244,.48); font-size:10px; line-height:1.35; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-profile-section] { padding-top:10px; padding-bottom:7px; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-profile-section] > [data-mooncake-enhancement-settings-section-heading] p { margin:2px 0 6px; font-size:10px; }
             #better-loot-tracker-config-panel [data-mooncake-virtual-profile-section] > [data-mooncake-enhancement-settings-section-heading] { padding-right:min(38%,260px); }
@@ -37469,6 +37769,8 @@
             @media (max-width:480px) {
                 #better-loot-tracker-config-panel [data-mooncake-virtual-equipment-preset] { grid-template-columns:1fr; }
                 #better-loot-tracker-config-panel [data-mooncake-virtual-equipment-preset-controls] { grid-template-columns:minmax(0,1fr) auto auto; }
+                #better-loot-tracker-config-panel [data-mooncake-virtual-rival-queue-header] { align-items:flex-start; }
+                #better-loot-tracker-config-panel [data-mooncake-virtual-rival-row] { grid-template-columns:20px 48px minmax(0,1fr) auto; gap:4px; }
                 #better-loot-tracker-config-panel [data-mooncake-virtual-community-buff-summary] { flex-basis:100%; white-space:normal; }
                 #better-loot-tracker-config-panel [data-mooncake-virtual-profile-section] > [data-mooncake-enhancement-settings-section-heading] { padding-right:0; }
                 #better-loot-tracker-config-panel [data-mooncake-virtual-profile-easter-egg] { position:static; max-width:none; margin:-1px 0 7px; text-align:right; }
@@ -38064,7 +38366,28 @@
         virtualPresetStatus.setAttribute('data-mooncake-virtual-equipment-preset-status', '1');
         virtualPresetStatus.textContent = virtualPresetHint.textContent;
         virtualPreset.append(virtualPresetCopy, virtualPresetControls, virtualPresetStatus);
-        virtual.rows.append(virtualPreset, virtualHeader, virtualBody);
+        const virtualRivalQueue = document.createElement('section');
+        virtualRivalQueue.setAttribute('data-mooncake-virtual-rival-queue', '1');
+        const virtualRivalQueueHeader = document.createElement('div');
+        virtualRivalQueueHeader.setAttribute('data-mooncake-virtual-rival-queue-header', '1');
+        const virtualRivalQueueCopy = document.createElement('div');
+        virtualRivalQueueCopy.setAttribute('data-mooncake-virtual-rival-queue-copy', '1');
+        const virtualRivalQueueTitle = document.createElement('strong');
+        virtualRivalQueueTitle.textContent = isZH ? '宿敌来犯' : 'Rival queue';
+        const virtualRivalQueueHint = document.createElement('small');
+        virtualRivalQueueHint.textContent = isZH
+            ? '最多三位，仅显示各方案的工时费，不会覆盖当前虚拟配置。拖拽调整顺序。'
+            : 'Up to three profiles; shows only hourly wage and never replaces the active virtual setup. Drag to reorder.';
+        virtualRivalQueueCopy.append(virtualRivalQueueTitle, virtualRivalQueueHint);
+        const virtualRivalAdd = document.createElement('button');
+        virtualRivalAdd.type = 'button';
+        virtualRivalAdd.setAttribute('data-mooncake-virtual-rival-add', '1');
+        virtualRivalAdd.textContent = isZH ? '新增宿敌' : 'Add rival';
+        virtualRivalQueueHeader.append(virtualRivalQueueCopy, virtualRivalAdd);
+        const virtualRivalList = document.createElement('div');
+        virtualRivalList.setAttribute('data-mooncake-virtual-rival-list', '1');
+        virtualRivalQueue.append(virtualRivalQueueHeader, virtualRivalList);
+        virtual.rows.append(virtualRivalQueue, virtualPreset, virtualHeader, virtualBody);
 
         const donation = mooncakeCreateEnhancementSettingsSection(isZH ? '打赏' : 'Support', '请包子吃个早饭~    记得备注名字哦');
         donation.section.setAttribute('data-mooncake-enhancement-settings-section', 'wide');
@@ -38651,6 +38974,138 @@
             virtualPresetStatus.textContent = message;
             virtualPresetStatus.style.color = isError ? 'rgba(255,157,170,.94)' : '';
         };
+        const virtualRivalList = configPanel.querySelector('[data-mooncake-virtual-rival-list]');
+        const virtualRivalAdd = configPanel.querySelector('[data-mooncake-virtual-rival-add]');
+        let virtualRivalDraft = false;
+        let virtualRivalDragIndex = null;
+        const renderVirtualRivalQueue = () => {
+            if (!virtualRivalList) return;
+            const values = mooncakeGetVirtualRivalProfileValues();
+            const availableValues = mooncakeGetVirtualProfileChoiceValues();
+            virtualRivalList.replaceChildren();
+
+            const appendRow = (value, index, isDraft = false) => {
+                const row = document.createElement('div');
+                row.setAttribute('data-mooncake-virtual-rival-row', '1');
+                row.draggable = !isDraft;
+                const handle = document.createElement('button');
+                handle.type = 'button';
+                handle.setAttribute('data-mooncake-virtual-rival-drag-handle', '1');
+                handle.setAttribute('aria-label', isZH ? '拖拽调整宿敌顺序' : 'Drag to reorder rival');
+                handle.title = isZH ? '拖拽排序' : 'Drag to reorder';
+                handle.textContent = isDraft ? '＋' : '⠿';
+                const order = document.createElement('span');
+                order.setAttribute('data-mooncake-virtual-rival-order', '1');
+                order.textContent = isDraft
+                    ? (isZH ? '新宿敌' : 'New')
+                    : (isZH ? `宿敌${index + 1}` : `Rival ${index + 1}`);
+                const select = document.createElement('select');
+                select.setAttribute('data-mooncake-virtual-rival-select', '1');
+                select.setAttribute('aria-label', isDraft
+                    ? (isZH ? '选择新增宿敌配置' : 'Choose new rival profile')
+                    : (isZH ? `宿敌${index + 1}配置` : `Rival ${index + 1} profile`));
+                const disabledValues = new Set(values.filter(candidate => candidate !== value));
+                mooncakePopulateVirtualProfileSelect(select, value || '', { disabledValues });
+                const remove = document.createElement('button');
+                remove.type = 'button';
+                remove.setAttribute('data-mooncake-virtual-rival-remove', '1');
+                remove.setAttribute('aria-label', isDraft
+                    ? (isZH ? '取消新增宿敌' : 'Cancel adding rival')
+                    : (isZH ? `删除宿敌${index + 1}` : `Delete rival ${index + 1}`));
+                remove.title = remove.getAttribute('aria-label');
+                remove.textContent = '×';
+                row.append(handle, order, select, remove);
+
+                if (isDraft) {
+                    handle.disabled = true;
+                    select.addEventListener('change', () => {
+                        const nextValue = select.value;
+                        if (!mooncakeGetVirtualProfileChoice(nextValue) || values.includes(nextValue)) return;
+                        virtualRivalDraft = false;
+                        mooncakeSetVirtualRivalProfileValues([...values, nextValue]);
+                        renderVirtualRivalQueue();
+                    });
+                    remove.addEventListener('click', () => {
+                        virtualRivalDraft = false;
+                        renderVirtualRivalQueue();
+                    });
+                    return row;
+                }
+
+                select.addEventListener('change', () => {
+                    const nextValue = select.value;
+                    if (!mooncakeGetVirtualProfileChoice(nextValue) || (nextValue !== value && values.includes(nextValue))) {
+                        renderVirtualRivalQueue();
+                        return;
+                    }
+                    const next = values.slice();
+                    next[index] = nextValue;
+                    mooncakeSetVirtualRivalProfileValues(next);
+                    renderVirtualRivalQueue();
+                });
+                remove.addEventListener('click', () => {
+                    mooncakeSetVirtualRivalProfileValues(values.filter((_, candidateIndex) => candidateIndex !== index));
+                    renderVirtualRivalQueue();
+                });
+                row.addEventListener('dragstart', event => {
+                    virtualRivalDragIndex = index;
+                    row.setAttribute('data-mooncake-virtual-rival-dragging', '1');
+                    if (event.dataTransfer) {
+                        event.dataTransfer.effectAllowed = 'move';
+                        event.dataTransfer.setData('text/plain', String(index));
+                    }
+                });
+                row.addEventListener('dragover', event => {
+                    if (!Number.isInteger(virtualRivalDragIndex) || virtualRivalDragIndex === index) return;
+                    event.preventDefault();
+                    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+                    row.setAttribute('data-mooncake-virtual-rival-drop-target', '1');
+                });
+                row.addEventListener('dragleave', () => row.removeAttribute('data-mooncake-virtual-rival-drop-target'));
+                row.addEventListener('drop', event => {
+                    row.removeAttribute('data-mooncake-virtual-rival-drop-target');
+                    const from = virtualRivalDragIndex;
+                    if (!Number.isInteger(from) || from === index) return;
+                    event.preventDefault();
+                    const next = values.slice();
+                    const [moving] = next.splice(from, 1);
+                    next.splice(index, 0, moving);
+                    mooncakeSetVirtualRivalProfileValues(next);
+                    virtualRivalDragIndex = null;
+                    renderVirtualRivalQueue();
+                });
+                row.addEventListener('dragend', () => {
+                    virtualRivalDragIndex = null;
+                    virtualRivalList.querySelectorAll('[data-mooncake-virtual-rival-dragging], [data-mooncake-virtual-rival-drop-target]').forEach(node => {
+                        node.removeAttribute('data-mooncake-virtual-rival-dragging');
+                        node.removeAttribute('data-mooncake-virtual-rival-drop-target');
+                    });
+                });
+                return row;
+            };
+
+            values.forEach((value, index) => virtualRivalList.appendChild(appendRow(value, index)));
+            if (virtualRivalDraft) virtualRivalList.appendChild(appendRow('', values.length, true));
+            if (!values.length && !virtualRivalDraft) {
+                const empty = document.createElement('div');
+                empty.setAttribute('data-mooncake-virtual-rival-empty', '1');
+                empty.textContent = isZH
+                    ? '暂无宿敌。添加糕手方案后，工时费提示右侧会显示对应工时。'
+                    : 'No rivals yet. Added profiles appear beside the hourly-wage tooltip.';
+                virtualRivalList.appendChild(empty);
+            }
+            if (virtualRivalAdd) {
+                virtualRivalAdd.disabled = virtualRivalDraft ||
+                    values.length >= MOONCAKE_VIRTUAL_RIVAL_MAX_COUNT ||
+                    availableValues.every(value => values.includes(value));
+            }
+        };
+        virtualRivalAdd?.addEventListener('click', () => {
+            if (virtualRivalDraft) return;
+            virtualRivalDraft = true;
+            renderVirtualRivalQueue();
+        });
+        renderVirtualRivalQueue();
         const syncVirtualProfileDeleteState = () => {
             const choice = mooncakeGetVirtualProfileChoice(virtualPresetSelect?.value);
             if (virtualPresetDelete) virtualPresetDelete.disabled = choice?.source !== 'custom';
@@ -38720,8 +39175,10 @@
             }
             config.virtualProfiles = profiles;
             saveConfig();
+            try { mooncakeClearEnhancementRouteCache(); } catch (_) {}
             const selectedValue = `custom:${id}`;
             mooncakePopulateVirtualProfileSelect(virtualPresetSelect, selectedValue);
+            renderVirtualRivalQueue();
             if (virtualPresetName) virtualPresetName.value = name;
             syncVirtualProfileDeleteState();
             setVirtualProfileStatus(isZH
@@ -38742,8 +39199,11 @@
                 || window.confirm(isZH ? `删除自定义配置“${choice.name}”？` : `Delete custom profile "${choice.name}"?`);
             if (!shouldDelete) return;
             config.virtualProfiles = mooncakeGetCustomVirtualProfiles().filter(profile => profile.id !== choice.id);
+            config.virtualRivals = mooncakeGetVirtualRivalProfileValues().filter(value => value !== `custom:${choice.id}`);
             saveConfig();
+            try { mooncakeClearEnhancementRouteCache(); } catch (_) {}
             mooncakePopulateVirtualProfileSelect(virtualPresetSelect);
+            renderVirtualRivalQueue();
             if (virtualPresetName) virtualPresetName.value = '';
             syncVirtualProfileDeleteState();
             setVirtualProfileStatus(isZH ? `已删除自定义配置：${choice.name}。` : `Custom profile deleted: ${choice.name}.`);
