@@ -4652,20 +4652,24 @@
                 padding-bottom: 4px;
             }
             .mooncake-tooltip .mooncake-tooltip-rival-layout {
-                display: grid;
-                grid-template-columns: minmax(0, 1fr) minmax(112px, auto);
-                gap: 10px;
-                align-items: stretch;
+                display: block;
                 min-width: 0;
                 white-space: normal;
+            }
+            .mooncake-tooltip .mooncake-tooltip-rival-layout::after {
+                content: '';
+                display: block;
+                clear: both;
             }
             .mooncake-tooltip .mooncake-tooltip-rival-primary {
                 min-width: 0;
                 white-space: pre-line;
             }
             .mooncake-tooltip .mooncake-tooltip-rival-panel {
-                align-self: stretch;
-                min-width: 112px;
+                float: right;
+                width: 142px;
+                min-width: 0;
+                margin: 0 0 7px 10px;
                 padding: 5px 7px;
                 border: 1px solid rgba(93, 193, 226, .42);
                 border-radius: 4px;
@@ -4692,10 +4696,31 @@
                 font-size: 11px;
                 white-space: nowrap;
             }
+            .mooncake-tooltip .mooncake-tooltip-rival-label {
+                display: flex;
+                min-width: 0;
+                align-items: baseline;
+                gap: 4px;
+            }
+            .mooncake-tooltip .mooncake-tooltip-rival-name {
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .mooncake-tooltip .mooncake-tooltip-rival-protect {
+                flex: 0 0 auto;
+                color: rgba(170, 231, 195, .9);
+                font-size: 10px;
+                font-weight: 800;
+            }
             .mooncake-tooltip .mooncake-tooltip-rival-row strong { font-size: 12px; }
             @media (max-width: 440px) {
-                .mooncake-tooltip .mooncake-tooltip-rival-layout { grid-template-columns: 1fr; gap: 7px; }
-                .mooncake-tooltip .mooncake-tooltip-rival-panel { min-width: 0; }
+                .mooncake-tooltip .mooncake-tooltip-rival-panel {
+                    float: none;
+                    width: auto;
+                    margin: 0 0 7px;
+                }
             }
             /* Keep the amount aligned even when a protection suffix is present. */
             .order-book-hourly-wage-header {
@@ -5757,7 +5782,7 @@
             ? mooncakeBuildVirtualRivalHourlyTooltip(options.itemHrid, enhancementLevel, tooltipMarketData, price)
             : '';
         if (rivalPanel) {
-            return `<div class="mooncake-tooltip-rival-layout"><div class="mooncake-tooltip-rival-primary">${html}</div>${rivalPanel}</div>`;
+            return `<div class="mooncake-tooltip-rival-layout">${rivalPanel}<div class="mooncake-tooltip-rival-primary">${html}</div></div>`;
         }
         return html;
     }
@@ -6096,6 +6121,8 @@
             return {
                 value,
                 index,
+                profileName: choice.name,
+                protectAt: Number(result?.metrics?.protectAt),
                 hourlyWage: Number(result?.hourlyWage)
             };
         }).filter(result => Number.isFinite(result.hourlyWage));
@@ -6112,7 +6139,11 @@
         if (!rivals.length) return '';
         const rows = rivals.map(rival => {
             const color = mooncakeGetProfitabilityColor(mooncakeGetHourlyWageTier(rival.hourlyWage));
-            return `<div class="mooncake-tooltip-rival-row"><span>宿敌${rival.index + 1}</span><strong style="color:${color};">${mooncakeFormatSignedHourlyWage(rival.hourlyWage)}/h</strong></div>`;
+            const profileName = mooncakeEscapeHtml(rival.profileName || (isZH ? `宿敌${rival.index + 1}` : `Rival ${rival.index + 1}`));
+            const protection = Number.isFinite(rival.protectAt) && rival.protectAt >= 0
+                ? (isZH ? `${Math.floor(rival.protectAt)}保` : `P${Math.floor(rival.protectAt)}`)
+                : (isZH ? '未定保' : 'P?');
+            return `<div class="mooncake-tooltip-rival-row"><span class="mooncake-tooltip-rival-label" title="${profileName}"><span class="mooncake-tooltip-rival-name">${profileName}</span><small class="mooncake-tooltip-rival-protect">${protection}</small></span><strong style="color:${color};">${mooncakeFormatSignedHourlyWage(rival.hourlyWage)}/h</strong></div>`;
         }).join('');
         return `<aside class="mooncake-tooltip-rival-panel"><div class="mooncake-tooltip-rival-title">宿敌来犯</div>${rows}</aside>`;
     }
@@ -39017,6 +39048,16 @@
                 remove.textContent = '×';
                 row.append(handle, order, select, remove);
 
+                // The game's outer settings shell also observes pointer/click
+                // events. Keep queue interactions from reaching its close
+                // handler, especially when the remove button is pressed.
+                const stopRivalControlPropagation = event => event.stopPropagation();
+                [row, handle, select, remove].forEach(control => {
+                    ['pointerdown', 'mousedown', 'click'].forEach(type => {
+                        control.addEventListener(type, stopRivalControlPropagation);
+                    });
+                });
+
                 if (isDraft) {
                     handle.disabled = true;
                     select.addEventListener('change', () => {
@@ -39026,7 +39067,8 @@
                         mooncakeSetVirtualRivalProfileValues([...values, nextValue]);
                         renderVirtualRivalQueue();
                     });
-                    remove.addEventListener('click', () => {
+                    remove.addEventListener('click', event => {
+                        event.preventDefault();
                         virtualRivalDraft = false;
                         renderVirtualRivalQueue();
                     });
@@ -39044,7 +39086,8 @@
                     mooncakeSetVirtualRivalProfileValues(next);
                     renderVirtualRivalQueue();
                 });
-                remove.addEventListener('click', () => {
+                remove.addEventListener('click', event => {
+                    event.preventDefault();
                     mooncakeSetVirtualRivalProfileValues(values.filter((_, candidateIndex) => candidateIndex !== index));
                     renderVirtualRivalQueue();
                 });
