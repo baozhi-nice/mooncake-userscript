@@ -25149,6 +25149,16 @@
     const MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR = 'data-mooncake-enh-plan-layout';
     const MOONCAKE_ENH_MARKET_PLAN_NARROW_ATTR = 'data-mooncake-enh-plan-narrow';
     const MOONCAKE_ENH_CURRENT_LAYOUT_ATTR = 'data-mooncake-enh-current-layout';
+    // Sunny's inline enhancement runtime owns the same native component as
+    // Mooncake's market reference. Treat its rendered root as the authority
+    // for that surface, rather than letting both scripts force competing grids.
+    const MOONCAKE_SUNNY_INLINE_ENHANCE_SELECTOR = [
+        '#sunnyMwi-inline-enhance-root',
+        '[data-sunny-mwi-inline-enhance-hard-root="1"]',
+        '#sunnyMwi-inline-enhance-body-row',
+        '#sunnyMwi-inline-enhance-rec-col',
+        '#sunnyMwi-inline-enhance-stats-col'
+    ].join(', ');
     const MOONCAKE_ENH_COST_MARKET_ATTR = 'data-mooncake-enh-cost-market';
     const MOONCAKE_ENH_COST_MARKET_HOST_ATTR = 'data-mooncake-enh-cost-market-host';
     const MOONCAKE_ENH_COST_MARKET_SIG_ATTR = 'data-mooncake-enh-cost-market-sig';
@@ -25416,6 +25426,27 @@
 
     function mooncakeFindEnhancingPanel() {
         return document.querySelector('[class*="EnhancingPanel_enhancingPanel"]');
+    }
+
+    function mooncakeIsSunnyInlineEnhanceNode(node) {
+        const element = node instanceof Element ? node : node?.parentElement;
+        if (element instanceof Element) {
+            return !!(element.matches?.(MOONCAKE_SUNNY_INLINE_ENHANCE_SELECTOR) ||
+                element.closest?.(MOONCAKE_SUNNY_INLINE_ENHANCE_SELECTOR));
+        }
+        return !!node?.querySelector?.(MOONCAKE_SUNNY_INLINE_ENHANCE_SELECTOR);
+    }
+
+    function mooncakeHasSunnyInlineEnhance(panel = null) {
+        const roots = document.querySelectorAll?.(MOONCAKE_SUNNY_INLINE_ENHANCE_SELECTOR) || [];
+        for (const root of roots) {
+            if (!root?.isConnected) continue;
+            if (!panel || panel.contains(root) ||
+                root.closest?.('[class*="EnhancingPanel_enhancingPanel"]') === panel) {
+                return true;
+            }
+        }
+        return false;
     }
 
     function mooncakeBuildEnhanceCostPurchaseTooltipHtml(itemHrid) {
@@ -29889,6 +29920,7 @@
             }
             const column = document.getElementById(MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID);
             const panel = column?.closest?.('[class*="EnhancingPanel_enhancingPanel"]') || mooncakeFindEnhancingPanel();
+            if (mooncakeYieldEnhanceMarketPlanToSunny(panel)) return;
             const component = column?.parentElement || panel?.querySelector?.('[class*="SkillActionDetail_enhancingComponent"]');
             if (!panel || !component?.matches?.('[class*="SkillActionDetail_enhancingComponent"]')) return;
             if (mooncakeIsEnhanceCurrentActionTab(panel)) {
@@ -29982,6 +30014,7 @@
 
     function mooncakePrepareEnhancePlanLayout(panel, enhancingComponent) {
         if (!panel || !enhancingComponent) return null;
+        if (mooncakeYieldEnhanceMarketPlanToSunny(panel)) return null;
         const enhancingAction = panel.querySelector('[class*="EnhancingPanel_enhancingAction"]');
         const rawLayout = mooncakeGetEnhancePlanLayoutMetrics(panel, enhancingAction);
         // Mobile browsers may expose a wide, scaled game canvas. Use the
@@ -30003,6 +30036,7 @@
 
     function mooncakePrepareEnhanceCurrentActionLayout(panel) {
         if (!panel) return null;
+        if (mooncakeYieldEnhanceMarketPlanToSunny(panel)) return null;
         const enhancingAction = panel.querySelector('[class*="EnhancingPanel_enhancingAction"]');
         const enhancingComponent = panel.querySelector('[class*="SkillActionDetail_enhancingComponent"]');
         if (!enhancingAction || !enhancingComponent) {
@@ -30065,6 +30099,20 @@
             }
             panel.removeAttribute('data-mooncake-enh-current-data-hidden');
         });
+    }
+
+    function mooncakeYieldEnhanceMarketPlanToSunny(panel) {
+        if (!mooncakeHasSunnyInlineEnhance(panel)) return false;
+        const hasMooncakeEnhanceSurface = !!document.getElementById(MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID) ||
+            mooncakeEnhancePlanLayoutStyleSnapshots.size > 0 ||
+            !!document.querySelector(
+                `[${MOONCAKE_ENH_MARKET_PLAN_LAYOUT_ATTR}], ` +
+                `[${MOONCAKE_ENH_MARKET_PLAN_NARROW_ATTR}], ` +
+                `[${MOONCAKE_ENH_CURRENT_LAYOUT_ATTR}], ` +
+                '[data-mooncake-enh-current-data-hidden="1"]'
+            );
+        if (hasMooncakeEnhanceSurface) removeMooncakeEnhanceMarketPlanColumn();
+        return true;
     }
 
     function mooncakeSetEnhanceCurrentDataPanelVisibility(enhancingComponent, shouldHide) {
@@ -31552,6 +31600,7 @@
             removeMooncakeEnhanceMarketPlanColumn();
             return;
         }
+        if (mooncakeYieldEnhanceMarketPlanToSunny(panel)) return;
         const enhancingComponent = panel.querySelector('[class*="SkillActionDetail_enhancingComponent"]');
         if (!enhancingComponent || !document.body.contains(enhancingComponent)) {
             removeMooncakeEnhanceMarketPlanColumn();
@@ -31711,6 +31760,7 @@
             mooncakeRemoveEnhanceCostMarketButtons();
             return;
         }
+        const sunnyInlineEnhanceActive = mooncakeYieldEnhanceMarketPlanToSunny(panel);
         if (mooncakeShouldUseMobileMarketTableLayout()) {
             panel.setAttribute('data-mooncake-enhance-mobile-layout', '1');
             ensureMooncakeEnhanceMarketPlanStyle();
@@ -31756,14 +31806,14 @@
             });
         }
         const targetLevel = mooncakeGetEnhanceTargetLevel(panel, isCurrentAction);
-        if (!skipMarketPlan) {
+        if (!skipMarketPlan && !sunnyInlineEnhanceActive) {
             ensureMooncakeEnhanceMarketPlanColumn(panel, baseHrid, baseStartLevel, isCurrentAction);
         }
-        if (isCurrentAction) {
+        if (isCurrentAction && !sunnyInlineEnhanceActive) {
             // Keep the active-action tab in the same centred width envelope as
             // the planning tab after the latter removes its market column.
             mooncakePrepareEnhanceCurrentActionLayout(panel);
-        } else {
+        } else if (!sunnyInlineEnhanceActive) {
             mooncakeClearEnhanceCurrentActionLayout();
         }
         const mount = mooncakeFindEnhanceProtectionMount(panel);
@@ -32068,6 +32118,7 @@
             if (!(node instanceof Element)) return false;
             if (node.id === MOONCAKE_ENH_PROTECTION_BUY_ID || node.id === MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID) return false;
             if (isProtectionRefreshInternalTarget(node)) return false;
+            if (mooncakeIsSunnyInlineEnhanceNode(node)) return true;
 
             const cls = typeof node.className === 'string' ? node.className : '';
             if (cls.includes('EnhancingPanel') ||
