@@ -18806,11 +18806,28 @@
         return true;
     }
 
+    // MWI Profit Panel II reuses the game's Inventory classes for its custom
+    // tab. It is not a real inventory and must stay outside MoonCake scanners.
+    const MOONCAKE_EXTERNAL_PROFIT_PANEL_SELECTOR = '.profit-pannel, .income-panel';
+
+    function mooncakeIsExternalProfitPanelNode(node) {
+        const element = node instanceof Element ? node : node?.parentElement;
+        return !!element?.closest?.(MOONCAKE_EXTERNAL_PROFIT_PANEL_SELECTOR);
+    }
+
+    function mooncakeNodeContainsExternalProfitPanel(node) {
+        return node instanceof Element && (
+            mooncakeIsExternalProfitPanelNode(node) ||
+            !!node.querySelector?.(MOONCAKE_EXTERNAL_PROFIT_PANEL_SELECTOR)
+        );
+    }
+
     function mooncakeFindVisibleItemNodeByHrid(hrid) {
         const id = String(hrid || '').replace(/^\/items\//, '');
         if (!id) return null;
         const nodes = document.querySelectorAll('[class*="Item_item"], [class*="Item_itemContainer"]');
         for (const node of nodes) {
+            if (mooncakeIsExternalProfitPanelNode(node)) continue;
             if (!mooncakeIsVisibleElement(node)) continue;
             const use = node.querySelector('use');
             const href = use?.href?.baseVal || use?.getAttribute?.('href') || '';
@@ -18954,7 +18971,8 @@
             }
             const target = event.target;
             const container = target?.closest?.('[class*="Item_itemContainer"]');
-            if (!container || !container.closest('[class*="Inventory_items"]')) return;
+            if (!container || !container.closest('[class*="Inventory_items"]') ||
+                mooncakeIsExternalProfitPanelNode(container)) return;
 
             const itemHrid = mooncakeGetItemHridFromContainer(container);
             if (!itemHrid || !mooncakeCanOpenMarketplaceForInventoryItem(itemHrid)) return;
@@ -19941,6 +19959,7 @@
     function mooncakeWarehouseFindInventoryRoot() {
         const roots = document.querySelectorAll('[class*="Inventory_inventory"] [class*="Inventory_items"], [class*="Inventory_items"]');
         for (const root of roots) {
+            if (mooncakeIsExternalProfitPanelNode(root)) continue;
             if (!mooncakeIsVisibleElement(root)) continue;
             const rect = root.getBoundingClientRect();
             // An empty native inventory may legitimately start at zero height;
@@ -19952,7 +19971,7 @@
     }
 
     function mooncakeWarehouseCollectInventoryNodes(root) {
-        if (!root) return [];
+        if (!root || mooncakeIsExternalProfitPanelNode(root)) return [];
         const entries = [];
         const seen = new Set();
         const visibleGrids = new Map();
@@ -20495,7 +20514,9 @@
                 // Inventory tabs are commonly kept mounted while hidden. Keep
                 // the stable presentation intact and wait for the tab mutation
                 // instead of restoring/rebuilding it in the background.
-                if (mooncakeWarehouseInventoryRoot && !mooncakeWarehouseInventoryRoot.isConnected) {
+                if (mooncakeWarehouseInventoryRoot &&
+                    (mooncakeIsExternalProfitPanelNode(mooncakeWarehouseInventoryRoot) ||
+                        !mooncakeWarehouseInventoryRoot.isConnected)) {
                     mooncakeWarehouseRestorePresentation();
                     mooncakeWarehouseStopObservingInventoryRoot();
                 } else if (mooncakeWarehouseInventoryRoot) {
@@ -21191,7 +21212,8 @@
         if (!mooncakeIsEnhancementInventoryWarehouseEnabled() || mooncakeWarehouseSunnyConflictLatched) return;
         if (!event.isTrusted || event.button !== 0 || event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) return;
         const container = event.target?.closest?.('[class*="Item_itemContainer"]');
-        if (!container || !container.closest('[class*="Inventory_items"]')) return;
+        if (!container || !container.closest('[class*="Inventory_items"]') ||
+            mooncakeIsExternalProfitPanelNode(container)) return;
         const itemHrid = mooncakeWarehouseNormalizeItemHrid(mooncakeGetItemHridFromContainer(container));
         if (!itemHrid) return;
         const target = {
@@ -21214,14 +21236,14 @@
         '[class*="Inventory_inventory"], [class*="Inventory_items"]';
 
     function mooncakeWarehouseNodeTouchesInventoryStructure(node) {
-        return node instanceof Element && (
+        return node instanceof Element && !mooncakeNodeContainsExternalProfitPanel(node) && (
             node.matches?.(MOONCAKE_WAREHOUSE_INVENTORY_STRUCTURE_SELECTOR) ||
             !!node.querySelector?.(MOONCAKE_WAREHOUSE_INVENTORY_STRUCTURE_SELECTOR)
         );
     }
 
     function mooncakeWarehouseNodeMayReplaceInventoryRoot(node) {
-        return node instanceof Element && (
+        return node instanceof Element && !mooncakeNodeContainsExternalProfitPanel(node) && (
             node.matches?.(MOONCAKE_WAREHOUSE_INVENTORY_ROOT_SELECTOR) ||
             !!node.querySelector?.(MOONCAKE_WAREHOUSE_INVENTORY_ROOT_SELECTOR)
         );
@@ -21254,7 +21276,8 @@
                 : mooncakeWarehouseFindInventoryRoot();
             const relevant = mutations.some(mutation => {
                 const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
-                if (target?.closest?.(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}]`)) return false;
+                if (mooncakeIsExternalProfitPanelNode(target) ||
+                    target?.closest?.(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}]`)) return false;
                 if (activeRoot?.isConnected) {
                     if (target && (target === activeRoot || activeRoot.contains(target))) {
                         return [...mutation.addedNodes, ...mutation.removedNodes].some(node => {
@@ -25790,7 +25813,8 @@
     function ensureMooncakeUpgradeSourceMarketButtons(root = document) {
         const labels = [...root.querySelectorAll('span, div, label')]
             .filter(mooncakeIsUpgradeSourceLabel)
-            .filter(mooncakeIsVisibleElement);
+            .filter(mooncakeIsVisibleElement)
+            .filter(label => !mooncakeIsExternalProfitPanelNode(label));
         for (const label of labels) {
             const itemContainer = mooncakeFindUpgradeSourceItemContainer(label);
             const itemHrid = mooncakeGetUpgradeSourceItemHrid(itemContainer);
@@ -25815,6 +25839,7 @@
         if (mooncakeUpgradeSourceMarketUnsubscribe) return;
         const isRelevantNode = node => {
             if (!(node instanceof Element)) return false;
+            if (mooncakeNodeContainsExternalProfitPanel(node)) return false;
             if (node.matches?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`) ||
                 node.closest?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)) return false;
             const className = typeof node.className === 'string' ? node.className : '';
@@ -29697,6 +29722,7 @@
         const selector = '[class*="Inventory_inventory"], [class*="InventoryPanel"], [class*="Inventory_panel"]';
         let best = null;
         for (const element of document.querySelectorAll(selector)) {
+            if (mooncakeIsExternalProfitPanelNode(element)) continue;
             if (!element?.isConnected) continue;
             let rect;
             let style;
@@ -29718,8 +29744,11 @@
 
     function mooncakeMayAffectEnhancePlanSidebar(node) {
         if (!(node instanceof Element)) return false;
+        if (mooncakeNodeContainsExternalProfitPanel(node)) return false;
         const selector = '[class*="Inventory_inventory"], [class*="InventoryPanel"], [class*="Inventory_panel"]';
-        return node.matches?.(selector) || !!node.querySelector?.(selector);
+        return node.matches?.(selector) ||
+            Array.from(node.querySelectorAll?.(selector) || [])
+                .some(element => !mooncakeIsExternalProfitPanelNode(element));
     }
 
     function mooncakeResolveEnhancePlanLayoutMode(availableWidth) {
@@ -30004,7 +30033,11 @@
             );
         }
         mooncakeObserveEnhancePlanContainer(panel);
-        const sidebarCandidate = layout.inventoryElement || document.querySelector('[class*="InventoryPanel"], [class*="Inventory_inventory"], [class*="Inventory_panel"]');
+        const sidebarSelector = '[class*="InventoryPanel"], [class*="Inventory_inventory"], [class*="Inventory_panel"]';
+        const sidebarCandidate = !mooncakeIsExternalProfitPanelNode(layout.inventoryElement)
+            ? layout.inventoryElement
+            : [...document.querySelectorAll(sidebarSelector)]
+                .find(element => !mooncakeIsExternalProfitPanelNode(element));
         if (sidebarCandidate) mooncakeObserveEnhancePlanSidebar(sidebarCandidate);
         else mooncakeStopEnhancePlanSidebarObserver();
         mooncakeEnsureEnhancePlanViewportListeners();
