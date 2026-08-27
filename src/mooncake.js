@@ -4222,7 +4222,7 @@
         return `${(numeric / 1024 / 1024).toFixed(2)} MB`;
     }
 
-    function mooncakeRenderOrderBookArchiveSide(title, rows, color, ownListingIds = new Set()) {
+    function mooncakeRenderOrderBookArchiveSide(title, rows, color, ownListingIds = new Set(), archiveOwnerCharacterId = '') {
         const body = rows.length
             ? rows.map(row => {
                 const listingId = row?.listingId === undefined || row?.listingId === null || row?.listingId === ''
@@ -4230,10 +4230,13 @@
                     : String(row.listingId);
                 const listingIdHtml = mooncakeEscapeHtml(listingId);
                 const currentCharacterId = mooncakeCharacterId == null ? '' : String(mooncakeCharacterId);
+                // isMine belongs to the saved snapshot. Keep it independent of
+                // the live listing map so cancelling a listing cannot erase its tag.
+                const snapshotOwnerCharacterId = row?.ownerCharacterId || archiveOwnerCharacterId;
                 const wasMineForCurrentCharacter = row?.isMine === true &&
-                    !!row?.ownerCharacterId &&
+                    !!snapshotOwnerCharacterId &&
                     !!currentCharacterId &&
-                    String(row.ownerCharacterId) === currentCharacterId;
+                    String(snapshotOwnerCharacterId) === currentCharacterId;
                 const isMine = wasMineForCurrentCharacter || ownListingIds.has(mooncakeGetMarketListingIdKey(row?.listingId));
                 const mineTag = isMine
                     ? `<span title="${isZH ? '我的挂单' : 'My listing'}" aria-label="${isZH ? '我的挂单' : 'My listing'}" style="display:inline-block;margin-right:3px;color:#ffd56e;font-size:12px;filter:drop-shadow(0 0 2px rgba(255,191,70,.48));vertical-align:1px;">🏷️</span>`
@@ -4249,11 +4252,12 @@
         if (!detail || !row) return;
         const time = new Date(row.timestamp).toLocaleString();
         const ownListingIds = mooncakeGetMyMarketListingIds();
+        const archiveOwnerCharacterId = row.ownerCharacterId == null ? '' : String(row.ownerCharacterId);
         detail.innerHTML = `
             <div style="display:flex;justify-content:space-between;gap:10px;margin-bottom:8px;color:rgba(222,231,255,.66);font-size:11px;"><span>${mooncakeEscapeHtml(time)}</span><span>${isZH ? '🏷️ 我的挂单 · 数量 / 价格 / 订单 ID' : '🏷️ My listing · Qty / Price / Order ID'}</span></div>
             <div data-mooncake-order-archive-sides style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
-                ${mooncakeRenderOrderBookArchiveSide(isZH ? '卖单' : 'Asks', row.asks || [], '#ffd66f', ownListingIds)}
-                ${mooncakeRenderOrderBookArchiveSide(isZH ? '买单' : 'Bids', row.bids || [], '#9ddfff', ownListingIds)}
+                ${mooncakeRenderOrderBookArchiveSide(isZH ? '卖单' : 'Asks', row.asks || [], '#ffd66f', ownListingIds, archiveOwnerCharacterId)}
+                ${mooncakeRenderOrderBookArchiveSide(isZH ? '买单' : 'Bids', row.bids || [], '#9ddfff', ownListingIds, archiveOwnerCharacterId)}
             </div>`;
     }
 
@@ -4628,6 +4632,17 @@
             .mooncake-tooltip .mooncake-history-timeline-target:hover {
                 filter: brightness(1.35);
             }
+            .mooncake-tooltip .mooncake-history-timeline-crosshair {
+                pointer-events: none;
+                transition: opacity .08s linear;
+            }
+            .mooncake-tooltip .mooncake-history-timeline-bar-label {
+                pointer-events: none;
+                paint-order: stroke;
+                stroke: rgba(8, 12, 20, .72);
+                stroke-width: 1.8px;
+                stroke-linejoin: round;
+            }
             .mooncake-tooltip .mooncake-history-timeline-detail {
                 min-height: 17px;
                 margin-top: 5px;
@@ -4953,6 +4968,14 @@
             const point = event.target?.closest?.('[data-mooncake-history-timeline-hover]');
             if (!point || !tooltipEl.contains(point)) return;
             mooncakeUpdateMarketHistoryTimelineDetail(point, tooltipEl);
+            mooncakeUpdateMarketHistoryTimelineCrosshair(point, tooltipEl);
+        });
+        tooltipEl.addEventListener('pointerout', event => {
+            const point = event.target?.closest?.('[data-mooncake-history-timeline-hover]');
+            if (!point || !tooltipEl.contains(point)) return;
+            const nextPoint = event.relatedTarget?.closest?.('[data-mooncake-history-timeline-hover]');
+            if (nextPoint && tooltipEl.contains(nextPoint)) return;
+            mooncakeClearMarketHistoryTimelineCrosshair(tooltipEl);
         });
         document.body.appendChild(tooltipEl);
         return tooltipEl;
@@ -5149,6 +5172,8 @@
         '.mooncake-market-level-jump-btn',
         '.mooncake-enh-protection-buy-btn',
         '.mooncake-enh-cost-market-btn',
+        '[data-mooncake-enh-cost-purchase-card="1"]',
+        '[data-mooncake-upgrade-source-purchase-card="1"]',
         '.mooncake-enh-target-market-btn',
         '.mooncake-order-economics-metric',
         '.mooncake-order-economics-row',
@@ -16063,6 +16088,20 @@
         output.textContent = detail;
     }
 
+    function mooncakeUpdateMarketHistoryTimelineCrosshair(point, tip = tooltipEl) {
+        const x = Number(point?.getAttribute?.('data-mooncake-history-timeline-x'));
+        const crosshair = tip?.querySelector?.('.mooncake-history-timeline-crosshair');
+        if (!Number.isFinite(x) || !crosshair) return;
+        crosshair.setAttribute('x1', String(x));
+        crosshair.setAttribute('x2', String(x));
+        crosshair.setAttribute('opacity', '1');
+    }
+
+    function mooncakeClearMarketHistoryTimelineCrosshair(tip = tooltipEl) {
+        const crosshair = tip?.querySelector?.('.mooncake-history-timeline-crosshair');
+        if (crosshair) crosshair.setAttribute('opacity', '0');
+    }
+
     function mooncakeBuildMarketHistoryTimelineTooltip(days, row, itemHrid = '', level = 0) {
         const windowDays = Math.max(1, Math.floor(Number(days) || 1));
         const binSeconds = windowDays <= 1 ? 15 * 60 : windowDays <= 3 ? 60 * 60 : 2 * 60 * 60;
@@ -16125,6 +16164,101 @@
             : left + (Math.max(firstTime, Math.min(lastTime, time)) - firstTime) / timeSpan * plotWidth;
         const priceYFor = price => priceTop + (maxPrice - price) / priceSpan * (priceBottom - priceTop);
         const number = value => Number(value).toFixed(1);
+        const volumeHeight = volumeBottom - volumeTop;
+        const sortedVolumes = points.map(point => Math.max(0, Number(point.volume) || 0)).sort((left, right) => left - right);
+        const medianVolume = sortedVolumes.length % 2
+            ? sortedVolumes[(sortedVolumes.length - 1) / 2]
+            : (sortedVolumes[sortedVolumes.length / 2 - 1] + sortedVolumes[sortedVolumes.length / 2]) / 2;
+        // A single very large trade should not flatten every ordinary trade into a 1px bar.
+        // The labels and tooltip continue to report the original, uncompressed quantity.
+        const compressVolumeScale = points.length >= 3 && maxVolume > Math.max(8, medianVolume * 4);
+        const volumeVisualRatio = value => {
+            const linearRatio = Math.max(0, Math.min(1, (Number(value) || 0) / maxVolume));
+            return compressVolumeScale ? Math.sqrt(linearRatio) : linearRatio;
+        };
+        const volumeValueAtRatio = ratio => {
+            const normalized = Math.max(0, Math.min(1, Number(ratio) || 0));
+            return compressVolumeScale ? maxVolume * normalized * normalized : maxVolume * normalized;
+        };
+        const dayLabelFor = timestamp => {
+            const date = new Date(timestamp * 1000);
+            const pad = value => String(value).padStart(2, '0');
+            return `${pad(date.getMonth() + 1)}/${pad(date.getDate())}`;
+        };
+        const timeLabelFor = timestamp => {
+            const date = new Date(timestamp * 1000);
+            const pad = value => String(value).padStart(2, '0');
+            return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+        };
+        const dayBands = [];
+        const daySeparators = [];
+        const oneDayDateTicks = [];
+        const multiDayTicks = [{ time: firstTime, label: dayLabelFor(firstTime), anchor: 'start' }];
+        let segmentStart = firstTime;
+        let segmentIndex = 0;
+        let nextMidnight = new Date(firstTime * 1000);
+        nextMidnight.setHours(24, 0, 0, 0);
+        while (segmentStart < lastTime) {
+            const midnightTime = Math.floor(nextMidnight.getTime() / 1000);
+            const segmentEnd = Math.min(lastTime, midnightTime);
+            const startX = xFor(segmentStart);
+            const endX = xFor(segmentEnd);
+            if (endX > startX) {
+                dayBands.push(`<rect x="${number(startX)}" y="${priceTop - 2}" width="${number(endX - startX)}" height="${volumeBottom - priceTop + 2}" fill="${segmentIndex % 2 ? 'rgba(116, 148, 214, .045)' : 'rgba(116, 148, 214, .015)'}" pointer-events="none"/>`);
+            }
+            if (segmentEnd < lastTime) {
+                const separatorX = number(xFor(segmentEnd));
+                daySeparators.push(`<line x1="${separatorX}" y1="${priceTop - 2}" x2="${separatorX}" y2="${volumeBottom}" stroke="rgba(150, 190, 250, .36)" stroke-width="1" stroke-dasharray="2 3" pointer-events="none"/>`);
+                multiDayTicks.push({ time: segmentEnd, label: dayLabelFor(segmentEnd), anchor: 'middle' });
+                if (windowDays <= 1) {
+                    oneDayDateTicks.push({ time: segmentEnd, label: dayLabelFor(segmentEnd) });
+                }
+            }
+            segmentStart = segmentEnd;
+            segmentIndex += 1;
+            nextMidnight.setDate(nextMidnight.getDate() + 1);
+        }
+        if (windowDays > 1) {
+            multiDayTicks.push({ time: lastTime, label: dayLabelFor(lastTime), anchor: 'end' });
+        }
+        const timeGuides = [];
+        const timeTicks = windowDays > 1
+            ? multiDayTicks
+            : (() => {
+                const step = 6 * 60 * 60;
+                const ticks = [{ time: firstTime, label: timeLabelFor(firstTime), anchor: 'start' }];
+                const firstTick = Math.ceil(firstTime / step) * step;
+                for (let timestamp = firstTick; timestamp < lastTime; timestamp += step) {
+                    if (timestamp <= firstTime) continue;
+                    const guideX = number(xFor(timestamp));
+                    timeGuides.push(`<line x1="${guideX}" y1="${priceTop - 2}" x2="${guideX}" y2="${volumeBottom}" stroke="rgba(150, 190, 250, .15)" stroke-width="1" stroke-dasharray="2 4" pointer-events="none"/>`);
+                    ticks.push({ time: timestamp, label: timeLabelFor(timestamp), anchor: 'middle' });
+                }
+                ticks.push({ time: lastTime, label: timeLabelFor(lastTime), anchor: 'end' });
+                return ticks;
+            })();
+        const compactTimeTicks = [];
+        const tickGap = windowDays > 1 ? 25 : 36;
+        for (const tick of timeTicks) {
+            const x = xFor(tick.time);
+            const previous = compactTimeTicks.at(-1);
+            if (previous && x - previous.x < tickGap) {
+                // Keep the right endpoint legible rather than printing two dates together.
+                if (tick.anchor === 'end') compactTimeTicks[compactTimeTicks.length - 1] = { ...tick, x };
+                continue;
+            }
+            compactTimeTicks.push({ ...tick, x });
+        }
+        const timeTickMarkup = compactTimeTicks.map(tick => `<text x="${number(tick.x)}" y="172" text-anchor="${tick.anchor}" fill="rgba(230,238,255,.62)" font-size="8.5" font-variant-numeric="tabular-nums" pointer-events="none">${mooncakeEscapeHtml(tick.label)}</text>`).join('');
+        const oneDayDateTickMarkup = oneDayDateTicks.map(tick => `<text x="${number(xFor(tick.time))}" y="160" text-anchor="middle" fill="rgba(183,207,250,.72)" font-size="8" font-weight="700" pointer-events="none">${mooncakeEscapeHtml(tick.label)}</text>`).join('');
+        const volumeTicks = [1, .5, 0].map(ratio => {
+            const y = volumeBottom - ratio * volumeHeight;
+            const value = mooncakeEscapeHtml(mooncakeFormatCompactNumber(volumeValueAtRatio(ratio)));
+            const stroke = ratio === 0 ? 'rgba(164,190,238,.25)' : 'rgba(164,190,238,.13)';
+            const dash = ratio === 0 ? '' : ' stroke-dasharray="2 3"';
+            return `<line x1="${left}" y1="${number(y)}" x2="${right}" y2="${number(y)}" stroke="${stroke}" stroke-width="1"${dash}/>`
+                + `<text x="${axisLabelX}" y="${number(y + 3)}" text-anchor="end" fill="${ratio === 1 ? '#87CEEB' : 'rgba(230,238,255,.5)'}" font-size="9" pointer-events="none">${value}</text>`;
+        }).join('');
         const rowMedianPrice = Number(row?.medianPrice);
         const medianPrice = Number.isFinite(rowMedianPrice) && rowMedianPrice > 0 ? rowMedianPrice : 0;
         const tickSpacing = Math.max((displayMaxPrice - rawMinPrice) * 0.015, displayMaxPrice * 0.005, 1);
@@ -16145,7 +16279,6 @@
         const avgPriceLabel = mooncakeEscapeHtml(mooncakeFormatMarketHistoryPrice(row?.avgPrice));
         const medianPriceLabel = mooncakeEscapeHtml(mooncakeFormatMarketHistoryPrice(row?.medianPrice));
         const totalVolumeLabel = mooncakeEscapeHtml(mooncakeFormatCompactNumber(row?.volume));
-        const maxVolumeLabel = mooncakeEscapeHtml(mooncakeFormatCompactNumber(maxVolume));
         const outlierSummary = compressHighOutliers
             ? `<span style="color:#ff9a70;">${isZH ? '异常高价' : 'High outlier'} <b>↑${mooncakeEscapeHtml(mooncakeFormatMarketHistoryDetailPrice(rawMaxPrice))}</b></span>`
             : '';
@@ -16157,7 +16290,16 @@
         </div>`;
         const barWidth = Math.max(3, Math.min(10, plotWidth / Math.max(1, points.length) * 0.68));
         const detailFor = point => mooncakeEscapeHtml(mooncakeBuildMarketHistoryTimelinePointDetail(point));
-        const attrsFor = point => `data-mooncake-history-timeline-hover="${detailFor(point)}"`;
+        const attrsFor = point => `data-mooncake-history-timeline-hover="${detailFor(point)}" data-mooncake-history-timeline-x="${number(xFor(point.time))}"`;
+        const barVisuals = points.map((point, index) => {
+            const ratio = volumeVisualRatio(point.volume);
+            return {
+                point,
+                index,
+                ratio,
+                height: Math.max(2, ratio * volumeHeight)
+            };
+        });
         const lineSegments = [];
         let segment = [];
         for (const point of points) {
@@ -16189,10 +16331,43 @@
             const x = number(xFor(point.time));
             return `<line class="mooncake-history-timeline-target" ${attrsFor(point)} x1="${x}" y1="${number(priceYFor(Math.min(point.maxPrice, displayMaxPrice)))}" x2="${x}" y2="${number(priceYFor(Math.min(point.minPrice, displayMaxPrice)))}" stroke="rgba(255,215,0,.42)" stroke-width="1.5"/>`;
         }).join('');
-        const bars = points.map(point => {
-            const height = Math.max(1, point.volume / maxVolume * (volumeBottom - volumeTop));
+        const bars = barVisuals.map(({ point, ratio, height }) => {
             const x = xFor(point.time) - barWidth / 2;
-            return `<rect class="mooncake-history-timeline-target" ${attrsFor(point)} x="${number(x)}" y="${number(volumeBottom - height)}" width="${number(barWidth)}" height="${number(height)}" rx="1" fill="rgba(135,206,235,.66)"/>`;
+            const alpha = (0.38 + ratio * 0.42).toFixed(2);
+            return `<rect class="mooncake-history-timeline-target" ${attrsFor(point)} x="${number(x)}" y="${number(volumeBottom - height)}" width="${number(barWidth)}" height="${number(height)}" rx="1" fill="rgba(135,206,235,${alpha})"/>`;
+        }).join('');
+        const barLabelIndexes = new Set();
+        if (points.length <= 10) {
+            const labelGap = 26;
+            const addBarLabel = (index, prioritize = false) => {
+                const x = xFor(barVisuals[index].point.time);
+                const nearby = [...barLabelIndexes].find(existing => Math.abs(xFor(barVisuals[existing].point.time) - x) < labelGap);
+                if (nearby === undefined) {
+                    barLabelIndexes.add(index);
+                } else if (prioritize) {
+                    barLabelIndexes.delete(nearby);
+                    barLabelIndexes.add(index);
+                }
+            };
+            barVisuals.forEach((_, index) => addBarLabel(index));
+            const peakIndex = barVisuals.reduce((bestIndex, current, index) =>
+                current.point.volume > barVisuals[bestIndex].point.volume ? index : bestIndex, 0);
+            addBarLabel(peakIndex, true);
+            addBarLabel(barVisuals.length - 1, true);
+        }
+        const barLabels = barVisuals.filter(({ index }) => barLabelIndexes.has(index))
+            .map(({ point, height }) => {
+                const y = Math.max(volumeTop + 9, volumeBottom - height - 4);
+                const label = mooncakeEscapeHtml(mooncakeFormatCompactNumber(point.volume));
+                return `<text class="mooncake-history-timeline-bar-label" x="${number(xFor(point.time))}" y="${number(y)}" text-anchor="middle" fill="#dff6ff" font-size="8" font-weight="700">${label}</text>`;
+            }).join('');
+        const hitTargets = points.map((point, index) => {
+            const x = xFor(point.time);
+            const previousX = index > 0 ? xFor(points[index - 1].time) : left;
+            const nextX = index < points.length - 1 ? xFor(points[index + 1].time) : right;
+            const start = index > 0 ? (previousX + x) / 2 : left;
+            const end = index < points.length - 1 ? (x + nextX) / 2 : right;
+            return `<rect class="mooncake-history-timeline-target" ${attrsFor(point)} x="${number(start)}" y="${priceTop - 2}" width="${number(Math.max(1, end - start))}" height="${volumeBottom - priceTop + 2}" fill="rgba(0,0,0,.001)" pointer-events="all"/>`;
         }).join('');
         const pointMarkers = points
             .filter(point => !compressHighOutliers || Number(point.price) <= displayMaxPrice)
@@ -16203,8 +16378,9 @@
             const top = priceTop + 3;
             return `<path class="mooncake-history-timeline-target" ${attrsFor(point)} d="M${x} ${top} l-4 7 h8 Z" fill="#ff8e5a" stroke="#171d2a" stroke-width="1"/>`;
         }).join('');
-        const firstLabel = mooncakeEscapeHtml(mooncakeFormatMarketHistoryTimelineTime(firstTime));
-        const lastLabel = mooncakeEscapeHtml(mooncakeFormatMarketHistoryTimelineTime(lastTime));
+        const volumeScaleNote = compressVolumeScale
+            ? `<text x="${right}" y="${volumeTop - 4}" text-anchor="end" fill="rgba(135,206,235,.72)" font-size="8.5" font-weight="700">${isZH ? '√ 压缩显示' : '√ scaled'}</text>`
+            : '';
         const defaultDetail = mooncakeEscapeHtml(mooncakeBuildMarketHistoryTimelinePointDetail(points.at(-1)));
         const canCalculateTradeHourly = Number(level) > 0 && mooncakeIsMarketHistoryEquipmentTarget(itemHrid);
         const hourlyContextAttributes = canCalculateTradeHourly
@@ -16218,17 +16394,17 @@
             const hourly = canCalculateTradeHourly
                 ? `<span data-mooncake-history-detail-hourly-price="${Number(trade.price)}" style="display:block;min-width:70px;color:rgba(230,238,255,.46);text-align:center;font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap;">...</span>`
                 : '<span style="display:block;min-width:70px;color:rgba(230,238,255,.42);text-align:center;font-weight:700;">-</span>';
-            return `<div style="display:grid;grid-template-columns:minmax(0,1.12fr) minmax(60px,.8fr) minmax(70px,.9fr) minmax(36px,.46fr);align-items:center;gap:8px;padding:4px 7px;${border}font-variant-numeric:tabular-nums;">
+            return `<div style="display:grid;grid-template-columns:minmax(0,1.12fr) minmax(36px,.46fr) minmax(60px,.8fr) minmax(70px,.9fr);align-items:center;gap:8px;padding:4px 7px;${border}font-variant-numeric:tabular-nums;">
                 <span style="color:rgba(230,238,255,.74);text-align:center;">${time}</span>
+                <span style="color:#87CEEB;text-align:center;font-weight:750;">${volume}</span>
                 <span style="color:#FFD700;text-align:center;font-weight:800;">${price}</span>
                 ${hourly}
-                <span style="color:#87CEEB;text-align:center;font-weight:750;">${volume}</span>
             </div>`;
         }).join('');
         const tradeDetail = trades.length
             ? `<div${hourlyContextAttributes} style="margin-top:7px;border:1px solid rgba(144,166,235,.28);border-radius:4px;overflow:hidden;">
-                <div style="display:grid;grid-template-columns:minmax(0,1.12fr) minmax(60px,.8fr) minmax(70px,.9fr) minmax(36px,.46fr);gap:8px;padding:4px 7px;background:rgba(75,89,138,.20);color:rgba(214,231,255,.80);font-size:10px;font-weight:800;text-align:center;">
-                    <span>${isZH ? '成交时段' : 'Period'}</span><span>${isZH ? '成交价' : 'Price'}</span><span>${isZH ? '工时' : 'Hourly'}</span><span>${isZH ? '数量' : 'Qty'}</span>
+                <div style="display:grid;grid-template-columns:minmax(0,1.12fr) minmax(36px,.46fr) minmax(60px,.8fr) minmax(70px,.9fr);gap:8px;padding:4px 7px;background:rgba(75,89,138,.20);color:rgba(214,231,255,.80);font-size:10px;font-weight:800;text-align:center;">
+                    <span>${isZH ? '成交时段' : 'Period'}</span><span>${isZH ? '数量' : 'Qty'}</span><span>${isZH ? '成交价' : 'Price'}</span><span>${isZH ? '工时' : 'Hourly'}</span>
                 </div>
                 <div class="mooncake-history-tooltip-scroll" style="max-height:152px;padding-right:0;font-size:11px;line-height:1.35;">${tradeRows}</div>
                 <div style="padding:4px 7px;border-top:1px solid rgba(164,190,238,.14);color:rgba(230,238,255,.52);font-size:10px;">${isZH
@@ -16238,8 +16414,11 @@
             : `<div style="margin-top:7px;color:rgba(230,238,255,.52);font-size:10px;">${isZH ? '成交时段明细将在下次行情刷新后显示' : 'Period details appear after the next market-history refresh'}</div>`;
         return `<div class="tt-header">${header}</div>`
             + summary
-            + `<div class="mooncake-history-timeline"><svg class="mooncake-history-timeline-chart" viewBox="0 0 ${width} 177" role="img" aria-label="${isZH ? '成交均价与成交量时间轴' : 'Average price and volume timeline'}">
+            + `<div class="mooncake-history-timeline"><svg class="mooncake-history-timeline-chart" viewBox="0 0 ${width} 177" role="img" aria-label="${isZH ? '按日期分区的成交均价与成交量时间轴' : 'Date-grouped average price and volume timeline'}">
                 <text x="${left}" y="12" fill="#d6e7ff" font-size="10" font-weight="700">${isZH ? '成交均价' : 'Average price'}</text>
+                ${dayBands.join('')}
+                ${daySeparators.join('')}
+                ${timeGuides.join('')}
                 ${priceGuides}
                 ${areaPaths}
                 ${rangeLines}
@@ -16248,13 +16427,14 @@
                 ${outlierMarkers}
                 <line x1="${left}" y1="102" x2="${right}" y2="102" stroke="rgba(164,190,238,.2)" stroke-width="1"/>
                 <text x="${left}" y="${volumeTop - 4}" fill="#d6e7ff" font-size="10" font-weight="700">${isZH ? '成交量' : 'Volume'}</text>
-                <text x="${axisLabelX}" y="${volumeTop + 3}" text-anchor="end" fill="#87CEEB" font-size="9" font-weight="600">${isZH ? '峰' : 'Peak'} ${maxVolumeLabel}</text>
+                ${volumeScaleNote}
+                ${volumeTicks}
                 ${bars}
-                <line x1="${left}" y1="${number((volumeTop + volumeBottom) / 2)}" x2="${right}" y2="${number((volumeTop + volumeBottom) / 2)}" stroke="rgba(164,190,238,.12)" stroke-width="1" stroke-dasharray="2 3"/>
-                <line x1="${left}" y1="${volumeBottom}" x2="${right}" y2="${volumeBottom}" stroke="rgba(164,190,238,.25)" stroke-width="1"/>
-                <text x="${axisLabelX}" y="${volumeBottom + 3}" text-anchor="end" fill="rgba(230,238,255,.5)" font-size="9">0</text>
-                <text x="${left}" y="172" fill="rgba(230,238,255,.55)" font-size="8.5">${firstLabel}</text>
-                <text x="${right}" y="172" text-anchor="end" fill="rgba(230,238,255,.55)" font-size="8.5">${lastLabel}</text>
+                ${barLabels}
+                ${hitTargets}
+                <line class="mooncake-history-timeline-crosshair" x1="-10" x2="-10" y1="${priceTop - 2}" y2="${volumeBottom}" stroke="rgba(231,244,255,.86)" stroke-width="1" stroke-dasharray="2 2" opacity="0"/>
+                ${oneDayDateTickMarkup}
+                ${timeTickMarkup}
             </svg></div>`
             + `<div class="mooncake-history-timeline-detail" data-mooncake-history-timeline-detail>${defaultDetail}</div>`
             + tradeDetail
@@ -25579,8 +25759,10 @@
     const MOONCAKE_ENH_COST_MARKET_ATTR = 'data-mooncake-enh-cost-market';
     const MOONCAKE_ENH_COST_MARKET_HOST_ATTR = 'data-mooncake-enh-cost-market-host';
     const MOONCAKE_ENH_COST_MARKET_SIG_ATTR = 'data-mooncake-enh-cost-market-sig';
+    const MOONCAKE_ENH_COST_PURCHASE_CARD_ATTR = 'data-mooncake-enh-cost-purchase-card';
     const MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR = 'data-mooncake-upgrade-source-market';
     const MOONCAKE_UPGRADE_SOURCE_MARKET_HOST_ATTR = 'data-mooncake-upgrade-source-market-host';
+    const MOONCAKE_UPGRADE_SOURCE_PURCHASE_CARD_ATTR = 'data-mooncake-upgrade-source-purchase-card';
     const MOONCAKE_ENH_PREVIEW_EXCLUDE_SEL = '[class*="SkillActionDetail_enhancingOutput"], [class*="SkillActionDetail_outputItems"]';
     const MOONCAKE_ENH_PROTECTION_NEAR_ASK_RATIO = 0.05;
     const MOONCAKE_ENH_PROTECTION_NEAR_ASK_LIMIT = 3;
@@ -25619,6 +25801,8 @@
     const mooncakeEnhanceCostPurchaseHostStyles = new WeakMap();
     const mooncakeEnhanceCostPurchaseFirstChildStyles = new WeakMap();
     const mooncakeUpgradeSourceMarketHostStyles = new WeakMap();
+    const mooncakeMaterialPurchaseCardStates = new WeakMap();
+    const mooncakeEnhancePlanMaterialShortageStyles = new WeakMap();
     let mooncakeUpgradeSourceMarketRefreshTimer = 0;
     let mooncakeUpgradeSourceMarketUnsubscribe = null;
     const mooncakeEnhanceCurrentDataPanelStyles = new WeakMap();
@@ -25880,7 +26064,95 @@
             + `<span class="tt-label">${isZH ? '说明:' : 'Note:'}</span> <span class="tt-value">${isZH ? '点击跳转到该材料的 +0 市场' : 'Click to open this material at +0'}</span>`;
     }
 
+    function mooncakeGetNodesIncludingRoot(root, selector) {
+        if (!root || !selector) return [];
+        const nodes = [...(root.querySelectorAll?.(selector) || [])];
+        if (root.matches?.(selector)) nodes.unshift(root);
+        return [...new Set(nodes)];
+    }
+
+    function mooncakeRestoreMaterialPurchaseCard(card) {
+        const state = mooncakeMaterialPurchaseCardStates.get(card);
+        if (!state) return;
+        card.removeEventListener('click', state.onClick);
+        card.removeEventListener('keydown', state.onKeyDown);
+        card.style.cursor = state.cursor;
+        for (const [name, value] of Object.entries(state.attributes)) {
+            if (value == null) card.removeAttribute(name);
+            else card.setAttribute(name, value);
+        }
+        card.removeAttribute(state.attr);
+        card.removeAttribute('data-mooncake-material-purchase-hrid');
+        card._mooncakeTooltipHtml = state.tooltipHtml;
+        card._mooncakeTooltipInteractive = state.tooltipInteractive;
+        mooncakeMaterialPurchaseCardStates.delete(card);
+    }
+
+    function mooncakeBindMaterialPurchaseCard(card, itemHrid, attr) {
+        if (!(card instanceof Element) || !itemHrid || !attr) return false;
+        let state = mooncakeMaterialPurchaseCardStates.get(card);
+        if (!state) {
+            state = {
+                attr,
+                itemHrid,
+                cursor: card.style.cursor,
+                attributes: {
+                    role: card.getAttribute('role'),
+                    tabindex: card.getAttribute('tabindex'),
+                    'aria-label': card.getAttribute('aria-label')
+                },
+                tooltipHtml: card._mooncakeTooltipHtml,
+                tooltipInteractive: card._mooncakeTooltipInteractive,
+                onClick: null,
+                onKeyDown: null
+            };
+            const activate = async event => {
+                if (event.defaultPrevented) return;
+                const target = event.target instanceof Element ? event.target : null;
+                const nestedControl = target?.closest?.('button, input, select, textarea, a, [role="button"]');
+                if (nestedControl && nestedControl !== card) return;
+
+                event.preventDefault();
+                event.stopPropagation();
+                const sourceHrid = state.itemHrid;
+                if (!sourceHrid) return;
+                hideTooltip();
+                const opened = await mooncakeOpenMaterialPurchaseSource(sourceHrid, 1);
+                if (opened && !mooncakeGetCoinShopItem(sourceHrid) && event.isTrusted) {
+                    mooncakeQueueQ7MarketReport(sourceHrid, 0);
+                }
+            };
+            state.onClick = activate;
+            state.onKeyDown = event => {
+                if (event.key !== 'Enter' && event.key !== ' ') return;
+                if (event.repeat) return;
+                void activate(event);
+            };
+            card.addEventListener('click', state.onClick);
+            card.addEventListener('keydown', state.onKeyDown);
+            bindTooltip(card, () => mooncakeBuildEnhanceCostPurchaseTooltipHtml(state.itemHrid));
+            mooncakeMaterialPurchaseCardStates.set(card, state);
+        } else if (state.attr !== attr) {
+            card.removeAttribute(state.attr);
+            state.attr = attr;
+        }
+
+        state.itemHrid = itemHrid;
+        card.setAttribute(attr, '1');
+        card.setAttribute('data-mooncake-material-purchase-hrid', itemHrid);
+        card.setAttribute('role', 'button');
+        if (!card.hasAttribute('tabindex')) card.tabIndex = 0;
+        const shopItem = mooncakeGetCoinShopItem(itemHrid);
+        const itemName = getItemName(itemHrid) || (isZH ? '材料' : 'material');
+        card.setAttribute('aria-label', shopItem
+            ? (isZH ? `前往${itemName}系统商店` : `Open ${itemName} shop`)
+            : (isZH ? `打开${itemName}市场` : `Open ${itemName} market`));
+        return true;
+    }
+
     function mooncakeRemoveEnhanceCostMarketButtons(root = document) {
+        mooncakeGetNodesIncludingRoot(root, `[${MOONCAKE_ENH_COST_PURCHASE_CARD_ATTR}="1"]`)
+            .forEach(mooncakeRestoreMaterialPurchaseCard);
         root.querySelectorAll?.(`[${MOONCAKE_ENH_COST_MARKET_ATTR}="1"]`).forEach(button => {
             const host = button.parentElement;
             button.remove();
@@ -26003,7 +26275,7 @@
 
         // MWITools may wrap the material cells while rebuilding its shortage
         // grid. Query descendants rather than relying on React's direct-child
-        // shape so the shortcuts return after either rendering path.
+        // shape so the material cards remain jump targets after either path.
         const itemContainers = [...new Set(
             [...requirements.querySelectorAll('[class*="Item_itemContainer"]')]
         )];
@@ -26022,74 +26294,20 @@
         const signature = materialEntries
             .map(entry => `${entry.itemHrid}:${entry.shopItem ? `shop:${entry.shopItem.price}` : 'market'}`)
             .join('|');
-        const existingButtonsMatch = requirements.getAttribute(MOONCAKE_ENH_COST_MARKET_SIG_ATTR) === signature &&
+        const existingCardsMatch = requirements.getAttribute(MOONCAKE_ENH_COST_MARKET_SIG_ATTR) === signature &&
             materialEntries.every(({ itemContainer, itemHrid }) =>
-                [...itemContainer.querySelectorAll(`[${MOONCAKE_ENH_COST_MARKET_ATTR}="1"]`)]
-                    .some(button => button.dataset.itemHrid === itemHrid)
+                itemContainer.getAttribute(MOONCAKE_ENH_COST_PURCHASE_CARD_ATTR) === '1' &&
+                itemContainer.getAttribute('data-mooncake-material-purchase-hrid') === itemHrid
             );
-        if (existingButtonsMatch) return;
+        if (existingCardsMatch) return;
 
         mooncakeRemoveEnhanceCostMarketButtons(requirements);
-        for (const { itemContainer, itemHrid, shopItem } of materialEntries) {
-            const purchaseLabel = shopItem
-                ? (isZH ? `前往${getItemName(itemHrid) || '材料'}系统商店` : `Open ${getItemName(itemHrid) || 'material'} shop`)
-                : (isZH ? `打开${getItemName(itemHrid) || '材料'}市场` : `Open ${getItemName(itemHrid) || 'material'} market`);
-            const host = mooncakePrepareEnhanceCostPurchaseHost(itemContainer);
-            if (!host) continue;
-            const isProcurementHost = !!host.closest?.('.mwi-procurement-requirement-grid, .mwi-procurement-panel');
-
-            const button = document.createElement('button');
-            button.type = 'button';
-            button.className = 'mooncake-enh-cost-market-btn';
-            button.setAttribute(MOONCAKE_ENH_COST_MARKET_ATTR, '1');
-            button.dataset.itemHrid = itemHrid;
-            button.setAttribute('aria-label', purchaseLabel);
-            Object.assign(button.style, {
-                position: 'static',
-                width: '22px',
-                minWidth: '22px',
-                maxWidth: '22px',
-                height: '22px',
-                minHeight: '22px',
-                maxHeight: '22px',
-                padding: '3px',
-                display: 'inline-flex',
-                flex: '0 0 22px',
-                margin: '0',
-                alignItems: 'center',
-                justifyContent: 'center',
-                border: shopItem ? '1px solid rgba(228,184,99,.52)' : '1px solid rgba(133,165,229,.42)',
-                borderRadius: '4px',
-                background: shopItem ? 'rgba(64,48,25,.9)' : 'rgba(31,39,63,.9)',
-                color: 'rgba(213,229,255,.96)',
-                cursor: 'pointer',
-                lineHeight: '1',
-                boxSizing: 'border-box'
-            });
-            const icon = mooncakeCreateMiscIconSvg(shopItem ? 'shop' : 'marketplace', 14);
-            if (icon) button.appendChild(icon);
-            else button.textContent = shopItem ? 'S' : 'M';
-            if (isProcurementHost) {
-                Object.assign(button.style, {
-                    position: 'absolute',
-                    top: '50%',
-                    right: '0',
-                    transform: 'translateY(-50%)',
-                    zIndex: '1'
-                });
-            }
-            bindTooltip(button, () => mooncakeBuildEnhanceCostPurchaseTooltipHtml(itemHrid));
-            button.addEventListener('click', async event => {
-                event.preventDefault();
-                event.stopPropagation();
-                hideTooltip();
-                const opened = await mooncakeOpenMaterialPurchaseSource(itemHrid, 1);
-                if (opened && !mooncakeGetCoinShopItem(itemHrid) && event.isTrusted) {
-                    mooncakeQueueQ7MarketReport(itemHrid, 0);
-                }
-            });
-
-            host.appendChild(button);
+        for (const { itemContainer, itemHrid } of materialEntries) {
+            mooncakeBindMaterialPurchaseCard(
+                itemContainer,
+                itemHrid,
+                MOONCAKE_ENH_COST_PURCHASE_CARD_ATTR
+            );
         }
         requirements.setAttribute(MOONCAKE_ENH_COST_MARKET_SIG_ATTR, signature);
     }
@@ -26186,6 +26404,8 @@
     }
 
     function mooncakeRemoveUpgradeSourceMarketButtons(root = document) {
+        mooncakeGetNodesIncludingRoot(root, `[${MOONCAKE_UPGRADE_SOURCE_PURCHASE_CARD_ATTR}="1"]`)
+            .forEach(mooncakeRestoreMaterialPurchaseCard);
         root.querySelectorAll?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`).forEach(button => {
             const host = button.parentElement;
             button.remove();
@@ -26198,64 +26418,15 @@
     function mooncakeEnsureUpgradeSourceMarketButton(itemContainer, itemHrid) {
         if (!itemContainer || !itemHrid) return;
         const scope = mooncakeGetUpgradeSourceMarketHost(itemContainer) || itemContainer;
-        const existing = [...scope.querySelectorAll(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)];
-        if (existing.some(button => button.dataset.itemHrid === itemHrid && button.parentElement === scope)) return;
+        const existingCardMatches = itemContainer.getAttribute(MOONCAKE_UPGRADE_SOURCE_PURCHASE_CARD_ATTR) === '1' &&
+            itemContainer.getAttribute('data-mooncake-material-purchase-hrid') === itemHrid;
+        if (existingCardMatches) return;
         mooncakeRemoveUpgradeSourceMarketButtons(scope);
-
-        const shopItem = mooncakeGetCoinShopItem(itemHrid);
-        const itemName = getItemName(itemHrid) || (isZH ? '材料' : 'material');
-        const label = shopItem
-            ? (isZH ? `前往${itemName}系统商店` : `Open ${itemName} shop`)
-            : (isZH ? `打开${itemName}市场` : `Open ${itemName} market`);
-        const host = mooncakePrepareUpgradeSourceMarketHost(scope);
-        if (!host) return;
-
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'mooncake-upgrade-source-market-btn';
-        button.setAttribute(MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR, '1');
-        button.dataset.itemHrid = itemHrid;
-        button.setAttribute('aria-label', label);
-        Object.assign(button.style, {
-            position: 'relative',
-            flex: '0 0 22px',
-            zIndex: '2',
-            width: '22px',
-            minWidth: '22px',
-            maxWidth: '22px',
-            height: '22px',
-            minHeight: '22px',
-            maxHeight: '22px',
-            padding: '3px',
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            margin: '0',
-            border: shopItem ? '1px solid rgba(228,184,99,.52)' : '1px solid rgba(133,165,229,.42)',
-            borderRadius: '4px',
-            background: shopItem ? 'rgba(64,48,25,.9)' : 'rgba(31,39,63,.9)',
-            color: 'rgba(213,229,255,.96)',
-            cursor: 'pointer',
-            lineHeight: '1',
-            boxSizing: 'border-box'
-        });
-        const icon = mooncakeCreateMiscIconSvg(shopItem ? 'shop' : 'marketplace', 14);
-        if (icon) button.appendChild(icon);
-        else button.textContent = shopItem ? 'S' : 'M';
-        bindTooltip(button, () => mooncakeBuildEnhanceCostPurchaseTooltipHtml(itemHrid));
-        button.addEventListener('click', async event => {
-            event.preventDefault();
-            event.stopPropagation();
-            hideTooltip();
-            const opened = await mooncakeOpenMaterialPurchaseSource(itemHrid, 1);
-            if (opened && !shopItem && event.isTrusted) {
-                mooncakeQueueQ7MarketReport(itemHrid, 0);
-            }
-        });
-        // In the empty state the native warning is already in this flex row,
-        // so appending keeps the shortcut after that warning. With a selected
-        // source, it naturally sits immediately to the icon's right.
-        host.appendChild(button);
+        mooncakeBindMaterialPurchaseCard(
+            itemContainer,
+            itemHrid,
+            MOONCAKE_UPGRADE_SOURCE_PURCHASE_CARD_ATTR
+        );
     }
 
     function ensureMooncakeUpgradeSourceMarketButtons(root = document) {
@@ -26263,12 +26434,17 @@
             .filter(mooncakeIsUpgradeSourceLabel)
             .filter(mooncakeIsVisibleElement)
             .filter(label => !mooncakeIsExternalProfitPanelNode(label));
+        const boundCards = new Set();
         for (const label of labels) {
             const itemContainer = mooncakeFindUpgradeSourceItemContainer(label);
             const itemHrid = mooncakeGetUpgradeSourceItemHrid(itemContainer);
             if (!itemHrid || itemHrid === '/items/coin' || itemHrid === '/items/coins') continue;
+            boundCards.add(itemContainer);
             mooncakeEnsureUpgradeSourceMarketButton(itemContainer, itemHrid);
         }
+        mooncakeGetNodesIncludingRoot(root, `[${MOONCAKE_UPGRADE_SOURCE_PURCHASE_CARD_ATTR}="1"]`)
+            .filter(card => !boundCards.has(card))
+            .forEach(mooncakeRestoreMaterialPurchaseCard);
     }
 
     function scheduleMooncakeUpgradeSourceMarketButtons(delay = 80) {
@@ -26288,8 +26464,8 @@
         const isRelevantNode = node => {
             if (!(node instanceof Element)) return false;
             if (mooncakeNodeContainsExternalProfitPanel(node)) return false;
-            if (node.matches?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`) ||
-                node.closest?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)) return false;
+            if (node.matches?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"], [${MOONCAKE_UPGRADE_SOURCE_PURCHASE_CARD_ATTR}="1"]`) ||
+                node.closest?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"], [${MOONCAKE_UPGRADE_SOURCE_PURCHASE_CARD_ATTR}="1"]`)) return false;
             const className = typeof node.className === 'string' ? node.className : '';
             return className.includes('ActionDetail') || className.includes('Item_itemContainer') ||
                 !!node.querySelector?.('[class*="ActionDetail"], [class*="Item_itemContainer"], [class*="Item_item"]');
@@ -26304,7 +26480,7 @@
             }
         });
         document.addEventListener('click', event => {
-            if (event.target?.closest?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)) return;
+            if (event.target?.closest?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"], [${MOONCAKE_UPGRADE_SOURCE_PURCHASE_CARD_ATTR}="1"]`)) return;
             if (event.target?.closest?.('[class*="ActionDetail"]')) {
                 scheduleMooncakeUpgradeSourceMarketButtons(120);
             }
@@ -28905,7 +29081,8 @@
             `#${MOONCAKE_ENH_CURRENT_PLAN_ID}`,
             `#${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}`,
             `[${MOONCAKE_LAZY_ENHANCEMENT_CONTROL_ATTR}]`,
-            `[${MOONCAKE_ENH_COST_MARKET_ATTR}="1"]`
+            `[${MOONCAKE_ENH_COST_MARKET_ATTR}="1"]`,
+            `[${MOONCAKE_ENH_COST_PURCHASE_CARD_ATTR}="1"]`
         ].join(', ');
         return element.matches?.(selector) || !!element.closest?.(selector);
     }
@@ -29756,6 +29933,44 @@
         return amount >= 1000 ? formatNumber(amount) : String(amount);
     }
 
+    function mooncakeUseEnhancePlanMaterialShortageInlineRow(materialElement) {
+        if (!(materialElement instanceof HTMLElement)) return;
+        if (!mooncakeEnhancePlanMaterialShortageStyles.has(materialElement)) {
+            mooncakeEnhancePlanMaterialShortageStyles.set(materialElement, {
+                display: materialElement.style.display,
+                alignItems: materialElement.style.alignItems,
+                gap: materialElement.style.gap,
+                whiteSpace: materialElement.style.whiteSpace
+            });
+        }
+        Object.assign(materialElement.style, {
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '4px',
+            whiteSpace: 'nowrap'
+        });
+    }
+
+    function mooncakeRestoreEnhancePlanMaterialShortageLayout(materialElement) {
+        const snapshot = mooncakeEnhancePlanMaterialShortageStyles.get(materialElement);
+        if (!snapshot) return;
+        Object.assign(materialElement.style, snapshot);
+        mooncakeEnhancePlanMaterialShortageStyles.delete(materialElement);
+    }
+
+    function mooncakeEnhancePlanMaterialShortageRowsFit(panel, requirementsRoot) {
+        if (!(requirementsRoot instanceof Element)) return false;
+        const rootRect = requirementsRoot.getBoundingClientRect();
+        const infoRoot = requirementsRoot.closest('[class*="SkillActionDetail_info"]') || panel;
+        const infoRect = infoRoot?.getBoundingClientRect?.();
+        const viewportRight = Math.max(0, window.innerWidth || document.documentElement.clientWidth || 0);
+        const rightLimit = Math.min(
+            viewportRight || Number.POSITIVE_INFINITY,
+            Number.isFinite(infoRect?.right) ? infoRect.right : Number.POSITIVE_INFINITY
+        ) - 6;
+        return rootRect.right <= rightLimit;
+    }
+
     function mooncakeGetCurrentEnhancePlanProtectionRequirement(panel, planCount) {
         const keyParts = String(mooncakeEnhanceCurrentPlanState.key || '').split('|');
         const protectionHrid = keyParts[3] || null;
@@ -29812,6 +30027,14 @@
         // material. Keep the plan calculation in that same visual language:
         // one compact badge per missing cost, rather than a second material
         // summary underneath the plan-count control.
+        const requirementsRoot = panel?.querySelector?.('[class*="SkillActionDetail_itemRequirements"]');
+        const materialElements = requirementsRoot
+            ? [...requirementsRoot.children].filter(node => node.matches?.('[class*="Item_itemContainer"]'))
+            : [];
+        // The badge temporarily turns a card into an inline row. Restore the
+        // game's own item layout first so a resolved shortage leaves no style
+        // behind on the next React refresh.
+        materialElements.forEach(mooncakeRestoreEnhancePlanMaterialShortageLayout);
         panel?.querySelectorAll?.('[data-mooncake-enh-plan-shortage], [data-mooncake-enh-plan-material-shortage]').forEach(node => node.remove());
 
         const controls = panel?.querySelector?.(`#${MOONCAKE_ENH_CURRENT_PLAN_ID}`);
@@ -29828,10 +30051,8 @@
         );
         if (!shortagesByHrid.size) return;
 
-        const requirementsRoot = panel.querySelector('[class*="SkillActionDetail_itemRequirements"]');
         if (!requirementsRoot) return;
-        const materialElements = [...requirementsRoot.children]
-            .filter(node => node.matches?.('[class*="Item_itemContainer"]'));
+        const inlineShortageRows = [];
         for (const materialElement of materialElements) {
             const itemHrid = mooncakeGetItemHridFromContainer(materialElement);
             const shortage = shortagesByHrid.get(itemHrid);
@@ -29850,7 +30071,7 @@
                 flex: '0 0 auto',
                 alignItems: 'center',
                 minWidth: '0',
-                marginLeft: '3px',
+                marginLeft: '0',
                 padding: '2px 5px',
                 border: '1px solid rgba(255, 124, 139, .62)',
                 borderRadius: '4px',
@@ -29863,7 +30084,20 @@
                 whiteSpace: 'nowrap',
                 boxSizing: 'border-box'
             });
+            mooncakeUseEnhancePlanMaterialShortageInlineRow(materialElement);
             materialElement.appendChild(badge);
+            inlineShortageRows.push({ materialElement, badge });
+        }
+
+        // The current-action info column is normally much wider than a badge.
+        // If a narrow viewport cannot absorb the combined card and badge,
+        // fall back to the native stacked presentation rather than overflowing
+        // the panel or creating a horizontal scrollbar.
+        if (inlineShortageRows.length && !mooncakeEnhancePlanMaterialShortageRowsFit(panel, requirementsRoot)) {
+            inlineShortageRows.forEach(({ materialElement, badge }) => {
+                mooncakeRestoreEnhancePlanMaterialShortageLayout(materialElement);
+                badge.style.marginLeft = '3px';
+            });
         }
     }
 
@@ -32501,7 +32735,8 @@
                     `#${MOONCAKE_ENH_CURRENT_PLAN_ID}`,
                     `#${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}`,
                     `[${MOONCAKE_LAZY_ENHANCEMENT_CONTROL_ATTR}]`,
-                    `[${MOONCAKE_ENH_COST_MARKET_ATTR}="1"]`
+                    `[${MOONCAKE_ENH_COST_MARKET_ATTR}="1"]`,
+                    `[${MOONCAKE_ENH_COST_PURCHASE_CARD_ATTR}="1"]`
                 ].join(', '))) continue;
                 if (node.matches?.('use, input, [class*="ItemSelector"]') ||
                     node.closest?.('[class*="ItemSelector"], [class*="SkillActionDetail_enhancingComponent"]')) {
@@ -32525,7 +32760,8 @@
             `#${MOONCAKE_ENH_CURRENT_PLAN_ID}`,
             `#${MOONCAKE_ENH_MARKET_PLAN_COLUMN_ID}`,
             `[${MOONCAKE_LAZY_ENHANCEMENT_CONTROL_ATTR}]`,
-            `[${MOONCAKE_ENH_COST_MARKET_ATTR}="1"]`
+            `[${MOONCAKE_ENH_COST_MARKET_ATTR}="1"]`,
+            `[${MOONCAKE_ENH_COST_PURCHASE_CARD_ATTR}="1"]`
         ].join(', ');
         const isProtectionRefreshInternalTarget = (node) => {
             const element = node instanceof Element ? node : node?.parentElement;
@@ -33655,6 +33891,12 @@
     const MOONCAKE_MY_LISTINGS_TARGET_RUN_ATTR = 'data-mooncake-my-listings-target-run';
     const MOONCAKE_MY_LISTINGS_TARGET_STATUS_ATTR = 'data-mooncake-my-listings-target-status';
     const MOONCAKE_MY_LISTINGS_TARGET_HIDDEN_ATTR = 'data-mooncake-my-listings-target-hidden';
+    const MOONCAKE_MY_LISTINGS_LAYOUT_ATTR = 'data-mooncake-my-listings-layout';
+    const MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR = 'data-mooncake-my-listings-control-host';
+    const MOONCAKE_MY_LISTINGS_TABLE_ATTR = 'data-mooncake-my-listings-mobile-table';
+    const MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR = 'data-mooncake-my-listings-mobile-role';
+    const MOONCAKE_MY_LISTINGS_CELL_LABEL_ATTR = 'data-mooncake-my-listings-mobile-label';
+    const MOONCAKE_MY_LISTINGS_CELL_EMPTY_ATTR = 'data-mooncake-my-listings-mobile-empty';
     const MOONCAKE_MY_LISTINGS_TARGET_STYLE_ID = 'MooncakeMyListingsTargetFilterStyle';
     let mooncakeMyListingsTargetFilterActive = false;
     let mooncakeMyListingsTargetFilterGeneration = 0;
@@ -33744,6 +33986,51 @@
             .filter(table => !table.closest('[class*="Modal_modalContainer"], [class*="MarketplacePanel_modalContent"]'));
         if (!tables.length) return null;
         return tables.find(table => mooncakeIsVisibleElement(table)) || tables[0];
+    }
+
+    function mooncakeGetMyListingsMobileCellRole(label, index) {
+        const text = String(label || '').trim().toLowerCase();
+        if (/状态|status/.test(text)) return 'status';
+        if (/类型|type|买卖|side/.test(text)) return 'side';
+        if (/进度|progress|物品|item/.test(text)) return 'progress';
+        if (/价格|price/.test(text)) return 'price';
+        if (/收集|claim/.test(text)) return 'claims';
+        if (/聊天|链接|chat|link/.test(text)) return 'link';
+        if (/取消|操作|action|cancel/.test(text)) return 'action';
+        return `cell-${index}`;
+    }
+
+    // The game's desktop table is intentionally wide. On a phone, keep the
+    // same DOM and actions but mark each cell so CSS can make a readable card
+    // rather than forcing the entire table through a horizontal scroll area.
+    function mooncakePrepareMyListingsResponsiveLayout(table, root = mooncakeGetMyListingsRoot(table)) {
+        if (!table || !root) return;
+        root.setAttribute(MOONCAKE_MY_LISTINGS_LAYOUT_ATTR, '1');
+        table.setAttribute(MOONCAKE_MY_LISTINGS_TABLE_ATTR, '1');
+
+        const headers = Array.from(table.querySelectorAll('thead th'))
+            .map(cell => String(cell.textContent || '').replace(/\s+/g, ' ').trim());
+        table.querySelectorAll('tbody tr').forEach(row => {
+            const cells = Array.from(row.querySelectorAll(':scope > td, :scope > th'));
+            cells.forEach((cell, index) => {
+                const label = headers[index] || '';
+                cell.setAttribute(MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR, mooncakeGetMyListingsMobileCellRole(label, index));
+                if (label) cell.setAttribute(MOONCAKE_MY_LISTINGS_CELL_LABEL_ATTR, label);
+                else cell.removeAttribute(MOONCAKE_MY_LISTINGS_CELL_LABEL_ATTR);
+                const isEmpty = !cell.children.length && !String(cell.textContent || '').trim();
+                if (isEmpty) cell.setAttribute(MOONCAKE_MY_LISTINGS_CELL_EMPTY_ATTR, '1');
+                else cell.removeAttribute(MOONCAKE_MY_LISTINGS_CELL_EMPTY_ATTR);
+            });
+        });
+
+        const listingCount = root.querySelector('[class*="MarketplacePanel_listingCount"]');
+        const controlHost = listingCount?.parentElement || null;
+        if (controlHost && controlHost !== root) {
+            const hasMooncakeControl = !!controlHost.querySelector(
+                `[${MOONCAKE_MY_LISTINGS_TARGET_FILTER_ATTR}="1"], [data-mooncake-my-listings-management="1"]`
+            );
+            if (hasMooncakeControl) controlHost.setAttribute(MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR, '1');
+        }
     }
 
     function mooncakeResolveMyListingSideText(value) {
@@ -34180,6 +34467,7 @@
         if (control) {
             mooncakeMyListingsTargetFilterBoundTable = table;
             mooncakeUpdateMyListingsTargetFilterControl(control);
+            mooncakePrepareMyListingsResponsiveLayout(table, root);
             return control;
         }
 
@@ -34263,6 +34551,7 @@
         else root.insertBefore(control, table);
         mooncakeMyListingsTargetFilterBoundTable = table;
         mooncakeUpdateMyListingsTargetFilterControl(control, '');
+        mooncakePrepareMyListingsResponsiveLayout(table, root);
         return control;
     }
 
@@ -34570,6 +34859,7 @@
         style.id = MOONCAKE_MY_LISTINGS_MANAGEMENT_STYLE_ID;
         style.textContent = `
             [${MOONCAKE_MY_LISTINGS_MANAGEMENT_HIDDEN_ATTR}="1"] { display:none !important; }
+            [${MOONCAKE_MY_LISTINGS_LAYOUT_ATTR}="1"] { min-width:0; box-sizing:border-box; }
             [${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"] {
                 display:inline-flex; align-items:center; flex-wrap:wrap; gap:4px; min-width:0;
                 margin:0 0 0 8px; padding:0; box-sizing:border-box;
@@ -34606,18 +34896,120 @@
                 font-size:17px !important; line-height:26px !important;
             }
             @media (max-width:680px) {
-                [${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"] {
-                    display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:3px;
-                    width:100%; margin:5px 0 0; padding:0;
+                [${MOONCAKE_MY_LISTINGS_LAYOUT_ATTR}="1"] {
+                    width:100%; max-width:100%; min-width:0; overflow-x:clip;
                 }
-                [${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"] [data-mooncake-my-listings-management-search-wrap] {
+                [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] {
+                    display:grid !important; grid-template-columns:minmax(0,1fr) !important;
+                    align-items:start !important; gap:6px !important;
+                    width:100% !important; min-width:0 !important; max-width:100% !important;
+                    margin:0 0 8px !important; padding:0 !important; box-sizing:border-box !important;
+                }
+                [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] [class*="MarketplacePanel_listingCount"] {
+                    grid-column:1 / -1; justify-self:start; min-width:0; max-width:100%;
+                    margin:0 !important; padding:3px 7px !important; box-sizing:border-box;
+                    border:1px solid rgba(129,154,223,.30); border-radius:5px;
+                    background:rgba(28,35,56,.66); color:rgba(230,237,255,.92);
+                    font-size:11px !important; font-weight:800; line-height:17px !important; white-space:nowrap !important;
+                }
+                [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"] {
+                    display:grid !important; grid-column:1 / -1; grid-template-columns:repeat(5,minmax(0,1fr)); gap:4px;
+                    width:100% !important; min-width:0; margin:0 !important; padding:0;
+                }
+                [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"] [data-mooncake-my-listings-management-search-wrap] {
                     grid-column:1 / -1; width:100%; min-width:0;
                 }
-                [${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"] input[type="search"] {
+                [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"] input[type="search"] {
                     width:100%; min-width:0; height:34px; font-size:11.5px;
                 }
-                [${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"] button:not([${MOONCAKE_MY_LISTINGS_MANAGEMENT_CLEAR_ATTR}="1"]) {
-                    width:100%; min-width:0; min-height:34px; padding:2px 4px; font-size:11px;
+                [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"] button:not([${MOONCAKE_MY_LISTINGS_MANAGEMENT_CLEAR_ATTR}="1"]) {
+                    width:100%; min-width:0; min-height:32px; padding:2px 2px; font-size:10.5px; line-height:17px;
+                }
+                [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_TARGET_FILTER_ATTR}="1"] {
+                    display:grid !important; grid-column:1 / -1;
+                    grid-template-columns:max-content minmax(52px,68px) max-content minmax(0,1fr);
+                    align-items:center; gap:5px; width:100% !important; min-width:0;
+                    margin:0 !important; padding:5px 6px !important; box-sizing:border-box;
+                    white-space:normal !important;
+                }
+                [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_TARGET_FILTER_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_TARGET_INPUT_ATTR}="1"] {
+                    width:100% !important; min-width:0 !important; height:30px !important; padding:2px 4px !important;
+                }
+                [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_TARGET_FILTER_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_TARGET_RUN_ATTR}="1"] {
+                    width:100%; min-width:0; min-height:30px; padding:3px 5px !important;
+                    font-size:11px !important; line-height:17px !important; text-align:center;
+                }
+                [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_TARGET_FILTER_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_TARGET_STATUS_ATTR}="1"] {
+                    grid-column:1 / -1; max-width:none !important; min-width:0;
+                    overflow:hidden; text-align:right; font-size:10px !important;
+                }
+
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] {
+                    display:block !important; width:100% !important; min-width:0 !important; max-width:100% !important;
+                    overflow:visible !important; border-collapse:separate !important; border-spacing:0 !important;
+                    background:transparent !important;
+                }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] thead { display:none !important; }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody {
+                    display:grid !important; grid-template-columns:minmax(0,1fr); gap:7px;
+                    width:100% !important; min-width:0 !important;
+                }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr {
+                    display:grid !important;
+                    grid-template-columns:minmax(0,1fr) minmax(0,.78fr) minmax(58px,.72fr);
+                    grid-template-areas:
+                        "side status status"
+                        "progress price price"
+                        "claims link action";
+                    align-items:center; gap:5px 7px; width:100% !important; min-width:0 !important;
+                    margin:0 !important; padding:8px !important; box-sizing:border-box;
+                    border:1px solid rgba(102,123,186,.30); border-radius:6px;
+                    background:rgba(24,29,45,.88) !important;
+                }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}] {
+                    display:flex !important; flex-direction:column; justify-content:center; align-items:flex-start;
+                    min-width:0; max-width:100%; padding:0 !important; margin:0 !important;
+                    background:transparent !important; border:0 !important; color:inherit; text-align:left !important;
+                    font-size:12px; line-height:17px; font-variant-numeric:tabular-nums;
+                }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}][${MOONCAKE_MY_LISTINGS_CELL_EMPTY_ATTR}="1"] {
+                    display:none !important;
+                }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}]::before {
+                    content:attr(${MOONCAKE_MY_LISTINGS_CELL_LABEL_ATTR}); display:block; margin:0 0 1px;
+                    color:rgba(186,199,235,.66); font-size:9px; font-weight:800; line-height:12px;
+                }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="side"] { grid-area:side; }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="status"] {
+                    grid-area:status; align-items:flex-end; text-align:right !important;
+                }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="progress"] {
+                    grid-area:progress; flex-direction:row; align-items:center; gap:6px; min-height:36px;
+                }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="progress"]::before { display:none; }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="progress"] svg {
+                    width:34px !important; height:34px !important; flex:0 0 auto;
+                }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="price"] {
+                    grid-area:price; align-items:flex-end; text-align:right !important;
+                    color:#ffe084; font-size:15px; font-weight:900; line-height:19px;
+                }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="claims"] { grid-area:claims; }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="link"] { grid-area:link; }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="action"] { grid-area:action; }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="claims"],
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="link"],
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="action"] {
+                    align-items:stretch;
+                }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="claims"]::before,
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="link"]::before,
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="action"]::before {
+                    display:none;
+                }
+                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}] button {
+                    width:100% !important; min-width:0 !important; min-height:30px; padding:3px 5px !important;
+                    box-sizing:border-box; white-space:nowrap; font-size:11px !important;
                 }
             }
         `;
@@ -34720,6 +35112,7 @@
         let control = mooncakeGetMyListingsManagementControl(table);
         if (control) {
             mooncakeSyncMyListingsManagementControl(control);
+            mooncakePrepareMyListingsResponsiveLayout(table, root);
             return control;
         }
 
@@ -34840,6 +35233,7 @@
         else if (buttonHost) buttonHost.appendChild(control);
         else root.insertBefore(control, table);
         mooncakeSyncMyListingsManagementControl(control);
+        mooncakePrepareMyListingsResponsiveLayout(table, root);
         return control;
     }
 
@@ -34885,6 +35279,7 @@
             mooncakeMyListingsManagementCollectableResetTimer = 0;
         }
         mooncakeSyncMyListingsManagementControl(control);
+        mooncakePrepareMyListingsResponsiveLayout(table, root);
     }
 
     // Refresh only when a quote that belongs to a visible personal listing
@@ -38784,6 +39179,18 @@
             #better-loot-tracker-fab:active {
                 cursor: grabbing;
             }
+            @media (max-width: 720px) {
+                #better-loot-tracker-fab {
+                    width: 40px !important;
+                    height: 40px !important;
+                    border-radius: 12px !important;
+                    font-size: 17px !important;
+                    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.42) !important;
+                }
+                #better-loot-tracker-fab::after {
+                    border-radius: 12px;
+                }
+            }
         `;
         document.head.appendChild(fabStyle);
 
@@ -38952,14 +39359,17 @@
         mooncakeUpgradeVirtualConfigPanel(configPanel);
 
         const getFabViewportBounds = () => {
-            const viewport = window.visualViewport;
-            const left = Math.max(0, Number(viewport?.offsetLeft) || 0);
-            const top = Math.max(0, Number(viewport?.offsetTop) || 0);
+            // Fixed-position coordinates belong to the layout viewport. The
+            // visual viewport can shift when mobile browser chrome or a
+            // keyboard appears, which must not move a button the player did
+            // not drag.
+            const width = Math.max(1, Number(window.innerWidth) || Number(document.documentElement?.clientWidth) || 1);
+            const height = Math.max(1, Number(window.innerHeight) || Number(document.documentElement?.clientHeight) || 1);
             return {
-                left,
-                top,
-                right: left + Math.max(1, Number(viewport?.width) || window.innerWidth || 1),
-                bottom: top + Math.max(1, Number(viewport?.height) || window.innerHeight || 1)
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height
             };
         };
         const setFabPosition = (left, top) => {
@@ -39422,6 +39832,8 @@
 
         // Pointer Events cover mouse, touch and pen with one drag path.
         let fabDrag = null;
+        const getFabDragThreshold = (pointerType = '') =>
+            pointerType === 'touch' || window.matchMedia?.('(max-width: 720px)').matches ? 12 : 5;
         fab.addEventListener('pointerdown', (event) => {
             if (!event.isPrimary || event.button !== 0) return;
             const rect = fab.getBoundingClientRect();
@@ -39431,6 +39843,7 @@
                 startY: event.clientY,
                 startLeft: rect.left,
                 startTop: rect.top,
+                threshold: getFabDragThreshold(event.pointerType),
                 moved: false
             };
             try { fab.setPointerCapture(event.pointerId); } catch (_) {}
@@ -39439,19 +39852,25 @@
             if (!fabDrag || event.pointerId !== fabDrag.pointerId) return;
             const deltaX = event.clientX - fabDrag.startX;
             const deltaY = event.clientY - fabDrag.startY;
-            if (!fabDrag.moved && Math.hypot(deltaX, deltaY) < 5) return;
+            if (!fabDrag.moved && Math.hypot(deltaX, deltaY) < fabDrag.threshold) return;
             fabDrag.moved = true;
             fab.style.cursor = 'grabbing';
             setFabPosition(fabDrag.startLeft + deltaX, fabDrag.startTop + deltaY);
             event.preventDefault();
         });
-        const finishFabDrag = (event) => {
+        const finishFabDrag = (event, commit = true) => {
             if (!fabDrag || event.pointerId !== fabDrag.pointerId) return;
             const moved = fabDrag.moved;
+            const startLeft = fabDrag.startLeft;
+            const startTop = fabDrag.startTop;
             try { fab.releasePointerCapture(event.pointerId); } catch (_) {}
             fabDrag = null;
             fab.style.cursor = 'pointer';
             if (!moved) return;
+            if (!commit) {
+                setFabPosition(startLeft, startTop);
+                return;
+            }
             const rect = fab.getBoundingClientRect();
             config.ui.fabPosition = { left: rect.left, top: rect.top };
             saveConfig();
@@ -39459,7 +39878,7 @@
             setTimeout(() => { fab._mooncakeSuppressNextClick = false; }, 0);
         };
         fab.addEventListener('pointerup', finishFabDrag);
-        fab.addEventListener('pointercancel', finishFabDrag);
+        fab.addEventListener('pointercancel', event => finishFabDrag(event, false));
 
         let fabViewportFrame = 0;
         const scheduleFabViewportClamp = () => {
@@ -39470,7 +39889,6 @@
             });
         };
         window.addEventListener('resize', scheduleFabViewportClamp, { passive: true });
-        window.visualViewport?.addEventListener('resize', scheduleFabViewportClamp, { passive: true });
     }
 
 })();
