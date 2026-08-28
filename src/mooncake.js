@@ -4615,6 +4615,7 @@
             }
             .mooncake-tooltip .mooncake-history-timeline {
                 margin: 6px 0 4px;
+                min-width: 0;
                 border: 1px solid rgba(150, 178, 226, .18);
                 border-radius: 4px;
                 background: rgba(8, 12, 20, .28);
@@ -4644,9 +4645,11 @@
                 stroke-linejoin: round;
             }
             .mooncake-tooltip .mooncake-history-timeline-detail {
-                min-height: 17px;
+                box-sizing: border-box;
+                height: 25px;
                 margin-top: 5px;
                 padding: 3px 5px;
+                overflow: hidden;
                 border: 1px solid rgba(150, 178, 226, .14);
                 border-radius: 3px;
                 background: rgba(119, 154, 214, .07);
@@ -4654,7 +4657,13 @@
                 font-size: 11px;
                 font-weight: 700;
                 line-height: 1.35;
+                white-space: nowrap;
+                text-overflow: ellipsis;
                 font-variant-numeric: tabular-nums;
+            }
+            .mooncake-tooltip.mooncake-tooltip-history-timeline {
+                width: min(420px, calc(100vw - 24px));
+                min-width: min(420px, calc(100vw - 24px));
             }
             .mooncake-tooltip .tt-label { color: #aaa; }
             .mooncake-tooltip .tt-value { color: #FFD700; }
@@ -5089,6 +5098,7 @@
         tip._mooncakeTooltipAnchor = anchorEl;
         mooncakeSetTooltipPinned(tip, false);
         tip.classList.toggle('mooncake-tooltip-interactive', anchorEl?._mooncakeTooltipInteractive === true);
+        tip.classList.toggle('mooncake-tooltip-history-timeline', !!tip.querySelector('.mooncake-history-timeline'));
         tip.classList.add("visible");
         positionTooltip(e, tip, anchorEl);
         if (mooncakeMoveVirtualRivalTooltipToSidecar(tip)) {
@@ -5137,7 +5147,7 @@
         if (!tip) return;
         mooncakeClearTooltipHideTimer(tip);
         mooncakeHideVirtualRivalTooltipSidecar();
-        tip.classList.remove("visible", "mooncake-tooltip-interactive");
+        tip.classList.remove("visible", "mooncake-tooltip-interactive", "mooncake-tooltip-history-timeline");
         tip._mooncakeTooltipAnchor = null;
         mooncakeSetTooltipPinned(tip, false);
     }
@@ -16086,6 +16096,7 @@
         const output = tip?.querySelector?.('[data-mooncake-history-timeline-detail]');
         if (!detail || !output || output.textContent === detail) return;
         output.textContent = detail;
+        output.title = detail;
     }
 
     function mooncakeUpdateMarketHistoryTimelineCrosshair(point, tip = tooltipEl) {
@@ -26418,15 +26429,61 @@
     function mooncakeEnsureUpgradeSourceMarketButton(itemContainer, itemHrid) {
         if (!itemContainer || !itemHrid) return;
         const scope = mooncakeGetUpgradeSourceMarketHost(itemContainer) || itemContainer;
-        const existingCardMatches = itemContainer.getAttribute(MOONCAKE_UPGRADE_SOURCE_PURCHASE_CARD_ATTR) === '1' &&
-            itemContainer.getAttribute('data-mooncake-material-purchase-hrid') === itemHrid;
-        if (existingCardMatches) return;
+        const existing = [...scope.querySelectorAll(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)];
+        if (existing.some(button => button.dataset.itemHrid === itemHrid && button.parentElement === scope)) return;
         mooncakeRemoveUpgradeSourceMarketButtons(scope);
-        mooncakeBindMaterialPurchaseCard(
-            itemContainer,
-            itemHrid,
-            MOONCAKE_UPGRADE_SOURCE_PURCHASE_CARD_ATTR
-        );
+
+        const shopItem = mooncakeGetCoinShopItem(itemHrid);
+        const itemName = getItemName(itemHrid) || (isZH ? '材料' : 'material');
+        const label = shopItem
+            ? (isZH ? `前往${itemName}系统商店` : `Open ${itemName} shop`)
+            : (isZH ? `打开${itemName}市场` : `Open ${itemName} market`);
+        const host = mooncakePrepareUpgradeSourceMarketHost(scope);
+        if (!host) return;
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'mooncake-upgrade-source-market-btn';
+        button.setAttribute(MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR, '1');
+        button.dataset.itemHrid = itemHrid;
+        button.setAttribute('aria-label', label);
+        Object.assign(button.style, {
+            position: 'relative',
+            flex: '0 0 22px',
+            zIndex: '2',
+            width: '22px',
+            minWidth: '22px',
+            maxWidth: '22px',
+            height: '22px',
+            minHeight: '22px',
+            maxHeight: '22px',
+            padding: '3px',
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            margin: '0',
+            border: shopItem ? '1px solid rgba(228,184,99,.52)' : '1px solid rgba(133,165,229,.42)',
+            borderRadius: '4px',
+            background: shopItem ? 'rgba(64,48,25,.9)' : 'rgba(31,39,63,.9)',
+            color: 'rgba(213,229,255,.96)',
+            cursor: 'pointer',
+            lineHeight: '1',
+            boxSizing: 'border-box'
+        });
+        const icon = mooncakeCreateMiscIconSvg(shopItem ? 'shop' : 'marketplace', 14);
+        if (icon) button.appendChild(icon);
+        else button.textContent = shopItem ? 'S' : 'M';
+        bindTooltip(button, () => mooncakeBuildEnhanceCostPurchaseTooltipHtml(itemHrid));
+        button.addEventListener('click', async event => {
+            event.preventDefault();
+            event.stopPropagation();
+            hideTooltip();
+            const opened = await mooncakeOpenMaterialPurchaseSource(itemHrid, 1);
+            if (opened && !shopItem && event.isTrusted) {
+                mooncakeQueueQ7MarketReport(itemHrid, 0);
+            }
+        });
+        host.appendChild(button);
     }
 
     function ensureMooncakeUpgradeSourceMarketButtons(root = document) {
@@ -26434,16 +26491,15 @@
             .filter(mooncakeIsUpgradeSourceLabel)
             .filter(mooncakeIsVisibleElement)
             .filter(label => !mooncakeIsExternalProfitPanelNode(label));
-        const boundCards = new Set();
         for (const label of labels) {
             const itemContainer = mooncakeFindUpgradeSourceItemContainer(label);
             const itemHrid = mooncakeGetUpgradeSourceItemHrid(itemContainer);
             if (!itemHrid || itemHrid === '/items/coin' || itemHrid === '/items/coins') continue;
-            boundCards.add(itemContainer);
             mooncakeEnsureUpgradeSourceMarketButton(itemContainer, itemHrid);
         }
+        // Clear cards injected by the brief direct-click implementation. Upgrade
+        // sources intentionally keep their separate compact market/shop button.
         mooncakeGetNodesIncludingRoot(root, `[${MOONCAKE_UPGRADE_SOURCE_PURCHASE_CARD_ATTR}="1"]`)
-            .filter(card => !boundCards.has(card))
             .forEach(mooncakeRestoreMaterialPurchaseCard);
     }
 
@@ -26464,8 +26520,8 @@
         const isRelevantNode = node => {
             if (!(node instanceof Element)) return false;
             if (mooncakeNodeContainsExternalProfitPanel(node)) return false;
-            if (node.matches?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"], [${MOONCAKE_UPGRADE_SOURCE_PURCHASE_CARD_ATTR}="1"]`) ||
-                node.closest?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"], [${MOONCAKE_UPGRADE_SOURCE_PURCHASE_CARD_ATTR}="1"]`)) return false;
+            if (node.matches?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`) ||
+                node.closest?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)) return false;
             const className = typeof node.className === 'string' ? node.className : '';
             return className.includes('ActionDetail') || className.includes('Item_itemContainer') ||
                 !!node.querySelector?.('[class*="ActionDetail"], [class*="Item_itemContainer"], [class*="Item_item"]');
@@ -26480,7 +26536,7 @@
             }
         });
         document.addEventListener('click', event => {
-            if (event.target?.closest?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"], [${MOONCAKE_UPGRADE_SOURCE_PURCHASE_CARD_ATTR}="1"]`)) return;
+            if (event.target?.closest?.(`[${MOONCAKE_UPGRADE_SOURCE_MARKET_ATTR}="1"]`)) return;
             if (event.target?.closest?.('[class*="ActionDetail"]')) {
                 scheduleMooncakeUpgradeSourceMarketButtons(120);
             }
@@ -33988,40 +34044,25 @@
         return tables.find(table => mooncakeIsVisibleElement(table)) || tables[0];
     }
 
-    function mooncakeGetMyListingsMobileCellRole(label, index) {
-        const text = String(label || '').trim().toLowerCase();
-        if (/状态|status/.test(text)) return 'status';
-        if (/类型|type|买卖|side/.test(text)) return 'side';
-        if (/进度|progress|物品|item/.test(text)) return 'progress';
-        if (/价格|price/.test(text)) return 'price';
-        if (/收集|claim/.test(text)) return 'claims';
-        if (/聊天|链接|chat|link/.test(text)) return 'link';
-        if (/取消|操作|action|cancel/.test(text)) return 'action';
-        return `cell-${index}`;
+    function mooncakeRestoreMyListingsNativeTable(table) {
+        if (!table) return;
+        table.removeAttribute(MOONCAKE_MY_LISTINGS_TABLE_ATTR);
+        table.querySelectorAll(
+            `[${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}], [${MOONCAKE_MY_LISTINGS_CELL_LABEL_ATTR}], [${MOONCAKE_MY_LISTINGS_CELL_EMPTY_ATTR}]`
+        ).forEach(cell => {
+            cell.removeAttribute(MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR);
+            cell.removeAttribute(MOONCAKE_MY_LISTINGS_CELL_LABEL_ATTR);
+            cell.removeAttribute(MOONCAKE_MY_LISTINGS_CELL_EMPTY_ATTR);
+        });
     }
 
-    // The game's desktop table is intentionally wide. On a phone, keep the
-    // same DOM and actions but mark each cell so CSS can make a readable card
-    // rather than forcing the entire table through a horizontal scroll area.
+    // Only the controls above the table need a phone layout. Keep the game's
+    // own listing rows intact so the original detailed order view remains
+    // familiar and horizontally scrollable where the game supports it.
     function mooncakePrepareMyListingsResponsiveLayout(table, root = mooncakeGetMyListingsRoot(table)) {
         if (!table || !root) return;
-        root.setAttribute(MOONCAKE_MY_LISTINGS_LAYOUT_ATTR, '1');
-        table.setAttribute(MOONCAKE_MY_LISTINGS_TABLE_ATTR, '1');
-
-        const headers = Array.from(table.querySelectorAll('thead th'))
-            .map(cell => String(cell.textContent || '').replace(/\s+/g, ' ').trim());
-        table.querySelectorAll('tbody tr').forEach(row => {
-            const cells = Array.from(row.querySelectorAll(':scope > td, :scope > th'));
-            cells.forEach((cell, index) => {
-                const label = headers[index] || '';
-                cell.setAttribute(MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR, mooncakeGetMyListingsMobileCellRole(label, index));
-                if (label) cell.setAttribute(MOONCAKE_MY_LISTINGS_CELL_LABEL_ATTR, label);
-                else cell.removeAttribute(MOONCAKE_MY_LISTINGS_CELL_LABEL_ATTR);
-                const isEmpty = !cell.children.length && !String(cell.textContent || '').trim();
-                if (isEmpty) cell.setAttribute(MOONCAKE_MY_LISTINGS_CELL_EMPTY_ATTR, '1');
-                else cell.removeAttribute(MOONCAKE_MY_LISTINGS_CELL_EMPTY_ATTR);
-            });
-        });
+        mooncakeRestoreMyListingsNativeTable(table);
+        root.removeAttribute(MOONCAKE_MY_LISTINGS_LAYOUT_ATTR);
 
         const listingCount = root.querySelector('[class*="MarketplacePanel_listingCount"]');
         const controlHost = listingCount?.parentElement || null;
@@ -34827,6 +34868,10 @@
         }
         mooncakeClearMyListingsManagementRows();
         document.querySelectorAll(`[${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"]`).forEach(control => control.remove());
+        document.querySelectorAll(`[${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"]`).forEach(mooncakeRestoreMyListingsNativeTable);
+        document.querySelectorAll(`[${MOONCAKE_MY_LISTINGS_LAYOUT_ATTR}="1"]`).forEach(root => {
+            root.removeAttribute(MOONCAKE_MY_LISTINGS_LAYOUT_ATTR);
+        });
         if (resetState) {
             mooncakeClearMyListingsLiveOrderBookCache();
             mooncakeMyListingsManagementState.query = '';
@@ -34859,7 +34904,6 @@
         style.id = MOONCAKE_MY_LISTINGS_MANAGEMENT_STYLE_ID;
         style.textContent = `
             [${MOONCAKE_MY_LISTINGS_MANAGEMENT_HIDDEN_ATTR}="1"] { display:none !important; }
-            [${MOONCAKE_MY_LISTINGS_LAYOUT_ATTR}="1"] { min-width:0; box-sizing:border-box; }
             [${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"] {
                 display:inline-flex; align-items:center; flex-wrap:wrap; gap:4px; min-width:0;
                 margin:0 0 0 8px; padding:0; box-sizing:border-box;
@@ -34896,9 +34940,6 @@
                 font-size:17px !important; line-height:26px !important;
             }
             @media (max-width:680px) {
-                [${MOONCAKE_MY_LISTINGS_LAYOUT_ATTR}="1"] {
-                    width:100%; max-width:100%; min-width:0; overflow-x:clip;
-                }
                 [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] {
                     display:grid !important; grid-template-columns:minmax(0,1fr) !important;
                     align-items:start !important; gap:6px !important;
@@ -34942,74 +34983,6 @@
                 [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_TARGET_FILTER_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_TARGET_STATUS_ATTR}="1"] {
                     grid-column:1 / -1; max-width:none !important; min-width:0;
                     overflow:hidden; text-align:right; font-size:10px !important;
-                }
-
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] {
-                    display:block !important; width:100% !important; min-width:0 !important; max-width:100% !important;
-                    overflow:visible !important; border-collapse:separate !important; border-spacing:0 !important;
-                    background:transparent !important;
-                }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] thead { display:none !important; }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody {
-                    display:grid !important; grid-template-columns:minmax(0,1fr); gap:7px;
-                    width:100% !important; min-width:0 !important;
-                }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr {
-                    display:grid !important;
-                    grid-template-columns:minmax(0,1fr) minmax(0,.78fr) minmax(58px,.72fr);
-                    grid-template-areas:
-                        "side status status"
-                        "progress price price"
-                        "claims link action";
-                    align-items:center; gap:5px 7px; width:100% !important; min-width:0 !important;
-                    margin:0 !important; padding:8px !important; box-sizing:border-box;
-                    border:1px solid rgba(102,123,186,.30); border-radius:6px;
-                    background:rgba(24,29,45,.88) !important;
-                }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}] {
-                    display:flex !important; flex-direction:column; justify-content:center; align-items:flex-start;
-                    min-width:0; max-width:100%; padding:0 !important; margin:0 !important;
-                    background:transparent !important; border:0 !important; color:inherit; text-align:left !important;
-                    font-size:12px; line-height:17px; font-variant-numeric:tabular-nums;
-                }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}][${MOONCAKE_MY_LISTINGS_CELL_EMPTY_ATTR}="1"] {
-                    display:none !important;
-                }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}]::before {
-                    content:attr(${MOONCAKE_MY_LISTINGS_CELL_LABEL_ATTR}); display:block; margin:0 0 1px;
-                    color:rgba(186,199,235,.66); font-size:9px; font-weight:800; line-height:12px;
-                }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="side"] { grid-area:side; }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="status"] {
-                    grid-area:status; align-items:flex-end; text-align:right !important;
-                }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="progress"] {
-                    grid-area:progress; flex-direction:row; align-items:center; gap:6px; min-height:36px;
-                }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="progress"]::before { display:none; }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="progress"] svg {
-                    width:34px !important; height:34px !important; flex:0 0 auto;
-                }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="price"] {
-                    grid-area:price; align-items:flex-end; text-align:right !important;
-                    color:#ffe084; font-size:15px; font-weight:900; line-height:19px;
-                }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="claims"] { grid-area:claims; }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="link"] { grid-area:link; }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="action"] { grid-area:action; }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="claims"],
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="link"],
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="action"] {
-                    align-items:stretch;
-                }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="claims"]::before,
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="link"]::before,
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}="action"]::before {
-                    display:none;
-                }
-                [${MOONCAKE_MY_LISTINGS_TABLE_ATTR}="1"] tbody tr > [${MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR}] button {
-                    width:100% !important; min-width:0 !important; min-height:30px; padding:3px 5px !important;
-                    box-sizing:border-box; white-space:nowrap; font-size:11px !important;
                 }
             }
         `;
