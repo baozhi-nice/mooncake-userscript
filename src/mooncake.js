@@ -486,6 +486,7 @@
             marketListingAgeUpload: true,
             enhancementInventoryWarehouse: true,
             lazyEnhancement: true,
+            actionQueueQuickOrder: true,
             chatLabor: true,
             chatLaborFormat: 'hourly',
             chatLaborExpectedHourlyM: 15,
@@ -943,6 +944,581 @@
         documentMutationSubscribers.set(name, callback);
         ensureDocumentMutationObserver();
         return () => documentMutationSubscribers.delete(name);
+    }
+
+    // ======================
+    // 行动队列：设为下一次
+    // ======================
+    // 收藏插件已经提供同一套操作时，以它的控件为准。月饼只在收藏插件
+    // 未向当前队列注入按钮时工作，避免双开后出现两个“设为下一次”按钮。
+    const MOONCAKE_ACTION_QUEUE_ROOT_SELECTOR = '[class*="QueuedActions_queuedActionsEditMenu"]';
+    const MOONCAKE_ACTION_QUEUE_ROW_SELECTOR = '[class*="QueuedActions_action__"][data-action-id]';
+    const MOONCAKE_ACTION_QUEUE_NEXT_ATTR = 'data-mooncake-action-queue-next';
+    const MOONCAKE_FAVORITES_ACTION_QUEUE_NEXT_ATTR = 'data-mwc-action-queue-next';
+    const MOONCAKE_ACTION_QUEUE_PAGE_COMMAND_ATTR = 'data-mooncake-action-queue-page-command';
+    const MOONCAKE_ACTION_QUEUE_PAGE_CURRENT_ID_ATTR = 'data-mooncake-action-queue-page-current-id';
+    const MOONCAKE_ACTION_QUEUE_PAGE_PENDING_IDS_ATTR = 'data-mooncake-action-queue-page-pending-ids';
+    const MOONCAKE_ACTION_QUEUE_PAGE_TARGET_ID_ATTR = 'data-mooncake-action-queue-page-target-id';
+    const MOONCAKE_ACTION_QUEUE_PAGE_RESULT_ATTR = 'data-mooncake-action-queue-page-result';
+    const MOONCAKE_ACTION_QUEUE_MOVE_TIMEOUT_MS = 3000;
+    const MOONCAKE_ACTION_QUEUE_BRIDGE_ERRORS = new Set([
+        'current-action-advanced',
+        'native-move-handler-contract-changed',
+        'native-move-handler-failed',
+        'queue-action-identity-ambiguous',
+        'queue-dom-order-ambiguous',
+        'queue-owner-ambiguous',
+        'queue-page-bridge-unavailable',
+        'queue-root-ambiguous',
+        'queue-root-missing',
+        'queue-order-drift',
+        'target-disappeared'
+    ]);
+    let mooncakeActionQueueQuickOrderUnsubscribe = null;
+    let mooncakeActionQueueQuickOrderFrame = 0;
+    let mooncakeActionQueueQuickOrderStartTimer = 0;
+    let mooncakeActionQueueQuickOrderPendingMove = null;
+    let mooncakeActionQueueQuickOrderMoveId = 0;
+
+    function mooncakeIsActionQueueQuickOrderEnabled() {
+        return config.features?.actionQueueQuickOrder !== false;
+    }
+
+    function mooncakeSetActionQueueQuickOrderEnabled(value) {
+        const enabled = value !== false;
+        if (!config.features) config.features = {};
+        config.features.actionQueueQuickOrder = enabled;
+        saveConfig();
+        if (enabled) mooncakeStartActionQueueQuickOrder();
+        else mooncakeStopActionQueueQuickOrder();
+        try { mooncakeRefreshEnhancementSettingsPanel(); } catch (_) {}
+    }
+
+    function mooncakeActionQueueHasFavoritesControls() {
+        return !!document.querySelector(`button[${MOONCAKE_FAVORITES_ACTION_QUEUE_NEXT_ATTR}]`);
+    }
+
+    function mooncakeActionQueueIsPositiveId(value) {
+        return Number.isSafeInteger(value) && value > 0;
+    }
+
+    function mooncakeActionQueueSameIds(left, right) {
+        return Array.isArray(left) && Array.isArray(right) &&
+            left.length === right.length && left.every((value, index) => value === right[index]);
+    }
+
+    function mooncakeActionQueueMoveIdToFront(ids, targetId) {
+        const index = ids.indexOf(targetId);
+        if (index < 0) return null;
+        if (index === 0) return [...ids];
+        return [targetId, ...ids.slice(0, index), ...ids.slice(index + 1)];
+    }
+
+    function mooncakeActionQueueNormalizeBridgeError(error) {
+        return typeof error === 'string' && MOONCAKE_ACTION_QUEUE_BRIDGE_ERRORS.has(error)
+            ? error
+            : 'queue-page-bridge-unavailable';
+    }
+
+    function mooncakeActionQueueFailureMessage(error) {
+        switch (error) {
+            case 'current-action-advanced':
+                return isZH ? '当前行动已推进，未调整队列' : 'The current action advanced; queue unchanged.';
+            case 'queue-order-drift':
+                return isZH ? '队列顺序已变化，未调整队列' : 'The queue order changed; queue unchanged.';
+            case 'target-disappeared':
+                return isZH ? '目标行动已离开队列' : 'The target action left the queue.';
+            case 'queue-move-confirm-timeout':
+                return isZH ? '队列调整等待超时' : 'Timed out waiting for the queue move.';
+            case 'native-move-handler-contract-changed':
+            case 'native-move-handler-failed':
+                return isZH ? '游戏队列接口已变化，未调整队列' : 'The game queue interface changed; queue unchanged.';
+            default:
+                return isZH ? '无法读取当前行动队列，请重新打开队列面板' : 'Could not read the action queue. Reopen the queue panel.';
+        }
+    }
+
+    function mooncakeActionQueueReportFailure(error) {
+        console.warn('[MoonCake] 设为下一次行动失败:', mooncakeActionQueueFailureMessage(error));
+    }
+
+    // The game React owner is intentionally read in page context. The bridge
+    // validates the visible queue against React's pending action IDs before it
+    // calls the native move handler, so a stale queue cannot be reordered.
+    function mooncakeActionQueuePageBridge() {
+        'use strict';
+
+        const commandAttribute = 'data-mooncake-action-queue-page-command';
+        const currentIdAttribute = 'data-mooncake-action-queue-page-current-id';
+        const pendingIdsAttribute = 'data-mooncake-action-queue-page-pending-ids';
+        const targetIdAttribute = 'data-mooncake-action-queue-page-target-id';
+        const resultAttribute = 'data-mooncake-action-queue-page-result';
+        const rootSelector = '[class*="QueuedActions_queuedActionsEditMenu"]';
+        const rowSelector = '[class*="QueuedActions_action__"][data-action-id]';
+        const trustedMoveHandlerPattern = /^\(\s*([A-Za-z_$][\w$]*)\s*,\s*([A-Za-z_$][\w$]*)\s*\)\s*=>\s*\{\s*[A-Za-z_$][\w$]*\.sendMoveCharacterAction\(\s*\1\s*,\s*\2\s*\)\s*;?\s*\}$/;
+        const request = document.currentScript;
+
+        const finish = result => {
+            if (request) request.setAttribute(resultAttribute, JSON.stringify(result));
+        };
+        const objectOrNull = value => value && typeof value === 'object' ? value : null;
+        const actionId = action => {
+            const value = Number(action?.id ?? action?.characterActionId ?? action?.actionId);
+            return Number.isSafeInteger(value) && value > 0 ? value : null;
+        };
+        const sameIds = (left, right) =>
+            left.length === right.length && left.every((value, index) => value === right[index]);
+
+        const readState = () => {
+            try {
+                const roots = Array.from(document.querySelectorAll(rootSelector))
+                    .filter(root => root?.isConnected !== false);
+                if (roots.length !== 1) {
+                    return { ok: false, error: roots.length ? 'queue-root-ambiguous' : 'queue-root-missing' };
+                }
+
+                const root = roots[0];
+                const fiberKey = Reflect.ownKeys(root).find(name =>
+                    typeof name === 'string' &&
+                    (name.startsWith('__reactFiber$') || name.startsWith('__reactInternalInstance$'))
+                );
+                let fiber = fiberKey ? objectOrNull(root[fiberKey]) : null;
+                const owners = new Set();
+                for (let depth = 0; fiber && depth < 48; depth += 1) {
+                    const instance = objectOrNull(fiber.stateNode);
+                    const props = objectOrNull(instance?.props);
+                    if (
+                        instance && props && Array.isArray(props.characterActions) &&
+                        typeof props.moveCharacterActionHandler === 'function' &&
+                        typeof instance.moveCharacterActionToFrontClicked === 'function' &&
+                        typeof instance.commitActionMove === 'function' &&
+                        typeof instance.getPendingActions === 'function'
+                    ) {
+                        owners.add(instance);
+                    }
+                    fiber = objectOrNull(fiber.return);
+                }
+                if (owners.size !== 1) return { ok: false, error: 'queue-owner-ambiguous' };
+
+                const owner = Array.from(owners)[0];
+                const handler = owner.props.moveCharacterActionHandler;
+                if (!trustedMoveHandlerPattern.test(Function.prototype.toString.call(handler))) {
+                    return { ok: false, error: 'native-move-handler-contract-changed' };
+                }
+
+                const actions = owner.props.characterActions;
+                const ids = actions.map(actionId);
+                if (ids.length < 1 || ids.some(id => id === null) || new Set(ids).size !== ids.length) {
+                    return { ok: false, error: 'queue-action-identity-ambiguous' };
+                }
+                const currentId = ids[0];
+                const pendingIds = actions.slice(1).filter(action => !action?.partyID).map(actionId);
+                if (pendingIds.some(id => id === null)) {
+                    return { ok: false, error: 'queue-action-identity-ambiguous' };
+                }
+
+                const rows = Array.from(root.querySelectorAll(rowSelector))
+                    .filter(row => row.closest?.(rootSelector) === root);
+                const rowIds = rows.map(row => {
+                    const value = Number(row.getAttribute('data-action-id'));
+                    return Number.isSafeInteger(value) && value > 0 ? value : null;
+                });
+                if (
+                    rowIds.length !== pendingIds.length || rowIds.some(id => id === null) ||
+                    new Set(rowIds).size !== rowIds.length || !sameIds(rowIds, pendingIds)
+                ) {
+                    return { ok: false, error: 'queue-dom-order-ambiguous' };
+                }
+                return { ok: true, currentId, pendingIds, handler, owner };
+            } catch (_) {
+                return { ok: false, error: 'queue-page-bridge-unavailable' };
+            }
+        };
+
+        if (!request) return;
+        const state = readState();
+        if (!state.ok) {
+            finish(state);
+            return;
+        }
+        const command = request.getAttribute(commandAttribute) || '';
+        if (command === 'read') {
+            finish({ ok: true, snapshot: { currentId: state.currentId, pendingIds: state.pendingIds } });
+            return;
+        }
+        if (command !== 'move') {
+            finish({ ok: false, error: 'queue-page-bridge-unavailable' });
+            return;
+        }
+
+        const expectedCurrentId = Number(request.getAttribute(currentIdAttribute));
+        const targetId = Number(request.getAttribute(targetIdAttribute));
+        let expectedPendingIds;
+        try {
+            expectedPendingIds = JSON.parse(request.getAttribute(pendingIdsAttribute) || '');
+        } catch (_) {
+            finish({ ok: false, error: 'queue-page-bridge-unavailable' });
+            return;
+        }
+        if (
+            !Number.isSafeInteger(expectedCurrentId) || expectedCurrentId <= 0 ||
+            !Number.isSafeInteger(targetId) || targetId <= 0 ||
+            !Array.isArray(expectedPendingIds) ||
+            expectedPendingIds.some(id => !Number.isSafeInteger(id) || id <= 0) ||
+            new Set(expectedPendingIds).size !== expectedPendingIds.length
+        ) {
+            finish({ ok: false, error: 'queue-page-bridge-unavailable' });
+            return;
+        }
+        if (state.currentId !== expectedCurrentId) {
+            finish({ ok: false, error: 'current-action-advanced' });
+            return;
+        }
+        if (!sameIds(state.pendingIds, expectedPendingIds)) {
+            finish({ ok: false, error: state.pendingIds.includes(targetId) ? 'queue-order-drift' : 'target-disappeared' });
+            return;
+        }
+        const targetIndex = state.pendingIds.indexOf(targetId);
+        if (targetIndex < 0) {
+            finish({ ok: false, error: 'target-disappeared' });
+            return;
+        }
+        if (targetIndex === 0) {
+            finish({ ok: false, error: 'queue-order-drift' });
+            return;
+        }
+        try {
+            Reflect.apply(state.handler, state.owner, [targetId, 0]);
+            finish({ ok: true, submitted: true });
+        } catch (_) {
+            finish({ ok: false, error: 'native-move-handler-failed' });
+        }
+    }
+
+    function mooncakeActionQueueRunPageBridge(attributes) {
+        const host = document.head || document.documentElement || document.body;
+        if (!host) return { ok: false, error: 'queue-page-bridge-unavailable' };
+        const script = document.createElement('script');
+        Object.entries(attributes).forEach(([key, value]) => script.setAttribute(key, value));
+        script.textContent = `(${mooncakeActionQueuePageBridge.toString()})();`;
+        let rawResult = '';
+        try {
+            host.appendChild(script);
+            rawResult = script.getAttribute(MOONCAKE_ACTION_QUEUE_PAGE_RESULT_ATTR) || '';
+        } catch (_) {
+            return { ok: false, error: 'queue-page-bridge-unavailable' };
+        } finally {
+            script.remove();
+        }
+        try {
+            return rawResult ? JSON.parse(rawResult) : { ok: false, error: 'queue-page-bridge-unavailable' };
+        } catch (_) {
+            return { ok: false, error: 'queue-page-bridge-unavailable' };
+        }
+    }
+
+    function mooncakeActionQueueReadSnapshot() {
+        const result = mooncakeActionQueueRunPageBridge({ [MOONCAKE_ACTION_QUEUE_PAGE_COMMAND_ATTR]: 'read' });
+        const snapshot = result?.snapshot;
+        if (
+            result?.ok !== true || !snapshot || !mooncakeActionQueueIsPositiveId(snapshot.currentId) ||
+            !Array.isArray(snapshot.pendingIds) ||
+            snapshot.pendingIds.some(id => !mooncakeActionQueueIsPositiveId(id)) ||
+            new Set(snapshot.pendingIds).size !== snapshot.pendingIds.length
+        ) {
+            return { ok: false, error: mooncakeActionQueueNormalizeBridgeError(result?.error) };
+        }
+        return { ok: true, snapshot: { currentId: snapshot.currentId, pendingIds: [...snapshot.pendingIds] } };
+    }
+
+    function mooncakeActionQueueMovePageAction(expected, targetId) {
+        const result = mooncakeActionQueueRunPageBridge({
+            [MOONCAKE_ACTION_QUEUE_PAGE_COMMAND_ATTR]: 'move',
+            [MOONCAKE_ACTION_QUEUE_PAGE_CURRENT_ID_ATTR]: String(expected.currentId),
+            [MOONCAKE_ACTION_QUEUE_PAGE_PENDING_IDS_ATTR]: JSON.stringify(expected.pendingIds),
+            [MOONCAKE_ACTION_QUEUE_PAGE_TARGET_ID_ATTR]: String(targetId)
+        });
+        return result?.ok === true && result?.submitted === true
+            ? { ok: true }
+            : { ok: false, error: mooncakeActionQueueNormalizeBridgeError(result?.error) };
+    }
+
+    function mooncakeActionQueueGetNativeTopControl(row) {
+        const candidates = Array.from(row.querySelectorAll('button')).filter(button =>
+            !button.hasAttribute(MOONCAKE_ACTION_QUEUE_NEXT_ATTR) &&
+            !button.hasAttribute(MOONCAKE_FAVORITES_ACTION_QUEUE_NEXT_ATTR) &&
+            button.querySelector('svg[aria-label="top"]') !== null
+        );
+        if (candidates.length !== 1) return null;
+        const button = candidates[0];
+        const icon = button.querySelector('svg[aria-label="top"]');
+        return icon ? { button, icon } : null;
+    }
+
+    function mooncakeActionQueueInspect() {
+        if (mooncakeActionQueueHasFavoritesControls()) return { ok: false, error: 'favorites-plugin-active' };
+        const roots = Array.from(document.querySelectorAll(MOONCAKE_ACTION_QUEUE_ROOT_SELECTOR))
+            .filter(root => root.isConnected !== false);
+        if (roots.length !== 1) {
+            return { ok: false, error: roots.length ? 'queue-root-ambiguous' : 'queue-root-missing' };
+        }
+        const state = mooncakeActionQueueReadSnapshot();
+        if (!state.ok) return state;
+        const root = roots[0];
+        const rows = Array.from(root.querySelectorAll(MOONCAKE_ACTION_QUEUE_ROW_SELECTOR))
+            .filter(row => row.closest(MOONCAKE_ACTION_QUEUE_ROOT_SELECTOR) === root);
+        const rowIds = rows.map(row => {
+            const id = Number(row.getAttribute('data-action-id'));
+            return mooncakeActionQueueIsPositiveId(id) ? id : null;
+        });
+        if (
+            rowIds.length !== state.snapshot.pendingIds.length || rowIds.some(id => id === null) ||
+            new Set(rowIds).size !== rowIds.length || !mooncakeActionQueueSameIds(rowIds, state.snapshot.pendingIds)
+        ) {
+            return { ok: false, error: 'queue-dom-order-ambiguous' };
+        }
+        const queueRows = [];
+        for (let index = 0; index < rows.length; index += 1) {
+            const nativeTop = mooncakeActionQueueGetNativeTopControl(rows[index]);
+            if (!nativeTop) return { ok: false, error: 'queue-native-controls-ambiguous' };
+            queueRows.push({ actionId: rowIds[index], element: rows[index], nativeTop: nativeTop.button, nativeIcon: nativeTop.icon });
+        }
+        return { ok: true, state: { ...state.snapshot, root, rows: queueRows } };
+    }
+
+    function mooncakeActionQueueCreateNextIcon(nativeIcon) {
+        const svg = nativeIcon.cloneNode(false);
+        svg.setAttribute('aria-label', 'next');
+        svg.setAttribute('viewBox', '0 0 20 20');
+        svg.removeAttribute('fill');
+        const namespace = 'http://www.w3.org/2000/svg';
+        const arrow = document.createElementNS(namespace, 'path');
+        arrow.setAttribute('d', 'M10 9 0 19h20L10 9Z');
+        arrow.setAttribute('fill', '#FEFEFE');
+        const firstLine = document.createElementNS(namespace, 'path');
+        firstLine.setAttribute('d', 'M0 1.5h20');
+        firstLine.setAttribute('stroke', '#FEFEFE');
+        firstLine.setAttribute('stroke-width', '3');
+        firstLine.setAttribute('stroke-linecap', 'butt');
+        const secondLine = document.createElementNS(namespace, 'path');
+        secondLine.setAttribute('d', 'M0 5.5h20');
+        secondLine.setAttribute('stroke', '#FEFEFE');
+        secondLine.setAttribute('stroke-width', '3');
+        secondLine.setAttribute('stroke-linecap', 'butt');
+        svg.replaceChildren(arrow, firstLine, secondLine);
+        return svg;
+    }
+
+    function mooncakeActionQueueRemoveOwnedControls() {
+        document.querySelectorAll(`button[${MOONCAKE_ACTION_QUEUE_NEXT_ATTR}]`).forEach(button => button.remove());
+    }
+
+    function mooncakeActionQueueCancelPendingMove() {
+        if (mooncakeActionQueueQuickOrderPendingMove?.timer) clearTimeout(mooncakeActionQueueQuickOrderPendingMove.timer);
+        mooncakeActionQueueQuickOrderPendingMove = null;
+    }
+
+    function mooncakeActionQueueReconcilePendingMove(state) {
+        const pending = mooncakeActionQueueQuickOrderPendingMove;
+        if (!pending) return;
+        if (state.currentId === pending.targetId) {
+            mooncakeActionQueueCancelPendingMove();
+            return;
+        }
+        if (state.currentId !== pending.currentId) {
+            mooncakeActionQueueCancelPendingMove();
+            mooncakeActionQueueReportFailure('current-action-advanced');
+            return;
+        }
+        if (!state.pendingIds.includes(pending.targetId)) {
+            mooncakeActionQueueCancelPendingMove();
+            mooncakeActionQueueReportFailure('target-disappeared');
+            return;
+        }
+        if (mooncakeActionQueueSameIds(state.pendingIds, pending.pendingIds)) return;
+        const expected = mooncakeActionQueueMoveIdToFront(pending.pendingIds, pending.targetId);
+        if (expected && mooncakeActionQueueSameIds(state.pendingIds, expected)) {
+            mooncakeActionQueueCancelPendingMove();
+        } else {
+            mooncakeActionQueueCancelPendingMove();
+            mooncakeActionQueueReportFailure('queue-order-drift');
+        }
+    }
+
+    function mooncakeActionQueueRender(state) {
+        for (let index = 0; index < state.rows.length; index += 1) {
+            const row = state.rows[index];
+            const existing = Array.from(row.element.querySelectorAll(`button[${MOONCAKE_ACTION_QUEUE_NEXT_ATTR}]`));
+            const button = existing.shift() || document.createElement('button');
+            existing.forEach(extra => extra.remove());
+            const disabled = index === 0 || mooncakeActionQueueQuickOrderPendingMove !== null;
+            const title = mooncakeActionQueueQuickOrderPendingMove
+                ? (isZH ? '正在调整队列' : 'Adjusting queue')
+                : index === 0
+                    ? (isZH ? '已经是下一个行动' : 'Already the next action')
+                    : (isZH ? '设为下一次行动' : 'Set as next action');
+            const renderKey = `${row.actionId}|${disabled ? '1' : '0'}|${row.nativeTop.className}`;
+            button.type = 'button';
+            button.className = row.nativeTop.className;
+            button.setAttribute(MOONCAKE_ACTION_QUEUE_NEXT_ATTR, String(row.actionId));
+            button.setAttribute('aria-label', title);
+            button.title = title;
+            button.disabled = disabled;
+            if (button.dataset.mooncakeActionQueueRenderKey !== renderKey) {
+                button.dataset.mooncakeActionQueueRenderKey = renderKey;
+                button.replaceChildren(mooncakeActionQueueCreateNextIcon(row.nativeIcon));
+            }
+            if (button.parentElement !== row.element || button.previousElementSibling !== row.nativeTop) {
+                row.nativeTop.insertAdjacentElement('afterend', button);
+            }
+        }
+        document.querySelectorAll(`button[${MOONCAKE_ACTION_QUEUE_NEXT_ATTR}]`).forEach(button => {
+            if (!state.root.contains(button)) button.remove();
+        });
+    }
+
+    function mooncakeActionQueueSyncNow() {
+        mooncakeActionQueueQuickOrderFrame = 0;
+        if (!mooncakeIsActionQueueQuickOrderEnabled()) {
+            mooncakeActionQueueCancelPendingMove();
+            mooncakeActionQueueRemoveOwnedControls();
+            return;
+        }
+        if (mooncakeActionQueueHasFavoritesControls()) {
+            mooncakeActionQueueCancelPendingMove();
+            mooncakeActionQueueRemoveOwnedControls();
+            return;
+        }
+        const inspection = mooncakeActionQueueInspect();
+        if (!inspection.ok) {
+            mooncakeActionQueueRemoveOwnedControls();
+            return;
+        }
+        mooncakeActionQueueReconcilePendingMove(inspection.state);
+        if (mooncakeActionQueueHasFavoritesControls()) {
+            mooncakeActionQueueRemoveOwnedControls();
+            return;
+        }
+        mooncakeActionQueueRender(inspection.state);
+    }
+
+    function mooncakeScheduleActionQueueQuickOrder() {
+        if (!mooncakeActionQueueQuickOrderUnsubscribe || mooncakeActionQueueQuickOrderFrame) return;
+        mooncakeActionQueueQuickOrderFrame = requestAnimationFrame(mooncakeActionQueueSyncNow);
+    }
+
+    function mooncakeActionQueueBeginPendingMove(state, targetId) {
+        const id = ++mooncakeActionQueueQuickOrderMoveId;
+        const pending = {
+            id,
+            currentId: state.currentId,
+            pendingIds: [...state.pendingIds],
+            targetId,
+            timer: 0
+        };
+        pending.timer = setTimeout(() => {
+            if (!mooncakeActionQueueQuickOrderPendingMove || mooncakeActionQueueQuickOrderPendingMove.id !== id) return;
+            mooncakeActionQueueCancelPendingMove();
+            mooncakeActionQueueReportFailure('queue-move-confirm-timeout');
+            mooncakeScheduleActionQueueQuickOrder();
+        }, MOONCAKE_ACTION_QUEUE_MOVE_TIMEOUT_MS);
+        mooncakeActionQueueQuickOrderPendingMove = pending;
+    }
+
+    function mooncakeActionQueueMoveToNext(targetId) {
+        if (mooncakeActionQueueQuickOrderPendingMove || mooncakeActionQueueHasFavoritesControls()) return;
+        const inspection = mooncakeActionQueueInspect();
+        if (!inspection.ok) {
+            if (inspection.error !== 'favorites-plugin-active') mooncakeActionQueueReportFailure(inspection.error);
+            mooncakeScheduleActionQueueQuickOrder();
+            return;
+        }
+        const state = inspection.state;
+        if (state.pendingIds.indexOf(targetId) <= 0) {
+            mooncakeScheduleActionQueueQuickOrder();
+            return;
+        }
+        const result = mooncakeActionQueueMovePageAction(state, targetId);
+        if (!result.ok) {
+            mooncakeActionQueueReportFailure(result.error);
+            mooncakeScheduleActionQueueQuickOrder();
+            return;
+        }
+        mooncakeActionQueueBeginPendingMove(state, targetId);
+        mooncakeActionQueueRender(state);
+        mooncakeScheduleActionQueueQuickOrder();
+    }
+
+    function mooncakeActionQueueHandleClick(event) {
+        if (!mooncakeIsActionQueueQuickOrderEnabled() || mooncakeActionQueueHasFavoritesControls()) return;
+        if (!(event.target instanceof Element) || event.isTrusted !== true) return;
+        if (navigator.userActivation && navigator.userActivation.isActive !== true) return;
+        const button = event.target.closest(`button[${MOONCAKE_ACTION_QUEUE_NEXT_ATTR}]`);
+        if (!button || button.disabled || !document.contains(button)) return;
+        const targetId = Number(button.getAttribute(MOONCAKE_ACTION_QUEUE_NEXT_ATTR));
+        const row = button.closest(MOONCAKE_ACTION_QUEUE_ROW_SELECTOR);
+        if (!mooncakeActionQueueIsPositiveId(targetId) || !row || Number(row.getAttribute('data-action-id')) !== targetId) return;
+        event.preventDefault();
+        event.stopPropagation();
+        mooncakeActionQueueMoveToNext(targetId);
+    }
+
+    function mooncakeActionQueueNodeTouchesQueue(node) {
+        return node instanceof Element && (
+            node.matches(MOONCAKE_ACTION_QUEUE_ROOT_SELECTOR) ||
+            node.matches(MOONCAKE_ACTION_QUEUE_ROW_SELECTOR) ||
+            node.matches(`button[${MOONCAKE_FAVORITES_ACTION_QUEUE_NEXT_ATTR}]`) ||
+            node.closest(MOONCAKE_ACTION_QUEUE_ROOT_SELECTOR) !== null ||
+            node.querySelector?.(`${MOONCAKE_ACTION_QUEUE_ROOT_SELECTOR}, ${MOONCAKE_ACTION_QUEUE_ROW_SELECTOR}, button[${MOONCAKE_FAVORITES_ACTION_QUEUE_NEXT_ATTR}]`) !== null
+        );
+    }
+
+    function mooncakeHandleActionQueueQuickOrderMutations(mutations) {
+        if (!mooncakeIsActionQueueQuickOrderEnabled()) return;
+        for (const mutation of mutations) {
+            if (mutation.type !== 'childList') continue;
+            if (mooncakeActionQueueNodeTouchesQueue(mutation.target) ||
+                [...mutation.addedNodes, ...mutation.removedNodes].some(mooncakeActionQueueNodeTouchesQueue)) {
+                mooncakeScheduleActionQueueQuickOrder();
+                return;
+            }
+        }
+    }
+
+    function mooncakeStartActionQueueQuickOrder() {
+        if (!mooncakeIsActionQueueQuickOrderEnabled()) return;
+        if (!mooncakeActionQueueQuickOrderUnsubscribe) {
+            mooncakeActionQueueQuickOrderUnsubscribe = subscribeDocumentMutations(
+                'action-queue-quick-order',
+                mooncakeHandleActionQueueQuickOrderMutations
+            );
+            document.addEventListener('click', mooncakeActionQueueHandleClick, true);
+        }
+        // Let 收藏插件 render first when both scripts start at the same time.
+        if (!mooncakeActionQueueQuickOrderStartTimer) {
+            mooncakeActionQueueQuickOrderStartTimer = setTimeout(() => {
+                mooncakeActionQueueQuickOrderStartTimer = 0;
+                mooncakeScheduleActionQueueQuickOrder();
+            }, 120);
+        }
+    }
+
+    function mooncakeStopActionQueueQuickOrder() {
+        if (mooncakeActionQueueQuickOrderStartTimer) {
+            clearTimeout(mooncakeActionQueueQuickOrderStartTimer);
+            mooncakeActionQueueQuickOrderStartTimer = 0;
+        }
+        if (mooncakeActionQueueQuickOrderFrame) {
+            cancelAnimationFrame(mooncakeActionQueueQuickOrderFrame);
+            mooncakeActionQueueQuickOrderFrame = 0;
+        }
+        if (mooncakeActionQueueQuickOrderUnsubscribe) {
+            mooncakeActionQueueQuickOrderUnsubscribe();
+            mooncakeActionQueueQuickOrderUnsubscribe = null;
+        }
+        document.removeEventListener('click', mooncakeActionQueueHandleClick, true);
+        mooncakeActionQueueCancelPendingMove();
+        mooncakeActionQueueRemoveOwnedControls();
     }
 
     const MOONCAKE_ENHANCEMENT_LEVEL_STYLE_ID = 'MooncakeEnhancementLevelStyle';
@@ -15041,8 +15617,18 @@
         }
     }
 
+    function mooncakeCancelMobileMarketHistoryDrag(card = null) {
+        const drag = mooncakeMarketHistoryMobileDrag;
+        if (!drag || (card && drag.card !== card)) return;
+        if (drag.frame) cancelAnimationFrame(drag.frame);
+        try { drag.handle?.releasePointerCapture?.(drag.pointerId); } catch (_) {}
+        if (drag.handle?.isConnected) drag.handle.style.cursor = 'grab';
+        mooncakeMarketHistoryMobileDrag = null;
+    }
+
     function mooncakeSetMobileMarketHistoryExpanded(card, expanded) {
         const isExpanded = expanded === true;
+        if (!isExpanded) mooncakeCancelMobileMarketHistoryDrag(card);
         if (card) card.dataset.expanded = isExpanded ? '1' : '0';
         try {
             localStorage.setItem(MOONCAKE_MARKET_HISTORY_MOBILE_EXPANDED_KEY, isExpanded ? '1' : '0');
@@ -15916,7 +16502,7 @@
 
     function mooncakeRemoveMarketHistoryCards(options = {}) {
         if (options.includeFloating) mooncakeMarketHistoryFloatDrag = null;
-        mooncakeMarketHistoryMobileDrag = null;
+        mooncakeCancelMobileMarketHistoryDrag();
         const selector = [
             `#${MOONCAKE_MARKET_HISTORY_CARD_ID}`,
             `#${MOONCAKE_MARKET_HISTORY_MOBILE_ID}`,
@@ -16807,7 +17393,10 @@
             padding: expanded ? '6px 34px 7px 6px' : '0',
             cursor: '',
             touchAction: 'auto',
-            userSelect: 'none'
+            userSelect: 'none',
+            // A collapsed mobile card remains in the DOM as the small "量"
+            // launcher. Its outer box must not swallow taps across this row.
+            pointerEvents: expanded ? 'auto' : 'none'
         });
         const height = expanded
             ? Math.min(176, Math.max(34, card.getBoundingClientRect().height || card.scrollHeight || 0))
@@ -17035,9 +17624,9 @@
     function mooncakeBuildMobileMarketHistoryCollapsedHtml() {
         const toggleTitle = isZH ? '展开交易卡片' : 'Expand trading card';
         const dragTitle = isZH ? '按住拖动交易卡片' : 'Drag trading card';
-        return `<span style="display:flex;width:58px;height:28px;align-items:center;justify-content:center;gap:0;">
-            <button type="button" data-mooncake-history-toggle="1" title="${toggleTitle}" aria-label="${toggleTitle}" style="width:34px;height:28px;padding:0;border:0;background:transparent;color:#eef6ff;font-size:13px;font-weight:900;cursor:pointer;">量</button>
-            <button type="button" data-mooncake-history-mobile-drag-handle="1" title="${dragTitle}" aria-label="${dragTitle}" style="width:24px;height:28px;padding:0;border:0;background:transparent;color:rgba(238,246,255,.72);font-size:15px;font-weight:800;line-height:1;cursor:grab;touch-action:none;">⠿</button>
+        return `<span style="display:flex;width:58px;height:28px;align-items:center;justify-content:center;gap:0;pointer-events:auto;">
+            <button type="button" data-mooncake-history-toggle="1" title="${toggleTitle}" aria-label="${toggleTitle}" style="width:34px;height:28px;padding:0;border:0;background:transparent;color:#eef6ff;font-size:13px;font-weight:900;cursor:pointer;pointer-events:auto;">量</button>
+            <button type="button" data-mooncake-history-mobile-drag-handle="1" title="${dragTitle}" aria-label="${dragTitle}" style="width:24px;height:28px;padding:0;border:0;background:transparent;color:rgba(238,246,255,.72);font-size:15px;font-weight:800;line-height:1;cursor:grab;touch-action:none;pointer-events:auto;">⠿</button>
         </span>`;
     }
 
@@ -36938,6 +37527,7 @@
         startMooncakeInventoryWarehouse();
         hookMooncakeProtectionAssistant();
         mooncakeStartLazyEnhancement();
+        mooncakeStartActionQueueQuickOrder();
         mooncakeStartEnhancementStopReminder();
 
         setTimeout(hookMooncakeMyListingsTargetFilter, 1000);
@@ -37035,6 +37625,7 @@
             case 'protection-assistant': return mooncakeIsProtectionAssistantEnabled();
             case 'inventory-warehouse': return mooncakeIsEnhancementInventoryWarehouseEnabled();
             case 'lazy-enhancement': return mooncakeIsLazyEnhancementEnabled();
+            case 'action-queue-quick-order': return mooncakeIsActionQueueQuickOrderEnabled();
             case 'enhancing-community-buff': return mooncakeIsEnhancingCommunityBuffEnabled();
             case 'enhancement-level-style': return mooncakeIsEnhancementLevelStyleEnabled();
             case 'enhancement-stop-reminder': return mooncakeIsEnhancementStopReminderEnabled();
@@ -37059,6 +37650,7 @@
             case 'protection-assistant': mooncakeSetProtectionAssistantEnabled(enabled); break;
             case 'inventory-warehouse': mooncakeSetEnhancementInventoryWarehouseEnabled(enabled); break;
             case 'lazy-enhancement': mooncakeSetLazyEnhancementEnabled(enabled); break;
+            case 'action-queue-quick-order': mooncakeSetActionQueueQuickOrderEnabled(enabled); break;
             case 'enhancing-community-buff': mooncakeSetEnhancingCommunityBuffEnabled(enabled); break;
             case 'enhancement-level-style': mooncakeSetEnhancementLevelStyleEnabled(enabled); break;
             case 'enhancement-stop-reminder': mooncakeSetEnhancementStopReminderEnabled(enabled); break;
@@ -38684,6 +39276,14 @@
         });
         const lazyEnhancementControl = lazyEnhancementRow.querySelector('[data-mooncake-enhancement-settings-row-control]');
         if (lazyEnhancementControl && lazyEnhancementManagerButton) lazyEnhancementControl.appendChild(lazyEnhancementManagerButton);
+        const actionQueueQuickOrderRow = mooncakeCreateEnhancementSettingsToggle(
+            'action-queue-quick-order',
+            isZH ? '下一次队列' : 'Set next queue action',
+            isZH
+                ? '在行动队列中显示“设为下一次”；收藏插件已提供时自动避让。'
+                : 'Show “set as next” in the action queue. Defers when the Favorites plugin provides it.'
+        );
+        actionQueueQuickOrderRow.setAttribute('data-mooncake-settings-enhance-row', 'queue-next');
         const protectionAssistantRow = mooncakeCreateEnhancementSettingsToggle('protection-assistant', isZH ? '保护助手' : 'Protection assistant', isZH ? '隐藏高风险保护选项。' : 'Hide risky protection options.');
         protectionAssistantRow.setAttribute('data-mooncake-settings-enhance-row', 'protection');
         const inventoryWarehouseRow = mooncakeCreateEnhancementSettingsToggle('inventory-warehouse', isZH ? '背包管理' : 'Inventory management', isZH ? '按用途整理强化背包。' : 'Organize enhancement inventory by use.', '', 'div');
@@ -38792,6 +39392,7 @@
         routeRow.setAttribute('data-mooncake-settings-enhance-row', 'route');
         enhance.rows.append(
             lazyEnhancementRow,
+            actionQueueQuickOrderRow,
             inventoryWarehouseRow,
             routeRow,
             protectionAssistantRow,
