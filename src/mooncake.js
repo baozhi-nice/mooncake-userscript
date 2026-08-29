@@ -15020,6 +15020,12 @@
     const MOONCAKE_LEVEL_BAR_ID = 'MooncakeMarketEnhLevelJumpBar';
     const MOONCAKE_RECIPE_BAR_ID = 'MooncakeMarketRecipeJumpBar';
     const MOONCAKE_STOCK_NAV_BAR_ID = 'MooncakeMarketStockNavigationBar';
+    const MOONCAKE_RECENT_MARKET_NAV_ID = 'MooncakeRecentMarketNavigation';
+    const MOONCAKE_RECENT_MARKET_NAV_STORAGE_KEY = 'Mooncake_recentMarketNavigation_v1';
+    const MOONCAKE_RECENT_MARKET_NAV_LIMIT = 5;
+    const MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS = 'mooncake-recent-market-navigation-host';
+    const MOONCAKE_RECENT_MARKET_NAV_CONTEXT_CLASS = 'mooncake-recent-market-navigation-context';
+    const MOONCAKE_RECENT_MARKET_NAV_STYLE_ID = 'MooncakeRecentMarketNavigationStyles';
     const MOONCAKE_MOBILE_BAR_ID = 'MooncakeMarketMobileJumpBar';
     const MOONCAKE_MOBILE_MENU_ID = 'MooncakeMarketMobileJumpMenu';
     const MOONCAKE_MOBILE_MARKET_HELPER_Z_INDEX = '8';
@@ -15288,8 +15294,8 @@
         const enabled = mooncakeIsMarketJumpHelpersEnabled();
         const label = isZH ? `快捷导航：${enabled ? '开' : '关'}` : `Quick navigation: ${enabled ? 'On' : 'Off'}`;
         const title = isZH
-            ? (enabled ? '关闭强化等级和上下游物品导航' : '开启强化等级和上下游物品导航')
-            : (enabled ? 'Hide level and related item navigation' : 'Show level and related item navigation');
+            ? (enabled ? '关闭强化等级、关联物品与最近访问导航' : '开启强化等级、关联物品与最近访问导航')
+            : (enabled ? 'Hide level, related-item, and recent navigation' : 'Show level, related-item, and recent navigation');
         const levelTitle = isZH
             ? '生活精华跳转到生活装备时默认打开的强化等级'
             : 'Default enhancement level when a skilling essence opens equipment';
@@ -15360,6 +15366,7 @@
         `#${MOONCAKE_LEVEL_BAR_ID}`,
         `#${MOONCAKE_STOCK_NAV_BAR_ID}`,
         `#${MOONCAKE_RECIPE_BAR_ID}`,
+        `#${MOONCAKE_RECENT_MARKET_NAV_ID}`,
         `#${MOONCAKE_MOBILE_BAR_ID}`,
         '#MooncakeMarketHistoryCard',
         '#MooncakeMarketHistoryMobileCard',
@@ -17377,16 +17384,32 @@
         const anchorRect = iconRect && iconRect.width > 0 && iconRect.height > 0 ? iconRect : itemRect;
         const expanded = card.dataset.expanded === '1';
         const viewportWidth = Math.max(1, window.innerWidth - margin * 2);
+        if (expanded) {
+            // The collapsed launcher locks these with !important for mobile
+            // hit testing. Remove that lock before restoring the full card.
+            [
+                'position', 'display', 'width', 'min-width', 'max-width',
+                'height', 'min-height', 'max-height', 'margin', 'padding',
+                'overflow', 'pointer-events'
+            ].forEach(property => card.style.removeProperty(property));
+        }
         const width = expanded
             ? Math.min(Math.max(280, mooncakeGetMobileMarketHistoryCardWidth(card.dataset.itemHrid) + 28), viewportWidth)
             : 60;
+        const collapsedLayout = !expanded;
         Object.assign(card.style, {
             position: 'fixed',
+            display: 'block',
+            flex: 'none',
+            alignSelf: 'auto',
+            margin: '0',
             width: `${width}px`,
+            minWidth: collapsedLayout ? '60px' : '0',
             height: expanded ? 'auto' : '30px',
             minHeight: expanded ? '34px' : '30px',
-            maxWidth: `calc(100vw - ${margin * 2}px)`,
+            maxWidth: collapsedLayout ? '60px' : `calc(100vw - ${margin * 2}px)`,
             maxHeight: expanded ? `min(176px, calc(100vh - ${margin * 2}px))` : '30px',
+            overflow: collapsedLayout ? 'hidden' : '',
             overflowX: 'hidden',
             overflowY: expanded ? 'auto' : 'hidden',
             zIndex: MOONCAKE_MARKET_HISTORY_FLOAT_Z_INDEX,
@@ -17394,10 +17417,29 @@
             cursor: '',
             touchAction: 'auto',
             userSelect: 'none',
-            // A collapsed mobile card remains in the DOM as the small "量"
-            // launcher. Its outer box must not swallow taps across this row.
-            pointerEvents: expanded ? 'auto' : 'none'
+            clipPath: collapsedLayout ? 'inset(0)' : '',
+            contain: collapsedLayout ? 'layout paint' : '',
+            pointerEvents: 'auto'
         });
+        if (collapsedLayout) {
+            // Some mobile browsers keep a previous fixed element's hit region
+            // during a same-frame content replacement. Lock every size axis so
+            // only the visible 60 x 30 launcher can receive the next tap.
+            [
+                ['position', 'fixed'],
+                ['display', 'block'],
+                ['width', '60px'],
+                ['min-width', '60px'],
+                ['max-width', '60px'],
+                ['height', '30px'],
+                ['min-height', '30px'],
+                ['max-height', '30px'],
+                ['margin', '0'],
+                ['padding', '0'],
+                ['overflow', 'hidden'],
+                ['pointer-events', 'auto']
+            ].forEach(([property, value]) => card.style.setProperty(property, value, 'important'));
+        }
         const height = expanded
             ? Math.min(176, Math.max(34, card.getBoundingClientRect().height || card.scrollHeight || 0))
             : 30;
@@ -17426,6 +17468,14 @@
             ? savedTop
             : Math.max(margin, Math.min(expanded ? expandedTop : collapsedTop, window.innerHeight - height - margin));
         mooncakeMoveMobileMarketHistoryCard(card, left, top, { width, height });
+    }
+
+    function mooncakeRenderMobileMarketHistoryLauncher(card, currentItem) {
+        if (!card?.isConnected) return;
+        card.dataset.expanded = '0';
+        card.innerHTML = mooncakeBuildMobileMarketHistoryCollapsedHtml();
+        card.setAttribute('aria-expanded', 'false');
+        mooncakePositionMobileHistoryCard(card, currentItem);
     }
 
     function mooncakeCreateMarketHistoryCardControl(text, title, attribute) {
@@ -17989,9 +18039,7 @@
         }
 
         if (isMobile && card.dataset.expanded !== '1') {
-            card.innerHTML = mooncakeBuildMobileMarketHistoryCollapsedHtml();
-            card.setAttribute('aria-expanded', 'false');
-            mooncakePositionMobileHistoryCard(card, target.currentItem);
+            mooncakeRenderMobileMarketHistoryLauncher(card, target.currentItem);
             return card;
         }
 
@@ -18269,8 +18317,18 @@
             if (toggle) {
                 const card = toggle.closest(`#${MOONCAKE_MARKET_HISTORY_MOBILE_ID}`);
                 if (card) {
-                    mooncakeSetMobileMarketHistoryExpanded(card, card.dataset.expanded !== '1');
+                    const shouldExpand = card.dataset.expanded !== '1';
+                    mooncakeSetMobileMarketHistoryExpanded(card, shouldExpand);
                     const marketTarget = mooncakeGetCurrentMarketHistoryTarget();
+                    if (!shouldExpand) {
+                        // Collapse synchronously before any refresh path can
+                        // await market data. This prevents a stale full card
+                        // from covering the market controls after its X button.
+                        mooncakeRenderMobileMarketHistoryLauncher(card, marketTarget?.currentItem || mooncakeFindCurrentMarketItemNode());
+                        event.preventDefault();
+                        event.stopPropagation();
+                        return;
+                    }
                     const windows = card._mooncakeMarketHistoryWindows;
                     const stateText = card._mooncakeMarketHistoryStateText || '';
                     const canRenderCurrentState = marketTarget
@@ -24427,6 +24485,316 @@
         return svg;
     }
 
+    let mooncakeRecentMarketItemsFallback = [];
+    let mooncakeRecentMarketLastTargetKey = '';
+
+    function mooncakeNormalizeRecentMarketItem(entry) {
+        if (!entry || typeof entry !== 'object') return null;
+        const itemHrid = mooncakeNormalizeEnhanceItemHrid(entry.itemHrid);
+        if (!itemHrid) return null;
+        const parsedLevel = Number.parseInt(entry.level, 10);
+        return {
+            itemHrid,
+            level: Number.isFinite(parsedLevel) ? Math.max(0, Math.min(20, parsedLevel)) : 0
+        };
+    }
+
+    function mooncakeGetRecentMarketItems() {
+        let stored = mooncakeRecentMarketItemsFallback;
+        try {
+            const parsed = JSON.parse(localStorage.getItem(MOONCAKE_RECENT_MARKET_NAV_STORAGE_KEY) || '[]');
+            if (Array.isArray(parsed)) stored = parsed;
+        } catch (_) {}
+
+        const seen = new Set();
+        const items = [];
+        for (const value of Array.isArray(stored) ? stored : []) {
+            const item = mooncakeNormalizeRecentMarketItem(value);
+            if (!item || seen.has(item.itemHrid)) continue;
+            seen.add(item.itemHrid);
+            items.push(item);
+            if (items.length >= MOONCAKE_RECENT_MARKET_NAV_LIMIT) break;
+        }
+        mooncakeRecentMarketItemsFallback = items;
+        return items;
+    }
+
+    function mooncakeSaveRecentMarketItems(items) {
+        const normalized = Array.isArray(items)
+            ? items.map(mooncakeNormalizeRecentMarketItem).filter(Boolean).slice(0, MOONCAKE_RECENT_MARKET_NAV_LIMIT)
+            : [];
+        mooncakeRecentMarketItemsFallback = normalized;
+        try {
+            localStorage.setItem(MOONCAKE_RECENT_MARKET_NAV_STORAGE_KEY, JSON.stringify(normalized));
+        } catch (_) {}
+        return normalized;
+    }
+
+    function mooncakeRememberRecentMarketItem(itemHrid, level = 0) {
+        const item = mooncakeNormalizeRecentMarketItem({ itemHrid, level });
+        if (!item) return mooncakeGetRecentMarketItems();
+        const current = mooncakeGetRecentMarketItems();
+        if (current[0]?.itemHrid === item.itemHrid && current[0]?.level === item.level) return current;
+        return mooncakeSaveRecentMarketItems([
+            item,
+            ...current.filter(entry => entry.itemHrid !== item.itemHrid)
+        ]);
+    }
+
+    function mooncakeGetRecentMarketItemLabel(item) {
+        const name = getItemName(item?.itemHrid) || item?.itemHrid || '';
+        const level = Number(item?.level) || 0;
+        return `${name}${level > 0 ? ` +${level}` : ''}`;
+    }
+
+    function mooncakeEnsureRecentMarketNavigationStyles() {
+        if (document.getElementById(MOONCAKE_RECENT_MARKET_NAV_STYLE_ID)) return;
+        const style = document.createElement('style');
+        style.id = MOONCAKE_RECENT_MARKET_NAV_STYLE_ID;
+        style.textContent = `
+            .${MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS} {
+                display: flex !important;
+                align-items: center !important;
+                gap: 6px !important;
+                width: 100% !important;
+                max-width: none !important;
+                min-width: 0;
+                box-sizing: border-box;
+            }
+            .${MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS} > [class*="Input_inputContainer"] {
+                flex: 0 0 18rem;
+                width: 18rem;
+                min-width: 18rem;
+                max-width: 18rem;
+            }
+            #${MOONCAKE_RECENT_MARKET_NAV_ID} {
+                display: flex !important;
+                align-items: center !important;
+                gap: 5px !important;
+                flex: 0 1 auto !important;
+                min-width: 38px !important;
+                max-width: min(30rem, 100%) !important;
+                height: 36px !important;
+                margin-left: 4px !important;
+                box-sizing: border-box !important;
+            }
+            #${MOONCAKE_RECENT_MARKET_NAV_ID} [role="toolbar"]::-webkit-scrollbar {
+                width: 0;
+                height: 0;
+            }
+            @media (max-width: 800px) {
+                .${MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS} {
+                    flex-wrap: wrap !important;
+                }
+                .${MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS} > [class*="Input_inputContainer"] {
+                    flex: 1 1 100% !important;
+                    width: 100% !important;
+                    min-width: 0 !important;
+                    max-width: none !important;
+                }
+                #${MOONCAKE_RECENT_MARKET_NAV_ID} {
+                    flex: 1 1 100% !important;
+                    max-width: 100% !important;
+                    margin-left: 0 !important;
+                }
+            }
+        `;
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    function mooncakeFindRecentMarketNavigationHost(currentItem = null) {
+        const hasCurrentContext = !!currentItem;
+        const currentPanel = currentItem?.closest?.('[class*="MarketplacePanel_marketplacePanel"]') || null;
+        const currentInModal = mooncakeIsMarketplaceModalDescendant(currentItem);
+        const isSameMarket = element => {
+            if (!hasCurrentContext) return true;
+            if (mooncakeIsMarketplaceModalDescendant(element) !== currentInModal) return false;
+            const panel = element.closest?.('[class*="MarketplacePanel_marketplacePanel"]') || null;
+            return !currentPanel || !panel || panel === currentPanel;
+        };
+        const findHost = selector => {
+            const candidates = Array.from(document.querySelectorAll(selector)).filter(isSameMarket);
+            return candidates.find(element => mooncakeIsVisibleElement(element) && element.getClientRects().length > 0)
+                || candidates.find(mooncakeIsVisibleElement)
+                || candidates[0]
+                || null;
+        };
+        const marketNav = findHost('[class*="MarketplacePanel_marketNavButtonContainer"]');
+        if (marketNav) return { element: marketNav, kind: 'market-nav' };
+        const filter = findHost('[class*="MarketplacePanel_itemFilterContainer"]');
+        return filter ? { element: filter, kind: 'filter' } : null;
+    }
+
+    function mooncakeCreateRecentMarketNavigationButton(item, active) {
+        const button = document.createElement('button');
+        const label = mooncakeGetRecentMarketItemLabel(item);
+        button.type = 'button';
+        button.title = isZH ? `前往市场：${label}` : `Open market: ${label}`;
+        button.setAttribute('aria-label', button.title);
+        mooncakeStyleJumpButton(button, 30);
+        Object.assign(button.style, {
+            position: 'relative',
+            borderColor: active ? 'rgba(88,224,237,.92)' : 'rgba(144,166,235,.55)',
+            background: active ? 'rgba(25,76,88,.9)' : '#282844',
+            boxShadow: active ? '0 0 0 1px rgba(88,224,237,.2), 0 1px 3px rgba(0,0,0,.4)' : '0 1px 2px rgba(0,0,0,.35)'
+        });
+
+        const icon = mooncakeCreateItemIconSvg(item.itemHrid, 24);
+        if (icon) button.appendChild(icon);
+        else button.textContent = '?';
+
+        if (item.level > 0) {
+            const badge = document.createElement('span');
+            badge.textContent = `+${item.level}`;
+            Object.assign(badge.style, {
+                position: 'absolute',
+                right: '1px',
+                bottom: '1px',
+                padding: '0 2px',
+                borderRadius: '3px',
+                background: 'rgba(20,20,34,.9)',
+                color: '#ffd365',
+                fontSize: '8px',
+                fontWeight: '800',
+                lineHeight: '10px',
+                pointerEvents: 'none'
+            });
+            button.appendChild(badge);
+        }
+
+        button.addEventListener('click', async event => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (button.dataset.busy === '1') return;
+            button.dataset.busy = '1';
+            button.disabled = true;
+            try {
+                const opened = await mooncakeOpenMarketplaceForHrid(item.itemHrid, item.level);
+                if (opened) mooncakeRememberRecentMarketItem(item.itemHrid, item.level);
+            } finally {
+                if (button.isConnected) {
+                    button.dataset.busy = '0';
+                    button.disabled = false;
+                }
+            }
+        });
+        return button;
+    }
+
+    function mooncakeRenderRecentMarketNavigation(bar, target) {
+        if (!bar?.isConnected) return;
+        const items = mooncakeGetRecentMarketItems();
+        const activeKey = target ? `${target.itemHrid}:${target.level}` : '';
+        const signature = `${activeKey}|${items.map(item => `${item.itemHrid}:${item.level}`).join('|')}`;
+        if (bar.dataset.signature === signature) return;
+        bar.dataset.signature = signature;
+        bar.replaceChildren();
+
+        const label = document.createElement('span');
+        label.textContent = isZH ? '最近' : 'Recent';
+        label.title = isZH ? '最近访问的市场物品' : 'Recently opened market items';
+        Object.assign(label.style, {
+            flex: '0 0 auto',
+            color: 'rgba(191,207,255,.78)',
+            fontSize: '11px',
+            fontWeight: '700',
+            whiteSpace: 'nowrap'
+        });
+
+        const strip = document.createElement('div');
+        strip.setAttribute('role', 'toolbar');
+        strip.setAttribute('aria-label', isZH ? '最近访问市场物品' : 'Recent market items');
+        Object.assign(strip.style, {
+            display: 'flex',
+            alignItems: 'center',
+            gap: '4px',
+            flex: '1 1 auto',
+            minWidth: '0',
+            overflowX: 'auto',
+            overflowY: 'hidden',
+            scrollbarWidth: 'none',
+            padding: '1px'
+        });
+        items.forEach(item => {
+            strip.appendChild(mooncakeCreateRecentMarketNavigationButton(
+                item,
+                `${item.itemHrid}:${item.level}` === activeKey
+            ));
+        });
+        bar.append(label, strip);
+    }
+
+    function mooncakeEnsureRecentMarketNavigation(currentItem = null, itemHrid = '', level = 0) {
+        const target = mooncakeNormalizeRecentMarketItem({ itemHrid, level });
+        if (target) {
+            const targetKey = `${target.itemHrid}:${target.level}`;
+            if (targetKey !== mooncakeRecentMarketLastTargetKey) {
+                mooncakeRecentMarketLastTargetKey = targetKey;
+                mooncakeRememberRecentMarketItem(target.itemHrid, target.level);
+            }
+        }
+        if (!mooncakeGetRecentMarketItems().length) {
+            document.getElementById(MOONCAKE_RECENT_MARKET_NAV_ID)?.remove();
+            return false;
+        }
+
+        mooncakeEnsureRecentMarketNavigationStyles();
+        const hostInfo = mooncakeFindRecentMarketNavigationHost(currentItem);
+        const host = hostInfo?.element || null;
+        let bar = document.getElementById(MOONCAKE_RECENT_MARKET_NAV_ID);
+        if (!host) {
+            bar?.remove();
+            return false;
+        }
+        if (bar && bar.parentElement !== host) {
+            bar.remove();
+            bar = null;
+        }
+        if (!bar) {
+            bar = document.createElement('div');
+            bar.id = MOONCAKE_RECENT_MARKET_NAV_ID;
+            bar.dataset.mooncakeRecentMarketNavigation = '1';
+            Object.assign(bar.style, {
+                display: 'flex',
+                alignItems: 'center',
+                gap: '5px',
+                flex: '0 1 auto',
+                minWidth: '38px',
+                maxWidth: 'min(30rem, 100%)',
+                height: '36px',
+                padding: '1px',
+                borderLeft: '0',
+                boxSizing: 'border-box',
+                overflow: 'hidden'
+            });
+        }
+        document.querySelectorAll(`.${MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS}`).forEach(candidate => {
+            if (candidate !== host || hostInfo.kind !== 'filter') {
+                candidate.classList.remove(MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS);
+            }
+        });
+        bar.classList.toggle(MOONCAKE_RECENT_MARKET_NAV_CONTEXT_CLASS, hostInfo.kind === 'market-nav');
+        bar.dataset.hostKind = hostInfo.kind;
+        if (hostInfo.kind === 'filter') {
+            host.classList.add(MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS);
+            if (bar.parentElement !== host) host.appendChild(bar);
+        } else if (bar.parentElement !== host) {
+            const collectorBar = host.querySelector(':scope > .mwc-market-quick-links-nav');
+            if (collectorBar) collectorBar.insertAdjacentElement('afterend', bar);
+            else host.appendChild(bar);
+        }
+        mooncakeRenderRecentMarketNavigation(bar, target);
+        return true;
+    }
+
+    function mooncakeRemoveRecentMarketNavigation() {
+        document.querySelectorAll(`#${MOONCAKE_RECENT_MARKET_NAV_ID}`).forEach(bar => bar.remove());
+        document.querySelectorAll(`.${MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS}`).forEach(host => {
+            host.classList.remove(MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS);
+        });
+        mooncakeRecentMarketLastTargetKey = '';
+    }
+
     function mooncakeGetMiscSpriteBase() {
         if (mooncakeMiscSpriteBase) return mooncakeMiscSpriteBase;
         const use = document.querySelector('use[href*="misc_sprite"][href*="#"], use[xlink\\:href*="misc_sprite"][xlink\\:href*="#"]');
@@ -25481,6 +25849,11 @@
     }
 
     function mooncakeRemoveMarketJumpNavigation() {
+        mooncakeRemoveMarketItemJumpNavigation();
+        mooncakeRemoveRecentMarketNavigation();
+    }
+
+    function mooncakeRemoveMarketItemJumpNavigation() {
         document.querySelectorAll(`#${MOONCAKE_LEVEL_BAR_ID}, #${MOONCAKE_STOCK_NAV_BAR_ID}, #${MOONCAKE_RECIPE_BAR_ID}, #${MOONCAKE_MOBILE_BAR_ID}`).forEach(el => el.remove());
         removeMooncakeMarketMobileMenu();
     }
@@ -25635,12 +26008,26 @@
     function ensureMooncakeMarketJumpHelpers() {
         const currentItem = mooncakeFindCurrentMarketItemNode();
         if (!mooncakeShouldShowMarketJumpHelpers(currentItem)) {
-            removeMooncakeMarketJumpBars();
+            mooncakeRemoveMarketItemJumpNavigation();
+            mooncakeRemoveMarketHistoryCards({ includeFloating: true });
+            document.getElementById(MOONCAKE_ORDER_BOOK_ARCHIVE_FLOAT_ID)?.remove();
+            if (mooncakeIsMarketJumpHelpersEnabled() && mooncakeFindRecentMarketNavigationHost()) {
+                mooncakeEnsureRecentMarketNavigation();
+            } else {
+                mooncakeRemoveRecentMarketNavigation();
+            }
             return;
         }
         const itemHrid = mooncakeParseItemHridFromPanel(currentItem);
         if (!itemHrid) {
-            removeMooncakeMarketJumpBars();
+            mooncakeRemoveMarketItemJumpNavigation();
+            mooncakeRemoveMarketHistoryCards({ includeFloating: true });
+            document.getElementById(MOONCAKE_ORDER_BOOK_ARCHIVE_FLOAT_ID)?.remove();
+            if (mooncakeIsMarketJumpHelpersEnabled() && mooncakeFindRecentMarketNavigationHost(currentItem)) {
+                mooncakeEnsureRecentMarketNavigation(currentItem);
+            } else {
+                mooncakeRemoveRecentMarketNavigation();
+            }
             return;
         }
         document.getElementById(MOONCAKE_ORDER_BOOK_ARCHIVE_FLOAT_ID)?.remove();
@@ -25649,6 +26036,11 @@
             scheduleMooncakeMarketHistoryCard(40);
             return;
         }
+        mooncakeEnsureRecentMarketNavigation(
+            currentItem,
+            itemHrid,
+            mooncakeGetCurrentMarketEnhanceLevel(0)
+        );
         if (mooncakeIsPhoneMarketUi()) {
             currentItem.querySelectorAll(`#${MOONCAKE_LEVEL_BAR_ID}, #${MOONCAKE_STOCK_NAV_BAR_ID}, #${MOONCAKE_RECIPE_BAR_ID}`).forEach(el => el.remove());
             ensureMooncakeMarketMobileJumpBar(currentItem, itemHrid);
@@ -33730,8 +34122,8 @@
         const marketJumpEnabled = mooncakeIsMarketJumpHelpersEnabled();
         const marketJumpToggleLabel = isZH ? `快捷导航：${marketJumpEnabled ? '开' : '关'}` : `Quick navigation: ${marketJumpEnabled ? 'On' : 'Off'}`;
         const marketJumpToggleTitle = isZH
-            ? (marketJumpEnabled ? '关闭强化等级和上下游物品导航' : '开启强化等级和上下游物品导航')
-            : (marketJumpEnabled ? 'Hide level and related item navigation' : 'Show level and related item navigation');
+            ? (marketJumpEnabled ? '关闭强化等级、关联物品与最近访问导航' : '开启强化等级、关联物品与最近访问导航')
+            : (marketJumpEnabled ? 'Hide level, related-item, and recent navigation' : 'Show level, related-item, and recent navigation');
         const marketJumpSettingsStyle = marketJumpEnabled
             ? 'border:1px solid rgba(236,202,126,.42);background:rgba(82,67,38,.72);color:rgba(255,239,203,.95);'
             : 'border:1px solid rgba(170,180,198,.28);background:rgba(54,58,68,.58);color:rgba(220,225,233,.72);';
@@ -33740,8 +34132,8 @@
             ? '生活精华跳转到生活装备时默认打开的强化等级'
             : 'Default enhancement level when a skilling essence opens equipment';
         const marketJumpSettingsTitle = isZH
-            ? '快捷导航开关；生活精华跳转到生活装备时默认打开的强化等级'
-            : 'Quick navigation and the default enhancement level for skilling equipment';
+            ? '快捷导航开关；包含强化等级、关联物品和最近访问。生活精华跳转到生活装备时默认打开的强化等级'
+            : 'Quick navigation for levels, related items, and recent visits; set the default level for skilling equipment';
         const materialEquipmentJumpOptions = Array.from({ length: 21 }, (_, level) =>
             `<option value="${level}" ${level === materialEquipmentJumpLevel ? 'selected' : ''}>+${level}</option>`
         ).join('');
@@ -37482,6 +37874,10 @@
                             enhancementLevel: 0
                         };
                         userSelectedEnhancement = false;
+                        // The item-list view does not always mount a current-item
+                        // detail card. Record the click directly so the recent
+                        // navigation is available as soon as the list is revisited.
+                        mooncakeRememberRecentMarketItem(itemHrid, 0);
 
                         const _md = getMarketData();
                         const _root0 = _md?.marketData?.[itemHrid]?.["0"];
@@ -37546,6 +37942,7 @@
 
                         currentMarketItem.enhancementLevel = enhancementLevel;
                         userSelectedEnhancement = true;
+                        mooncakeRememberRecentMarketItem(currentMarketItem.itemHrid, enhancementLevel);
 
                         const _md2 = getMarketData();
                         const _root2 = _md2?.marketData?.[currentMarketItem.itemHrid]?.[enhancementLevel.toString()];
@@ -39236,7 +39633,7 @@
             mooncakeCreateEnhancementSettingsToggle('market-listing-age', isZH ? '挂单时长' : 'Listing age', isZH ? '在订单簿显示挂单已存在时长。' : 'Show listing age in order books.'),
             mooncakeCreateBaseItemCostPricePolicyControl(),
             mooncakeCreateEnhancementSettingsToggle('dungeon-token-listing-guide', isZH ? '地下城代币提示' : 'Dungeon token guide', isZH ? '收购挂牌时标记当前每代币买一最优的地下城兑换物。' : 'Mark dungeon redemptions that currently have the best bid value per token.'),
-            mooncakeCreateEnhancementSettingsToggle('market-jump', isZH ? '快捷导航' : 'Quick navigation', isZH ? '显示等级与上下游入口。' : 'Show level and related-item shortcuts.'),
+            mooncakeCreateEnhancementSettingsToggle('market-jump', isZH ? '快捷导航' : 'Quick navigation', isZH ? '显示等级、关联物品与最近访问入口。' : 'Show level, related-item, and recent-visit shortcuts.'),
             marketLevelJumpSequenceRow,
             jumpLevelRow
         );
