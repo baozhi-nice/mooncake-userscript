@@ -18300,12 +18300,14 @@
                 return;
             }
             if (koukouTrigger) {
+                removeMooncakeMarketMobileMenu();
                 mooncakeOpenMarketKouKouPanel();
                 event.preventDefault();
                 event.stopPropagation();
                 return;
             }
             if (shortageTrigger) {
+                removeMooncakeMarketMobileMenu();
                 mooncakeOpenMarketShortagePanel();
                 event.preventDefault();
                 event.stopPropagation();
@@ -25144,13 +25146,51 @@
     }
 
     function mooncakeCreateMobileMarketHistoryControls() {
-        const { section, body } = mooncakeCreateMobileMenuSection(isZH ? '交易卡片' : 'Trading card');
+        const { section, body } = mooncakeCreateMobileMenuSection(isZH ? '市场工具' : 'Market tools');
         const enabled = mooncakeIsMarketHistoryCardEnabled();
         Object.assign(body.style, {
             display: 'grid',
             gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
             gap: '6px',
             width: '100%'
+        });
+
+        const mobileTools = [
+            {
+                attribute: 'data-mooncake-koukou',
+                label: isZH ? '扣扣小子' : 'Hourly scanner',
+                title: isZH ? '查看扣扣筛选与交易统计' : 'Open hourly scanner and trading statistics',
+                border: 'rgba(92,220,234,.46)',
+                background: 'rgba(26,83,93,.72)',
+                color: 'rgba(220,251,255,.95)'
+            },
+            {
+                attribute: 'data-mooncake-shortage',
+                label: isZH ? '缺货统计' : 'Shortage stats',
+                title: isZH ? '查看缺货材料与装备统计' : 'Open shortage statistics',
+                border: 'rgba(235,166,144,.40)',
+                background: 'rgba(80,48,38,.68)',
+                color: 'rgba(255,232,220,.95)'
+            }
+        ];
+        mobileTools.forEach(tool => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.setAttribute(tool.attribute, '1');
+            button.textContent = tool.label;
+            button.title = tool.title;
+            Object.assign(button.style, {
+                cursor: 'pointer',
+                border: `1px solid ${tool.border}`,
+                background: tool.background,
+                color: tool.color,
+                borderRadius: '7px',
+                minHeight: '32px',
+                padding: '5px 8px',
+                fontSize: '12px',
+                fontWeight: '800'
+            });
+            body.appendChild(button);
         });
 
         const toggle = document.createElement('button');
@@ -34645,6 +34685,41 @@
         });
     }
 
+    function mooncakeGetMyListingsControlHost(root) {
+        return root?.querySelector?.(`[${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"]`) || null;
+    }
+
+    // Keep MoonCake's controls in their own host.  Styling the game's count
+    // row was enough to make some narrow layouts reflow the native table too.
+    function mooncakeEnsureMyListingsControlHost(table, root) {
+        if (!table || !root) return null;
+        const listingCount = root.querySelector('[class*="MarketplacePanel_listingCount"]');
+        const legacyHost = listingCount?.parentElement || null;
+        let host = mooncakeGetMyListingsControlHost(root);
+        if (host === legacyHost) {
+            // Pre-1.6.155 versions marked the game's own count row as the
+            // control host. Remove that marker before installing the isolated
+            // container so a hot update cannot preserve the old reflow.
+            host.removeAttribute(MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR);
+            host = null;
+        }
+        if (host?.isConnected) return host;
+
+        host = document.createElement('div');
+        host.setAttribute(MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR, '1');
+        host.setAttribute('role', 'group');
+        host.setAttribute('aria-label', isZH ? '挂单筛选与扣扣出击' : 'Listing filters and target scan');
+
+        if (listingCount?.parentElement && listingCount.parentElement !== table) {
+            listingCount.after(host);
+        } else if (table.parentElement) {
+            table.before(host);
+        } else {
+            root.insertBefore(host, table);
+        }
+        return host;
+    }
+
     // Only the controls above the table need a phone layout. Keep the game's
     // own listing rows intact so the original detailed order view remains
     // familiar and horizontally scrollable where the game supports it.
@@ -34653,14 +34728,14 @@
         mooncakeRestoreMyListingsNativeTable(table);
         root.removeAttribute(MOONCAKE_MY_LISTINGS_LAYOUT_ATTR);
 
-        const listingCount = root.querySelector('[class*="MarketplacePanel_listingCount"]');
-        const controlHost = listingCount?.parentElement || null;
-        if (controlHost && controlHost !== root) {
-            const hasMooncakeControl = !!controlHost.querySelector(
-                `[${MOONCAKE_MY_LISTINGS_TARGET_FILTER_ATTR}="1"], [data-mooncake-my-listings-management="1"]`
-            );
-            if (hasMooncakeControl) controlHost.setAttribute(MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR, '1');
-        }
+        const controlHost = mooncakeEnsureMyListingsControlHost(table, root);
+        if (!controlHost) return;
+        [
+            root.querySelector(`[${MOONCAKE_MY_LISTINGS_TARGET_FILTER_ATTR}="1"]`),
+            root.querySelector('[data-mooncake-my-listings-management="1"]')
+        ].filter(Boolean).forEach(control => {
+            if (control.parentElement !== controlHost) controlHost.appendChild(control);
+        });
     }
 
     function mooncakeResolveMyListingSideText(value) {
@@ -35493,6 +35568,14 @@
         style.id = MOONCAKE_MY_LISTINGS_MANAGEMENT_STYLE_ID;
         style.textContent = `
             [${MOONCAKE_MY_LISTINGS_MANAGEMENT_HIDDEN_ATTR}="1"] { display:none !important; }
+            [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] {
+                display:inline-flex; align-items:center; flex-wrap:wrap; gap:4px; min-width:0;
+                max-width:100%; margin:0 0 0 8px; padding:0; box-sizing:border-box;
+            }
+            [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"],
+            [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_TARGET_FILTER_ATTR}="1"] {
+                margin:0 !important;
+            }
             [${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"] {
                 display:inline-flex; align-items:center; flex-wrap:wrap; gap:4px; min-width:0;
                 margin:0 0 0 8px; padding:0; box-sizing:border-box;
@@ -35534,13 +35617,6 @@
                     align-items:start !important; gap:6px !important;
                     width:100% !important; min-width:0 !important; max-width:100% !important;
                     margin:0 0 8px !important; padding:0 !important; box-sizing:border-box !important;
-                }
-                [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] [class*="MarketplacePanel_listingCount"] {
-                    grid-column:1 / -1; justify-self:start; min-width:0; max-width:100%;
-                    margin:0 !important; padding:3px 7px !important; box-sizing:border-box;
-                    border:1px solid rgba(129,154,223,.30); border-radius:5px;
-                    background:rgba(28,35,56,.66); color:rgba(230,237,255,.92);
-                    font-size:11px !important; font-weight:800; line-height:17px !important; white-space:nowrap !important;
                 }
                 [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] [${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"] {
                     display:grid !important; grid-column:1 / -1; grid-template-columns:repeat(5,minmax(0,1fr)); gap:4px;
