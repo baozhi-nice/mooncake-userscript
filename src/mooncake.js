@@ -5172,6 +5172,10 @@
                 transition: opacity 0.15s ease;
             }
             .mooncake-tooltip.visible { opacity: 1; }
+            /* Timeline hit targets use SVG pointer-events="all". Once a
+             * tooltip is hidden, that attribute must not leave an invisible
+             * layer above the marketplace tabs on touch devices. */
+            .mooncake-tooltip:not(.visible) * { pointer-events: none !important; }
             .mooncake-tooltip.mooncake-tooltip-pinned { pointer-events: auto; }
             .mooncake-tooltip.mooncake-tooltip-interactive {
                 pointer-events: auto;
@@ -15635,7 +15639,12 @@
 
     function mooncakeSetMobileMarketHistoryExpanded(card, expanded) {
         const isExpanded = expanded === true;
-        if (!isExpanded) mooncakeCancelMobileMarketHistoryDrag(card);
+        if (!isExpanded) {
+            mooncakeCancelMobileMarketHistoryDrag(card);
+            // The mobile toggle handles its click in capture phase and stops it
+            // before the shared tooltip's bubble-phase outside-click closer.
+            hideTooltip();
+        }
         if (card) card.dataset.expanded = isExpanded ? '1' : '0';
         try {
             localStorage.setItem(MOONCAKE_MARKET_HISTORY_MOBILE_EXPANDED_KEY, isExpanded ? '1' : '0');
@@ -24584,17 +24593,17 @@
             }
             @media (max-width: 800px) {
                 .${MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS} {
-                    flex-wrap: wrap !important;
+                    flex-wrap: nowrap !important;
                 }
                 .${MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS} > [class*="Input_inputContainer"] {
-                    flex: 1 1 100% !important;
-                    width: 100% !important;
+                    flex: 1 1 0 !important;
+                    width: auto !important;
                     min-width: 0 !important;
                     max-width: none !important;
                 }
                 #${MOONCAKE_RECENT_MARKET_NAV_ID} {
-                    flex: 1 1 100% !important;
-                    max-width: 100% !important;
+                    flex: 0 1 auto !important;
+                    max-width: calc(100% - 112px) !important;
                     margin-left: 0 !important;
                 }
             }
@@ -24619,9 +24628,14 @@
                 || candidates[0]
                 || null;
         };
+        const filter = findHost('[class*="MarketplacePanel_itemFilterContainer"]');
+        // At the CSS compact breakpoint the filter is the only host that keeps
+        // the item search and recent five-item strip in one usable row.
+        if (filter && (mooncakeIsPhoneMarketUi() || window.matchMedia?.('(max-width: 800px)').matches)) {
+            return { element: filter, kind: 'filter' };
+        }
         const marketNav = findHost('[class*="MarketplacePanel_marketNavButtonContainer"]');
         if (marketNav) return { element: marketNav, kind: 'market-nav' };
-        const filter = findHost('[class*="MarketplacePanel_itemFilterContainer"]');
         return filter ? { element: filter, kind: 'filter' } : null;
     }
 
