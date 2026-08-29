@@ -776,6 +776,27 @@
         }
     }
 
+    function mooncakeIsVirtualConfigFabVisible() {
+        return config.ui?.fabVisible !== false;
+    }
+
+    function mooncakeSetVirtualConfigFabVisible(visible) {
+        const shouldShow = visible !== false;
+        if (!config.ui || typeof config.ui !== 'object') config.ui = {};
+        const changed = config.ui.fabVisible !== shouldShow;
+        config.ui.fabVisible = shouldShow;
+
+        const fab = ui.fab || document.getElementById('better-loot-tracker-fab');
+        if (fab) {
+            fab.style.display = shouldShow ? 'flex' : 'none';
+            if (shouldShow) {
+                requestAnimationFrame(() => fab._mooncakeClampIntoViewport?.());
+            }
+        }
+        if (changed) saveConfig();
+        return shouldShow;
+    }
+
     const MOONCAKE_ENHANCEMENT_SETTINGS_READY_ATTR = 'data-mooncake-enhancement-settings-ready';
     const MOONCAKE_ENHANCEMENT_SETTINGS_TRIGGER_ATTR = 'data-mooncake-enhancement-settings-open';
     const MOONCAKE_ENHANCEMENT_SETTINGS_QR_PREVIEW_ID = 'MooncakeEnhancementSettingsQrPreview';
@@ -821,7 +842,8 @@
         '是谁偷走了我的期望',
         '是谁偷走了我的成功率',
         '你偷走了我的牛生',
-        'XiaoR:20工有什么做得必要吗，可怜的底层强化师没事干了'
+        'XiaoR:20工有什么做得必要吗，可怜的底层强化师没事干了',
+        'IIIIDeepLoopIIII：强化最可贵的不是等级，不是喇叭，是勇气'
 
     ]);
     // Built-in records are an offline fallback. The live acknowledgement list
@@ -2424,7 +2446,9 @@
             try { mooncakeRefreshOrderModalEconomics(); } catch (_) {}
             return;
         }
-        document.querySelectorAll('[data-mooncake-dungeon-token-listing-guide="1"]').forEach(row => row.remove());
+        document.querySelectorAll(
+            '[data-mooncake-dungeon-token-listing-guide="1"], [data-mooncake-dungeon-token-listing-badge="1"]'
+        ).forEach(row => row.remove());
     }
 
     function mooncakeUpdateMarketplaceHourlyWageControls() {
@@ -14554,6 +14578,7 @@
     let currentMarketItem = null;
     let userSelectedEnhancement = false;
     let _enhancementTabRetryTimer = 0;
+    let _enhancementTabNavigationFollowupTimer = 0;
     let _enhancementTabContentRetryTimer = 0;
     let _pendingEnhancementTabContentRetryArgs = null;
     let _marketClickGeneration = 0;
@@ -15028,6 +15053,7 @@
     const MOONCAKE_RECENT_MARKET_NAV_STORAGE_KEY = 'Mooncake_recentMarketNavigation_v1';
     const MOONCAKE_RECENT_MARKET_NAV_LIMIT = 5;
     const MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS = 'mooncake-recent-market-navigation-host';
+    const MOONCAKE_RECENT_MARKET_NAV_MOBILE_ACTION_HOST_CLASS = 'mooncake-recent-market-navigation-mobile-action-host';
     const MOONCAKE_RECENT_MARKET_NAV_CONTEXT_CLASS = 'mooncake-recent-market-navigation-context';
     const MOONCAKE_RECENT_MARKET_NAV_STYLE_ID = 'MooncakeRecentMarketNavigationStyles';
     const MOONCAKE_MOBILE_BAR_ID = 'MooncakeMarketMobileJumpBar';
@@ -19595,6 +19621,78 @@
         return `<span style="color:${color};font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap;">${mooncakeFormatSignedMoney(value)}</span>`;
     }
 
+    function mooncakeBuildKouKouMobileMetricPair(label, firstValue, secondValue) {
+        return `<div style="min-width:0;border:1px solid rgba(92,220,234,.16);background:rgba(255,255,255,.035);border-radius:6px;padding:5px 6px;line-height:1.2;">
+            <span style="display:block;color:rgba(220,251,255,.58);font-size:10px;font-weight:700;white-space:nowrap;">${label}</span>
+            <span style="display:flex;align-items:baseline;justify-content:flex-end;gap:3px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;font-size:11px;margin-top:3px;font-variant-numeric:tabular-nums;">
+                ${firstValue}<span style="color:rgba(230,238,255,.38);font-weight:700;">-</span>${secondValue}
+            </span>
+        </div>`;
+    }
+
+    function mooncakeBuildKouKouMobileHistory(row) {
+        const windows = [1, 3, 7];
+        const valueCell = value => `<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;">${value}</span>`;
+        const metricRow = (label, values) => `<span style="color:rgba(220,251,255,.58);font-size:10px;font-weight:700;white-space:nowrap;">${label}</span>${values.map(valueCell).join('')}`;
+        const volumeSummary = windows.map(day => {
+            const volume = mooncakeFormatCompactNumber(row[`volume${day}`]);
+            const average = Number(row[`avg${day}`]) > 0 ? mooncakeFormatMarketPrice(row[`avg${day}`]) : '-';
+            const hourlyValue = Number(row[`avgHourly${day}`]);
+            const hourly = Number.isFinite(hourlyValue) ? `${mooncakeFormatSignedHourlyWage(hourlyValue)}/h` : '-';
+            const title = `${day}d：数量 ${volume}，交易均价 ${average}，工时 ${hourly}`;
+            return `<span title="${mooncakeEscapeHtml(title)}" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;font-size:9px;font-weight:800;font-variant-numeric:tabular-nums;">
+                <span style="color:rgba(220,251,255,.62);font-weight:900;">${day}d</span> <span style="color:#87CEEB;">${volume}</span><span style="color:rgba(230,238,255,.32);">-</span><span style="color:#B9E6A3;">${average}</span><span style="color:rgba(230,238,255,.32);">-</span><span style="color:${row[`avgHourly${day}Color`] || '#7DFFB3'};">${hourly}</span>
+            </span>`;
+        }).join('');
+        return `<details style="border-top:1px solid rgba(255,255,255,.07);margin-top:7px;padding-top:5px;">
+            <summary style="display:block;cursor:pointer;color:rgba(220,251,255,.76);font-size:10px;font-weight:800;line-height:1.25;">
+                <span style="display:flex;align-items:center;justify-content:space-between;gap:8px;line-height:16px;"><span>1d/3d/7d交易量</span><span style="color:rgba(230,238,255,.45);font-size:9px;white-space:nowrap;">数量-均价-工时</span></span>
+                <span style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;margin-top:2px;">${volumeSummary}</span>
+            </summary>
+            <div style="display:grid;grid-template-columns:36px repeat(3,minmax(0,1fr));gap:4px 6px;padding:5px 0 2px;font-size:10px;font-variant-numeric:tabular-nums;align-items:center;">
+                <span></span>${windows.map(day => `<span style="color:rgba(220,251,255,.7);font-weight:800;text-align:right;">${day} 日</span>`).join('')}
+                ${metricRow('数量', windows.map(day => mooncakeFormatCompactNumber(row[`volume${day}`])))}
+                ${metricRow('均价', windows.map(day => mooncakeFormatBargainPrice(row[`avg${day}`], '#B9E6A3')))}
+                ${metricRow('工时', windows.map(day => mooncakeFormatKouKouHourly(row[`avgHourly${day}`], row[`avgHourly${day}Color`] || '#7DFFB3')))}
+                ${metricRow('总额', windows.map(day => mooncakeFormatMarketPrice(row[`turnover${day}`])))}
+            </div>
+        </details>`;
+    }
+
+    function mooncakeRenderKouKouMobileRows(rows, options = {}) {
+        if (!rows.length) {
+            const message = options.onlyKouKou
+                ? '当前左一暂无达到目标工时费的装备'
+                : '没有符合筛选条件的交易记录';
+            return `<div style="padding:24px 12px;text-align:center;color:rgba(230,238,255,.62);">${message}</div>`;
+        }
+        return rows.map(row => {
+            const displayName = `${getItemName(row.itemHrid)} +${row.level}`;
+            const itemLevel = Number(row.itemLevel) > 0 ? `Lv.${row.itemLevel}` : '';
+            const title = `${displayName}${itemLevel ? ` · 装备等级 ${row.itemLevel}` : ''}`;
+            return `<article data-mooncake-koukou-row="${mooncakeEscapeHtml(row.itemHrid)}|${row.level}" style="border:1px solid rgba(92,220,234,.2);background:rgba(255,255,255,.025);border-radius:7px;padding:8px;margin-top:7px;box-sizing:border-box;">
+                <div style="display:flex;align-items:center;gap:7px;min-width:0;">
+                    <span data-icon="${mooncakeEscapeHtml(row.itemHrid)}" style="display:inline-flex;align-items:center;justify-content:center;flex:0 0 26px;width:26px;height:26px;"></span>
+                    <button type="button" data-mooncake-koukou-jump="1" data-hrid="${mooncakeEscapeHtml(row.itemHrid)}" data-level="${row.level}" title="${mooncakeEscapeHtml(title)}" style="flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:0;background:transparent;color:#eef6ff;font:inherit;font-size:12px;font-weight:900;padding:0;cursor:pointer;text-align:left;">${mooncakeEscapeHtml(displayName)}</button>
+                    ${itemLevel ? `<span style="flex:0 0 auto;color:rgba(220,251,255,.72);font-size:10px;font-weight:800;white-space:nowrap;">${itemLevel}</span>` : ''}
+                </div>
+                <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin-top:7px;">
+                    ${mooncakeBuildKouKouMobileMetricPair(
+                        '当前左一 / 工时',
+                        mooncakeFormatBargainPrice(row.ask, '#B9E6A3'),
+                        mooncakeFormatKouKouHourly(row.hourlyWage, row.evaluation?.combinedColor || '#7DFFB3')
+                    )}
+                    ${mooncakeBuildKouKouMobileMetricPair(
+                        '扣一档工时 / 利润',
+                        mooncakeFormatKouKouHourly(row.undercutHourlyWage, row.undercutEvaluation?.combinedColor || '#7DFFB3'),
+                        mooncakeFormatKouKouProfit(row.undercutProfit)
+                    )}
+                </div>
+                ${mooncakeBuildKouKouMobileHistory(row)}
+            </article>`;
+        }).join('');
+    }
+
     function mooncakeBuildKouKouHeader() {
         const columns = MOONCAKE_KOUKOU_GRID_COLUMNS;
         const activeSort = mooncakeMarketHistoryRankingSort;
@@ -19626,6 +19724,9 @@
     }
 
     function mooncakeRenderKouKouRows(rows, options = {}) {
+        if (mooncakeShouldUseMobileMarketTableLayout()) {
+            return mooncakeRenderKouKouMobileRows(rows, options);
+        }
         if (!rows.length) {
             const message = options.onlyKouKou
                 ? '当前左一暂无达到目标工时费的装备'
@@ -19660,6 +19761,80 @@
         }).join('');
     }
 
+    function mooncakeApplyKouKouMobileLayout(panel) {
+        if (!panel || !mooncakeShouldUseMobileMarketTableLayout()) return false;
+        panel.setAttribute('data-mooncake-koukou-mobile-layout', '1');
+        Object.assign(panel.style, {
+            width: 'calc(100vw - 12px)',
+            maxHeight: 'calc(100vh - 16px)',
+            borderRadius: '9px'
+        });
+
+        const header = panel.querySelector('[data-mooncake-koukou-header]');
+        const heading = panel.querySelector('[data-mooncake-koukou-heading]');
+        const title = panel.querySelector('[data-mooncake-koukou-title]');
+        const credit = panel.querySelector('[data-mooncake-koukou-credit]');
+        const close = panel.querySelector('[data-mooncake-history-rank-close]');
+        if (header) Object.assign(header.style, { alignItems: 'flex-start', gap: '8px', padding: '8px 10px' });
+        if (heading) Object.assign(heading.style, { display: 'flex', flex: '1 1 auto', flexDirection: 'column', alignItems: 'stretch', gap: '2px' });
+        if (title) Object.assign(title.style, { fontSize: '14px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' });
+        if (credit) Object.assign(credit.style, { fontSize: '10px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' });
+        if (close) Object.assign(close.style, {
+            width: '34px', minWidth: '34px', height: '34px', minHeight: '34px', flex: '0 0 34px',
+            border: '1px solid rgba(238,246,255,.18)', borderRadius: '6px', background: 'rgba(255,255,255,.04)'
+        });
+
+        const filters = panel.querySelector('[data-mooncake-koukou-filters]');
+        if (filters) Object.assign(filters.style, {
+            display: 'grid', gridTemplateColumns: 'repeat(2,minmax(0,1fr))', gap: '7px', alignItems: 'center', padding: '8px 10px'
+        });
+        const makeInputFieldResponsive = (field, inputSelector, fullWidth = false) => {
+            if (!field) return;
+            Object.assign(field.style, { minWidth: '0', width: '100%', ...(fullWidth ? { gridColumn: '1 / -1' } : {}) });
+            const input = field.querySelector(inputSelector);
+            if (input) Object.assign(input.style, { flex: '1 1 0', width: '0', minWidth: '0', maxWidth: 'none' });
+        };
+        makeInputFieldResponsive(panel.querySelector('[data-mooncake-koukou-filter-name]'), '[data-mooncake-koukou-item-name]', true);
+        makeInputFieldResponsive(panel.querySelector('[data-mooncake-koukou-filter-volume]'), '[data-mooncake-koukou-min-volume]');
+        makeInputFieldResponsive(panel.querySelector('[data-mooncake-koukou-filter-target]'), '[data-mooncake-koukou-target-hourly]');
+
+        const itemFilter = panel.querySelector('[data-mooncake-koukou-filter-item]');
+        const itemFilterControl = itemFilter?.firstElementChild;
+        const itemFilterDetails = itemFilter?.querySelector('details');
+        if (itemFilter) Object.assign(itemFilter.style, { minWidth: '0', width: '100%' });
+        if (itemFilterControl) Object.assign(itemFilterControl.style, { minWidth: '0', width: '100%' });
+        if (itemFilterDetails) Object.assign(itemFilterDetails.style, { flex: '1 1 0', width: '0', minWidth: '0' });
+
+        const enhancementFilter = panel.querySelector('[data-mooncake-koukou-filter-enhancement]');
+        const enhancementControl = enhancementFilter?.firstElementChild;
+        const enhancementSelect = enhancementFilter?.querySelector('[data-mooncake-rank-filter-single]');
+        if (enhancementFilter) Object.assign(enhancementFilter.style, { minWidth: '0', width: '100%' });
+        if (enhancementControl) Object.assign(enhancementControl.style, { minWidth: '0', width: '100%' });
+        if (enhancementSelect) Object.assign(enhancementSelect.style, { flex: '1 1 0', width: '0', minWidth: '0', maxWidth: 'none' });
+
+        const actions = panel.querySelector('[data-mooncake-koukou-filter-actions]');
+        const onlyToggle = panel.querySelector('[data-mooncake-koukou-filter-only]');
+        const refresh = panel.querySelector('[data-mooncake-koukou-run]');
+        const status = panel.querySelector('[data-mooncake-koukou-status]');
+        if (actions) Object.assign(actions.style, {
+            display: 'grid', gridColumn: '1 / -1', gridTemplateColumns: 'minmax(0,1fr) auto',
+            alignItems: 'center', gap: '7px', width: '100%', minWidth: '0', alignSelf: 'stretch'
+        });
+        if (onlyToggle) Object.assign(onlyToggle.style, {
+            minWidth: '0', width: '100%', minHeight: '34px', justifyContent: 'center', gap: '5px', padding: '5px 8px', whiteSpace: 'nowrap'
+        });
+        if (refresh) Object.assign(refresh.style, { gridColumn: '2', gridRow: '1', minHeight: '34px', padding: '5px 12px', whiteSpace: 'nowrap' });
+        if (status) Object.assign(status.style, {
+            gridColumn: '1 / -1', gridRow: '2', width: 'auto', minHeight: '14px', fontSize: '10px', lineHeight: '1.35'
+        });
+
+        const description = panel.querySelector('[data-mooncake-koukou-description]');
+        const body = panel.querySelector('[data-mooncake-koukou-body]');
+        if (description) Object.assign(description.style, { padding: '5px 10px', fontSize: '9px', lineHeight: '1.35' });
+        if (body) Object.assign(body.style, { minHeight: '0', flex: '1 1 auto', overflowX: 'hidden', overflowY: 'auto', padding: '0 8px 10px' });
+        return true;
+    }
+
     function mooncakeOpenMarketKouKouPanel() {
         mooncakeMarketHistoryRankingSeq++;
         mooncakeMarketBargainSeq++;
@@ -19679,6 +19854,7 @@
         }
         const preferences = mooncakeReadKouKouPreferences();
         mooncakeMarketHistoryRankingSort = preferences.sort;
+        panel.removeAttribute('data-mooncake-koukou-mobile-layout');
         Object.assign(panel.style, {
             position: 'fixed',
             left: '50%',
@@ -19699,36 +19875,39 @@
             flexDirection: 'column'
         });
         panel.innerHTML = `
-            <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.08);">
-                <div style="display:flex;align-items:baseline;gap:10px;min-width:0;flex-wrap:wrap;">
-                    <span style="font-size:15px;font-weight:900;color:#dcfbff;">扣还是不扣这是个选择~~~~</span>
-                    <span style="font-size:11px;color:rgba(220,251,255,.58);white-space:nowrap;">致敬大佬cancannide</span>
+            <div data-mooncake-koukou-header style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.08);">
+                <div data-mooncake-koukou-heading style="display:flex;align-items:baseline;gap:10px;min-width:0;flex-wrap:wrap;">
+                    <span data-mooncake-koukou-title style="font-size:15px;font-weight:900;color:#dcfbff;">扣还是不扣这是个选择~~~~</span>
+                    <span data-mooncake-koukou-credit style="font-size:11px;color:rgba(220,251,255,.58);white-space:nowrap;">致敬大佬cancannide</span>
                 </div>
                 <button type="button" data-mooncake-history-rank-close="1" style="cursor:pointer;border:0;background:transparent;color:rgba(238,246,255,.72);font-size:18px;line-height:1;">×</button>
             </div>
-            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 12px 7px;border-bottom:1px solid rgba(255,255,255,.08);">
-                <label style="display:flex;align-items:center;gap:4px;color:rgba(230,238,255,.72);"><span>装备名称</span>
+            <div data-mooncake-koukou-filters style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 12px 7px;border-bottom:1px solid rgba(255,255,255,.08);">
+                <label data-mooncake-koukou-filter-name style="display:flex;align-items:center;gap:4px;color:rgba(230,238,255,.72);"><span>装备名称</span>
                     <input type="search" data-mooncake-koukou-item-name value="${mooncakeEscapeHtml(preferences.nameQuery)}" placeholder="输入名称" autocomplete="off" aria-label="装备名称" style="width:168px;background:rgba(255,255,255,.08);border:1px solid rgba(92,220,234,.34);border-radius:6px;color:#eef6ff;padding:4px 7px;box-sizing:border-box;">
                 </label>
-                ${mooncakeBuildRankingMultiSelect('item', '装备等级', mooncakeGetRankingItemLevelOptions(), preferences.itemLevels, 118)}
-                ${mooncakeBuildRankingSingleSelect('enhancement', '强化等级', mooncakeGetRankingEnhancementLevelOptions(), preferences.enhancementLevel, 94)}
-                <label style="display:flex;align-items:center;gap:4px;color:rgba(230,238,255,.72);"><span>最低7日量</span>
+                <div data-mooncake-koukou-filter-item>${mooncakeBuildRankingMultiSelect('item', '装备等级', mooncakeGetRankingItemLevelOptions(), preferences.itemLevels, 118)}</div>
+                <div data-mooncake-koukou-filter-enhancement>${mooncakeBuildRankingSingleSelect('enhancement', '强化等级', mooncakeGetRankingEnhancementLevelOptions(), preferences.enhancementLevel, 94)}</div>
+                <label data-mooncake-koukou-filter-volume style="display:flex;align-items:center;gap:4px;color:rgba(230,238,255,.72);"><span>最低7日量</span>
                     <input type="number" data-mooncake-koukou-min-volume min="0" step="1" value="${preferences.minVolume}" aria-label="最低7日成交量" style="width:92px;background:rgba(255,255,255,.08);border:1px solid rgba(92,220,234,.34);border-radius:6px;color:#eef6ff;padding:4px 7px;box-sizing:border-box;">
                 </label>
-                <label style="display:flex;align-items:center;gap:4px;color:rgba(230,238,255,.72);"><span>目标工时</span>
+                <label data-mooncake-koukou-filter-target style="display:flex;align-items:center;gap:4px;color:rgba(230,238,255,.72);"><span>目标工时</span>
                     <input type="number" data-mooncake-koukou-target-hourly min="${MOONCAKE_ORDER_TARGET_HOURLY_MIN_M}" max="${MOONCAKE_ORDER_TARGET_HOURLY_MAX_M}" step="0.001" value="${preferences.targetHourlyM}" aria-label="目标工时费（M/h）" style="width:104px;background:rgba(255,255,255,.08);border:1px solid rgba(92,220,234,.34);border-radius:6px;color:#eef6ff;padding:4px 7px;box-sizing:border-box;">
                     <span>M/h</span>
                 </label>
-                <label title="勾选后仅显示当前左一工时达到目标的装备" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;border:1px solid rgba(92,220,234,.46);background:rgba(26,83,93,.72);color:#dcfbff;border-radius:7px;padding:5px 9px;font-weight:800;">
-                    <input type="checkbox" data-mooncake-koukou-only="1" ${preferences.onlyKouKou ? 'checked' : ''}>
-                    <span>扣扣小子</span>
-                </label>
-                <button type="button" data-mooncake-koukou-run="1" style="cursor:pointer;border:1px solid rgba(92,220,234,.46);background:rgba(26,83,93,.72);color:#dcfbff;border-radius:7px;padding:5px 10px;font-weight:800;">刷新</button>
-                <span data-mooncake-koukou-status style="color:rgba(230,238,255,.58);font-size:11px;"></span>
+                <div data-mooncake-koukou-filter-actions style="display:contents;">
+                    <label data-mooncake-koukou-filter-only title="勾选后仅显示当前左一工时达到目标的装备" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;border:1px solid rgba(92,220,234,.46);background:rgba(26,83,93,.72);color:#dcfbff;border-radius:7px;padding:5px 9px;font-weight:800;">
+                        <input type="checkbox" data-mooncake-koukou-only="1" ${preferences.onlyKouKou ? 'checked' : ''}>
+                        <span>扣扣小子</span>
+                    </label>
+                    <button type="button" data-mooncake-koukou-run="1" style="cursor:pointer;border:1px solid rgba(92,220,234,.46);background:rgba(26,83,93,.72);color:#dcfbff;border-radius:7px;padding:5px 10px;font-weight:800;">刷新</button>
+                    <span data-mooncake-koukou-status style="color:rgba(230,238,255,.58);font-size:11px;"></span>
+                </div>
             </div>
-            <div style="padding:6px 12px;color:rgba(220,251,255,.65);font-size:11px;border-bottom:1px solid rgba(255,255,255,.06);">左侧按当前左一报价计算扣一档工时与利润，右侧保留 1/3/7 日交易统计。勾选“扣扣小子”后，只保留当前工时达到目标的装备；扣一档利润已扣市场税。</div>
+            <div data-mooncake-koukou-description style="padding:6px 12px;color:rgba(220,251,255,.65);font-size:11px;border-bottom:1px solid rgba(255,255,255,.06);">左侧按当前左一报价计算扣一档工时与利润，右侧保留 1/3/7 日交易统计。勾选“扣扣小子”后，只保留当前工时达到目标的装备；扣一档利润已扣市场税。</div>
             <div data-mooncake-koukou-body style="overflow:auto;overscroll-behavior:contain;padding:0 12px 16px;"></div>
         `;
+        mooncakeApplyKouKouMobileLayout(panel);
         mooncakeRunMarketKouKou();
     }
 
@@ -23033,8 +23212,10 @@
     }
 
     function mooncakeEnsureDungeonTokenListingGuide(modal) {
+        const transactionKind = mooncakeGetOrderModalTransactionKind(modal);
         const isEligible = mooncakeIsDungeonTokenListingGuideEnabled() &&
-            mooncakeIsCreateOrderModal(modal) && mooncakeGetOrderModalTransactionKind(modal) === 'buy-listing';
+            mooncakeIsCreateOrderModal(modal) &&
+            (transactionKind === 'buy-listing' || transactionKind === 'instant-buy');
         if (!isEligible) {
             mooncakeRemoveDungeonTokenListingGuide(modal);
             return;
@@ -24601,6 +24782,22 @@
                     min-width: 0 !important;
                     max-width: none !important;
                 }
+                .${MOONCAKE_RECENT_MARKET_NAV_MOBILE_ACTION_HOST_CLASS} {
+                    display: flex !important;
+                    align-items: center !important;
+                    flex-wrap: nowrap !important;
+                    gap: 6px !important;
+                    width: 100% !important;
+                    max-width: none !important;
+                    min-width: 0 !important;
+                    box-sizing: border-box !important;
+                }
+                .${MOONCAKE_RECENT_MARKET_NAV_MOBILE_ACTION_HOST_CLASS} > #${MOONCAKE_RECENT_MARKET_NAV_ID} {
+                    flex: 1 1 38px !important;
+                    min-width: 38px !important;
+                    max-width: none !important;
+                    margin-left: 0 !important;
+                }
                 #${MOONCAKE_RECENT_MARKET_NAV_ID} {
                     flex: 0 1 auto !important;
                     max-width: calc(100% - 112px) !important;
@@ -24609,6 +24806,56 @@
             }
         `;
         (document.head || document.documentElement).appendChild(style);
+    }
+
+    function mooncakeGetMarketplaceNavigationButtonText(button) {
+        return [
+            button?.getAttribute?.('aria-label') || '',
+            button?.getAttribute?.('title') || '',
+            button?.textContent || ''
+        ].join(' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function mooncakeIsUsableRecentMarketNavigationHost(element) {
+        if (!element?.isConnected || !mooncakeIsVisibleElement(element)) return false;
+        const rect = element.getBoundingClientRect();
+        if (rect.width < 1 || rect.height < 1) return false;
+        for (let node = element; node && node !== document.documentElement; node = node.parentElement) {
+            const style = window.getComputedStyle(node);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+        }
+        return true;
+    }
+
+    function mooncakeFindRecentMarketNavigationMobileActionHost(isSameMarket, currentPanel = null) {
+        const panelSelector = '[class*="MarketplacePanel_marketplacePanel"]';
+        const isVisibleButton = button => mooncakeIsVisibleElement(button) && button.getClientRects().length > 0;
+        const buttons = Array.from(document.querySelectorAll('button, [role="button"]'))
+            .filter(button => isVisibleButton(button) && isSameMarket(button));
+        const isViewAllItemsButton = button => /查看所有物品|view\s+(?:all\s+)?items|all\s+items/i.test(
+            mooncakeGetMarketplaceNavigationButtonText(button)
+        );
+        const isRefreshButton = button => /刷新|refresh/i.test(
+            mooncakeGetMarketplaceNavigationButtonText(button)
+        );
+        const getPanel = element => element?.closest?.(panelSelector) || currentPanel || null;
+        const viewAllItemsButtons = buttons.filter(isViewAllItemsButton).sort((left, right) => {
+            if (currentPanel) {
+                return Number(getPanel(right) === currentPanel) - Number(getPanel(left) === currentPanel);
+            }
+            return Number(mooncakeIsMarketplaceModalDescendant(right)) - Number(mooncakeIsMarketplaceModalDescendant(left));
+        });
+
+        for (const viewAllItemsButton of viewAllItemsButtons) {
+            const panel = getPanel(viewAllItemsButton);
+            let host = viewAllItemsButton.parentElement;
+            for (let depth = 0; host && host !== panel && depth < 8; depth++, host = host.parentElement) {
+                if (!mooncakeIsVisibleElement(host) || host.getClientRects().length === 0) continue;
+                const actionButtons = buttons.filter(button => host.contains(button) && (!panel || getPanel(button) === panel));
+                if (actionButtons.some(isRefreshButton)) return host;
+            }
+        }
+        return null;
     }
 
     function mooncakeFindRecentMarketNavigationHost(currentItem = null) {
@@ -24629,10 +24876,17 @@
                 || null;
         };
         const filter = findHost('[class*="MarketplacePanel_itemFilterContainer"]');
-        // At the CSS compact breakpoint the filter is the only host that keeps
-        // the item search and recent five-item strip in one usable row.
-        if (filter && (mooncakeIsPhoneMarketUi() || window.matchMedia?.('(max-width: 800px)').matches)) {
-            return { element: filter, kind: 'filter' };
+        const compactMarketLayout = mooncakeIsPhoneMarketUi()
+            || Boolean(window.matchMedia?.('(max-width: 800px)').matches);
+        if (compactMarketLayout) {
+            // The normal item list keeps its search and recent items together.
+            // The equipment all-levels/order-book pages retain a hidden filter
+            // node, so only use that host when it is actually rendered.
+            if (mooncakeIsUsableRecentMarketNavigationHost(filter)) {
+                return { element: filter, kind: 'filter' };
+            }
+            const actionHost = mooncakeFindRecentMarketNavigationMobileActionHost(isSameMarket, currentPanel);
+            if (actionHost) return { element: actionHost, kind: 'mobile-actions' };
         }
         const marketNav = findHost('[class*="MarketplacePanel_marketNavButtonContainer"]');
         if (marketNav) return { element: marketNav, kind: 'market-nav' };
@@ -24662,8 +24916,8 @@
             badge.textContent = `+${item.level}`;
             Object.assign(badge.style, {
                 position: 'absolute',
-                right: '1px',
-                bottom: '1px',
+                left: '1px',
+                top: '1px',
                 padding: '0 2px',
                 borderRadius: '3px',
                 background: 'rgba(20,20,34,.9)',
@@ -24782,15 +25036,25 @@
                 overflow: 'hidden'
             });
         }
-        document.querySelectorAll(`.${MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS}`).forEach(candidate => {
-            if (candidate !== host || hostInfo.kind !== 'filter') {
-                candidate.classList.remove(MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS);
-            }
+        const usesFilterHostLayout = hostInfo.kind === 'filter';
+        const usesMobileActionHostLayout = hostInfo.kind === 'mobile-actions';
+        document.querySelectorAll(
+            `.${MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS}, .${MOONCAKE_RECENT_MARKET_NAV_MOBILE_ACTION_HOST_CLASS}`
+        ).forEach(candidate => {
+            candidate.classList.toggle(MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS, usesFilterHostLayout && candidate === host);
+            candidate.classList.toggle(
+                MOONCAKE_RECENT_MARKET_NAV_MOBILE_ACTION_HOST_CLASS,
+                usesMobileActionHostLayout && candidate === host
+            );
         });
-        bar.classList.toggle(MOONCAKE_RECENT_MARKET_NAV_CONTEXT_CLASS, hostInfo.kind === 'market-nav');
+        if (usesFilterHostLayout) host.classList.add(MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS);
+        if (usesMobileActionHostLayout) host.classList.add(MOONCAKE_RECENT_MARKET_NAV_MOBILE_ACTION_HOST_CLASS);
+        bar.classList.toggle(
+            MOONCAKE_RECENT_MARKET_NAV_CONTEXT_CLASS,
+            hostInfo.kind === 'market-nav' || usesMobileActionHostLayout
+        );
         bar.dataset.hostKind = hostInfo.kind;
-        if (hostInfo.kind === 'filter') {
-            host.classList.add(MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS);
+        if (usesFilterHostLayout) {
             if (bar.parentElement !== host) host.appendChild(bar);
         } else if (bar.parentElement !== host) {
             const collectorBar = host.querySelector(':scope > .mwc-market-quick-links-nav');
@@ -24805,6 +25069,9 @@
         document.querySelectorAll(`#${MOONCAKE_RECENT_MARKET_NAV_ID}`).forEach(bar => bar.remove());
         document.querySelectorAll(`.${MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS}`).forEach(host => {
             host.classList.remove(MOONCAKE_RECENT_MARKET_NAV_HOST_CLASS);
+        });
+        document.querySelectorAll(`.${MOONCAKE_RECENT_MARKET_NAV_MOBILE_ACTION_HOST_CLASS}`).forEach(host => {
+            host.classList.remove(MOONCAKE_RECENT_MARKET_NAV_MOBILE_ACTION_HOST_CLASS);
         });
         mooncakeRecentMarketLastTargetKey = '';
     }
@@ -33960,12 +34227,31 @@
         scheduleMooncakeEnhanceProtectionBuyBox(1000);
     }
 
+    function mooncakeFindVisibleEnhancementTabContainers() {
+        const roots = Array.from(document.querySelectorAll('[class*="CharacterManagement_tabsComponentContainer"]'));
+        for (const root of roots) {
+            const tabsContainer = root.querySelector('[class*="TabsComponent_tabsContainer"]');
+            const tabPanelsContainer = root.querySelector('[class*="TabsComponent_tabPanelsContainer"]');
+            if (!tabsContainer || !tabPanelsContainer) continue;
+            if (!mooncakeIsVisibleElement(root) || !mooncakeIsVisibleElement(tabsContainer) || !mooncakeIsVisibleElement(tabPanelsContainer)) continue;
+            if (!root.getClientRects().length || !tabsContainer.getClientRects().length || !tabPanelsContainer.getClientRects().length) continue;
+            return { root, tabsContainer, tabPanelsContainer };
+        }
+        return null;
+    }
+
     function createEnhancementTab() {
         if (enhancementTabButton && !enhancementTabButton.isConnected) enhancementTabButton = null;
         if (enhancementTabPanel && !enhancementTabPanel.isConnected) enhancementTabPanel = null;
 
-        const existingButton = document.querySelector(`[${MOONCAKE_ENHANCEMENT_TAB_BUTTON_ATTR}="1"]`);
-        const existingPanel = document.querySelector(`[${MOONCAKE_ENHANCEMENT_TAB_PANEL_ATTR}="1"]`);
+        const containers = mooncakeFindVisibleEnhancementTabContainers();
+        if (!containers) {
+            scheduleEnhancementTabEnsure(500);
+            return false;
+        }
+        const { tabsContainer, tabPanelsContainer } = containers;
+        const existingButton = tabsContainer.querySelector(`[${MOONCAKE_ENHANCEMENT_TAB_BUTTON_ATTR}="1"]`);
+        const existingPanel = tabPanelsContainer.querySelector(`[${MOONCAKE_ENHANCEMENT_TAB_PANEL_ATTR}="1"]`);
         if (existingButton && existingPanel) {
             enhancementTabButton = existingButton;
             enhancementTabPanel = existingPanel;
@@ -33974,14 +34260,6 @@
 
         if (existingButton && !existingPanel) existingButton.remove();
         if (existingPanel && !existingButton) existingPanel.remove();
-
-        const tabsContainer = document.querySelector('[class^="CharacterManagement_tabsComponentContainer"] [class*="TabsComponent_tabsContainer"]');
-        const tabPanelsContainer = document.querySelector('[class^="CharacterManagement_tabsComponentContainer"] [class*="TabsComponent_tabPanelsContainer"]');
-
-        if (!tabsContainer || !tabPanelsContainer) {
-            scheduleEnhancementTabEnsure(500);
-            return false;
-        }
 
         const oldTabButtons = tabsContainer.querySelectorAll("button");
         const oldTabPanels = tabPanelsContainer.querySelectorAll('[class*="TabPanel_tabPanel"]');
@@ -34022,8 +34300,21 @@
         }, delay);
     }
 
+    function scheduleEnhancementTabEnsureAfterMyStuffNavigation() {
+        scheduleEnhancementTabEnsure(0);
+        if (_enhancementTabNavigationFollowupTimer) clearTimeout(_enhancementTabNavigationFollowupTimer);
+        _enhancementTabNavigationFollowupTimer = setTimeout(() => {
+            _enhancementTabNavigationFollowupTimer = 0;
+            scheduleEnhancementTabEnsure(0);
+        }, 320);
+    }
+
     function ensureEnhancementTabReady() {
-        if (enhancementTabButton?.isConnected && enhancementTabPanel?.isConnected) return true;
+        const containers = mooncakeFindVisibleEnhancementTabContainers();
+        if (!containers) return !!(enhancementTabButton?.isConnected && enhancementTabPanel?.isConnected);
+        if (enhancementTabButton?.isConnected && enhancementTabPanel?.isConnected &&
+            containers?.tabsContainer.contains(enhancementTabButton) &&
+            containers?.tabPanelsContainer.contains(enhancementTabPanel)) return true;
         return createEnhancementTab();
     }
 
@@ -36535,6 +36826,12 @@
                            el.closest?.(selector) ||
                            !!(includeDescendants && el.querySelector?.(selector));
                 };
+                const _touchesEnhancementTabs = (el, includeDescendants = true) => {
+                    if (!(el instanceof Element)) return false;
+                    const selector = '[class*="CharacterManagement_tabsComponentContainer"], [class*="CharacterManagement"], [class*="TabsComponent"]';
+                    return el.matches?.(selector) || el.closest?.(selector) ||
+                           !!(includeDescendants && el.querySelector?.(selector));
+                };
 
                 for (const mutation of mutations) {
                     const mutationTarget = _mutationTargetEl(mutation);
@@ -36610,7 +36907,7 @@
                             }
                             if (node.getAttribute?.(MOONCAKE_ENHANCEMENT_TAB_BUTTON_ATTR) === '1' ||
                                 node.getAttribute?.(MOONCAKE_ENHANCEMENT_TAB_PANEL_ATTR) === '1' ||
-                                node.matches?.('[class*="CharacterManagement"], [class*="TabsComponent"]')) {
+                                _touchesEnhancementTabs(node) || _touchesEnhancementTabs(targetEl, false)) {
                                 enhancementTabButton = enhancementTabButton?.isConnected ? enhancementTabButton : null;
                                 enhancementTabPanel = enhancementTabPanel?.isConnected ? enhancementTabPanel : null;
                                 needEnhancementTabEnsure = true;
@@ -37837,6 +38134,8 @@
             const isMooncakeInjectedMarketClick = !!target.closest(MOONCAKE_MARKET_INJECTED_SELECTOR);
             const marketControl = target.closest?.('[class*="MarketplacePanel"] button, [class*="MarketplacePanel"] select, [class*="MarketplacePanel"] [role="button"], [class*="MarketplacePanel"] [role="tab"], [class*="TabsComponent"] button, [class*="TabsComponent"] [role="button"], [class*="TabsComponent"] [role="tab"]');
             const navControl = target.closest?.('[class*="Navigation"], [class*="Sidebar"], [class*="Bottom"], [class*="Tab"] button, [role="navigation"], [role="tablist"] [role="tab"]');
+            const myStuffNavigation = target.closest?.('[aria-label="navigationBar.myStuff"]') ||
+                target.closest?.('[class*="NavigationBar_nav"]')?.querySelector?.('[aria-label="navigationBar.myStuff"]');
             if (e.isTrusted && !isMooncakeInjectedMarketClick &&
                 (marketControl?.closest?.('[class*="MarketplacePanel"]') || mooncakeIsQ7MarketNavigationClick(target))) {
                 mooncakeTouchListingTimeMarket();
@@ -37849,6 +38148,9 @@
                     ensureMooncakeMarketJumpHelpers();
                 }, 360);
                 scheduleMooncakeMarketHistoryCard(420);
+            }
+            if (!isMooncakeInjectedMarketClick && myStuffNavigation) {
+                scheduleEnhancementTabEnsureAfterMyStuffNavigation();
             }
 
             // Q7 reports are intentionally armed only by an actual user market visit.
@@ -38097,6 +38399,7 @@
 
     function mooncakeGetEnhancementSettingsToggleValue(key) {
         switch (key) {
+            case 'fab-visible': return mooncakeIsVirtualConfigFabVisible();
             case 'market-history': return mooncakeIsMarketHistoryCardEnabled();
             case 'market-hourly': return isMarketplaceHourlyWageEnabled();
             case 'market-listing-age': return mooncakeIsMarketListingAgeEnabled();
@@ -38122,6 +38425,7 @@
 
     function mooncakeSetEnhancementSettingsToggleValue(key, enabled) {
         switch (key) {
+            case 'fab-visible': mooncakeSetVirtualConfigFabVisible(enabled); break;
             case 'market-history': mooncakeSetMarketHistoryCardEnabled(enabled); break;
             case 'market-hourly': setMarketplaceHourlyWageEnabled(enabled); break;
             case 'market-listing-age': mooncakeSetMarketListingAgeEnabled(enabled); break;
@@ -39623,6 +39927,13 @@
         const marketHourlyControl = marketHourlyRow.querySelector('[data-mooncake-enhancement-settings-row-control]');
         const hourlyWageColorProfilePopover = mooncakeCreateHourlyWageColorProfilePopover();
         marketHourlyControl?.appendChild(hourlyWageColorProfilePopover);
+        const fabVisibilityRow = mooncakeCreateEnhancementSettingsToggle(
+            'fab-visible',
+            isZH ? '显示棒棒糖浮窗' : 'Show lollipop button',
+            isZH ? '隐藏后可在包子页的设置面板入口恢复。' : 'Restore it from the settings entry on the Enhance page.',
+            '',
+            'div'
+        );
         const fabShortcutHint = document.createElement('div');
         fabShortcutHint.setAttribute('data-mooncake-enhancement-settings-fab-shortcut', '1');
         const fabShortcutIcon = document.createElement('span');
@@ -39643,10 +39954,11 @@
             marketHistoryRow,
             columnBlock,
             marketHourlyRow,
+            fabVisibilityRow,
             fabShortcutHint,
             mooncakeCreateEnhancementSettingsToggle('market-listing-age', isZH ? '挂单时长' : 'Listing age', isZH ? '在订单簿显示挂单已存在时长。' : 'Show listing age in order books.'),
             mooncakeCreateBaseItemCostPricePolicyControl(),
-            mooncakeCreateEnhancementSettingsToggle('dungeon-token-listing-guide', isZH ? '地下城代币提示' : 'Dungeon token guide', isZH ? '收购挂牌时标记当前每代币买一最优的地下城兑换物。' : 'Mark dungeon redemptions that currently have the best bid value per token.'),
+            mooncakeCreateEnhancementSettingsToggle('dungeon-token-listing-guide', isZH ? '地下城代币提示' : 'Dungeon token guide', isZH ? '购买挂牌或订单行购买时，标记当前每代币买一最优的地下城兑换物。' : 'Mark the current best bid per dungeon token in buy-listing and instant-buy dialogs.'),
             mooncakeCreateEnhancementSettingsToggle('market-jump', isZH ? '快捷导航' : 'Quick navigation', isZH ? '显示等级、关联物品与最近访问入口。' : 'Show level, related-item, and recent-visit shortcuts.'),
             marketLevelJumpSequenceRow,
             jumpLevelRow
@@ -40205,7 +40517,7 @@
             box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45);
             cursor: pointer;
             z-index: 9999;
-            display: ${config.ui.fabVisible === false ? 'none' : 'flex'};
+            display: ${mooncakeIsVirtualConfigFabVisible() ? 'flex' : 'none'};
             align-items: center;
             justify-content: center;
             font-size: 20px;
@@ -40452,6 +40764,7 @@
             const rect = fab.getBoundingClientRect();
             setFabPosition(rect.left, rect.top);
         };
+        fab._mooncakeClampIntoViewport = clampFabIntoViewport;
 
         // 加载保存的位置
         if (config.ui.fabPosition) {
@@ -40464,12 +40777,9 @@
         document.addEventListener('keydown', (e) => {
             if (e.ctrlKey && e.altKey && e.key === 'd') {
                 e.preventDefault();
-                fab.style.display = fab.style.display === 'none' ? 'flex' : 'none';
-                config.ui.fabVisible = fab.style.display !== 'none';
-                saveConfig();
-                if (config.ui.fabVisible) requestAnimationFrame(clampFabIntoViewport);
+                const fabVisible = mooncakeSetVirtualConfigFabVisible(!mooncakeIsVirtualConfigFabVisible());
                 // 如果悬浮框被隐藏，同时关闭配置面板
-                if (fab.style.display === 'none') {
+                if (!fabVisible) {
                     mooncakeCloseEnhancementSettingsPanel();
                 }
             }
