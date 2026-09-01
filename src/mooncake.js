@@ -1786,18 +1786,35 @@
 
     function mooncakeHandleEnhancementLevelStyleMutations(mutations) {
         if (!mooncakeIsEnhancementLevelStyleEnabled()) return;
+        const roots = [];
+        const queuedRoots = new Set();
         for (const mutation of mutations) {
             if (mutation.target instanceof Element && mutation.target.matches(MOONCAKE_ENHANCEMENT_LEVEL_SELECTOR)) {
                 mooncakeEnhancementLevelStylePending.add(mutation.target);
             }
             for (const node of mutation.addedNodes) {
                 if (node instanceof Element) {
-                    mooncakeQueueEnhancementLevelStyleRoot(node);
+                    if (!queuedRoots.has(node)) {
+                        queuedRoots.add(node);
+                        roots.push(node);
+                    }
                 } else if (node.parentElement?.matches?.(MOONCAKE_ENHANCEMENT_LEVEL_SELECTOR)) {
                     mooncakeEnhancementLevelStylePending.add(node.parentElement);
                 }
             }
         }
+        // React often reports a parent together with several descendants in the
+        // same observer batch. Querying every descendant repeats the same broad
+        // selector walk, so retain only roots not already covered by a parent.
+        const scanRoots = [];
+        for (const root of roots) {
+            if (scanRoots.some(parent => parent.contains(root))) continue;
+            for (let index = scanRoots.length - 1; index >= 0; index--) {
+                if (root.contains(scanRoots[index])) scanRoots.splice(index, 1);
+            }
+            scanRoots.push(root);
+        }
+        scanRoots.forEach(mooncakeQueueEnhancementLevelStyleRoot);
         mooncakeScheduleEnhancementLevelStyleFlush();
     }
 
@@ -5178,7 +5195,8 @@
                 mooncakeRefreshOrderModalEconomics();
             }
         }
-        if (mooncakeIsMarketListingAgeEnabled()) {
+        const refreshVisibleMarketplacePricing = mooncakeMarketplacePricingSurfaceState !== false;
+        if (mooncakeIsMarketListingAgeEnabled() && refreshVisibleMarketplacePricing) {
             scheduleMarketplaceOrderBookHourlyWageRefresh();
         }
         if (!priceChanged && !snapshotQuotesChanged) {
@@ -5198,7 +5216,7 @@
         if (typeof mooncakeScheduleCurrentEnhancementMarketRefresh === 'function') {
             mooncakeScheduleCurrentEnhancementMarketRefresh(itemHrid);
         }
-        if (typeof scheduleMarketplaceHourlyWageRefresh === 'function') {
+        if (refreshVisibleMarketplacePricing && typeof scheduleMarketplaceHourlyWageRefresh === 'function') {
             scheduleMarketplaceHourlyWageRefresh();
         }
         if (typeof mooncakeNotifyMyListingsTargetFilterMarketUpdate === 'function') {
@@ -15185,6 +15203,10 @@
     let _pendingOrderBookRaf = null;
     let _pendingOrderBookResizeTimer = 0;
     let _pendingSummaryRaf = null;
+    // `false` means the last verified state had no visible native market table.
+    // Background market packets must not keep scheduling DOM work in that state;
+    // market clicks and native table mutations force the next verification.
+    let mooncakeMarketplacePricingSurfaceState = null;
     const mooncakeOrderBookRenderGenerations = new WeakMap();
     let _summaryRenderGeneration = 0;
     let _enhancementTabRenderGeneration = 0;
@@ -21127,6 +21149,7 @@
     let mooncakeWarehouseObservedRoot = null;
     let mooncakeWarehouseObservedWidth = null;
     let mooncakeWarehouseObservedRootVisible = false;
+    let mooncakeWarehouseLastMissingRootProbeAt = 0;
     let mooncakeWarehouseSunnyConflictNotified = false;
     // Sunny can briefly remove its inventory markers while reconciling. Once its
     // favorites layout appears, do not let both plugins reclaim the same nodes.
@@ -22048,6 +22071,25 @@
         return null;
     }
 
+    function mooncakeWarehouseGetActiveRootForMutations() {
+        const root = mooncakeWarehouseInventoryRoot;
+        if (root?.isConnected) {
+            // Visibility and resize observers already schedule the next render
+            // when a mounted inventory tab becomes visible. Do not scan every
+            // unrelated document mutation while it remains hidden.
+            if (mooncakeWarehouseObservedRoot === root && !mooncakeWarehouseObservedRootVisible) return null;
+            return root;
+        }
+
+        // The native inventory can be mounted by keyboard or a script instead
+        // of a trusted click. Keep that path working, but avoid a full document
+        // query on every game/UI mutation while no inventory root exists.
+        const now = performance.now();
+        if (now - mooncakeWarehouseLastMissingRootProbeAt < 400) return null;
+        mooncakeWarehouseLastMissingRootProbeAt = now;
+        return mooncakeWarehouseFindInventoryRoot();
+    }
+
     function mooncakeWarehouseCollectInventoryNodes(root) {
         if (!root || mooncakeIsExternalProfitPanelNode(root)) return [];
         const entries = [];
@@ -22617,6 +22659,7 @@
             }
             if (root !== mooncakeWarehouseInventoryRoot) {
                 mooncakeWarehouseInventoryRoot = root;
+                mooncakeWarehouseLastMissingRootProbeAt = 0;
                 mooncakeWarehouseRootStyleSnapshot = mooncakeWarehouseSnapshotInlineStyles(root, MOONCAKE_WAREHOUSE_ROOT_STYLE_PROPS);
             }
             const entries = mooncakeWarehouseCollectInventoryNodes(root);
@@ -23346,18 +23389,17 @@
         mooncakeWarehouseMutationUnsubscribe = subscribeDocumentMutations('mooncake-inventory-warehouse', mutations => {
             if (!mooncakeIsEnhancementInventoryWarehouseEnabled()) return;
             if (mooncakeWarehouseSunnyConflictLatched) return;
-            if (mooncakeWarehouseMutationsIntroduceSunnyConflict(mutations)) {
-                mooncakeWarehouseSuspendForSunnyConflict();
-                return;
-            }
             if (document.hidden) {
                 mooncakeWarehousePendingVisibleRender = true;
                 mooncakeWarehouseGeometryDirty = true;
                 return;
             }
-            const activeRoot = mooncakeWarehouseInventoryRoot?.isConnected
-                ? mooncakeWarehouseInventoryRoot
-                : mooncakeWarehouseFindInventoryRoot();
+            const activeRoot = mooncakeWarehouseGetActiveRootForMutations();
+            if (!activeRoot) return;
+            if (mooncakeWarehouseMutationsIntroduceSunnyConflict(mutations)) {
+                mooncakeWarehouseSuspendForSunnyConflict();
+                return;
+            }
             const relevant = mutations.some(mutation => {
                 const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
                 if (mooncakeIsExternalProfitPanelNode(target) ||
@@ -24852,6 +24894,85 @@
             if (shouldScan) mooncakeScheduleOrderModalScan(60);
         });
         mooncakeScheduleOrderModalScan(0);
+    }
+
+    // Closing a buy dialog inside the compact marketplace can leave the
+    // native action button with Button_disabled even though its disabled
+    // property is false. One native refresh remounts the action and restores
+    // its click handler without touching legitimate disabled states.
+    const MOONCAKE_COMPACT_MARKET_BUY_ACTION_RECOVERY_DELAY_MS = 140;
+    const MOONCAKE_NATIVE_DISABLED_BUTTON_CLASS_RE = /^Button_disabled(?:__|$)/;
+    let mooncakeCompactMarketBuyActionRecoveryTimer = 0;
+    let mooncakeCompactMarketBuyActionRecoveryHooked = false;
+
+    function mooncakeIsCompactMarketplaceBuyActionButton(button) {
+        if (!(button instanceof HTMLButtonElement)) return false;
+        const text = mooncakeGetMarketplaceNavigationButtonText(button);
+        return /新购买挂牌|(?:^|\s)购买(?:\s|$)|new\s+(?:buy|bid)|(?:^|\s)buy(?:\s|$)/i.test(text);
+    }
+
+    function mooncakeIsStaleCompactMarketplaceBuyAction(button) {
+        if (!mooncakeIsCompactMarketplaceBuyActionButton(button)) return false;
+        if (button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
+        return [...button.classList].some(className => MOONCAKE_NATIVE_DISABLED_BUTTON_CLASS_RE.test(className));
+    }
+
+    function mooncakeFindCompactMarketplaceRefreshButton(panel) {
+        if (!panel?.querySelectorAll) return null;
+        return [...panel.querySelectorAll('button')].find(button => {
+            if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+            return /(?:^|\s)(?:刷新|refresh)(?:\s|$)/i.test(mooncakeGetMarketplaceNavigationButtonText(button));
+        }) || null;
+    }
+
+    function mooncakeRecoverCompactMarketplaceBuyActions() {
+        if (mooncakeFindOrderModalRoots().some(mooncakeIsCreateOrderModal)) return false;
+        const compactPanels = [...document.querySelectorAll('[class*="MainPanel_marketplaceModalContent"]')]
+            .filter(mooncakeIsVisibleElement);
+        let recovered = false;
+        for (const panel of compactPanels) {
+            const hasStaleBuyAction = [...panel.querySelectorAll('button')]
+                .some(mooncakeIsStaleCompactMarketplaceBuyAction);
+            if (!hasStaleBuyAction) continue;
+            const refreshButton = mooncakeFindCompactMarketplaceRefreshButton(panel);
+            if (!refreshButton) continue;
+            try {
+                refreshButton.click();
+                recovered = true;
+            } catch (_) {}
+        }
+        return recovered;
+    }
+
+    function mooncakeScheduleCompactMarketplaceBuyActionRecovery() {
+        if (mooncakeCompactMarketBuyActionRecoveryTimer) clearTimeout(mooncakeCompactMarketBuyActionRecoveryTimer);
+        mooncakeCompactMarketBuyActionRecoveryTimer = setTimeout(() => {
+            mooncakeCompactMarketBuyActionRecoveryTimer = 0;
+            mooncakeRecoverCompactMarketplaceBuyActions();
+        }, MOONCAKE_COMPACT_MARKET_BUY_ACTION_RECOVERY_DELAY_MS);
+    }
+
+    function mooncakeCompactMarketplaceBuyActionRecoveryMutationNeedsScan(mutations) {
+        return mutations.some(mutation => {
+            if (mutation.type !== 'childList') return false;
+            return [...mutation.addedNodes, ...mutation.removedNodes].some(node => {
+                if (!(node instanceof Element)) return false;
+                return node.matches?.(MOONCAKE_ORDER_MODAL_SELECTOR) ||
+                    node.matches?.(MOONCAKE_ORDER_MODAL_CONTENT_SELECTOR) ||
+                    !!node.querySelector?.(MOONCAKE_ORDER_MODAL_SELECTOR) ||
+                    !!node.querySelector?.(MOONCAKE_ORDER_MODAL_CONTENT_SELECTOR);
+            });
+        });
+    }
+
+    function hookMooncakeCompactMarketplaceBuyActionRecovery() {
+        if (mooncakeCompactMarketBuyActionRecoveryHooked) return;
+        mooncakeCompactMarketBuyActionRecoveryHooked = true;
+        subscribeDocumentMutations('compact-market-buy-action-recovery', mutations => {
+            if (mooncakeCompactMarketplaceBuyActionRecoveryMutationNeedsScan(mutations)) {
+                mooncakeScheduleCompactMarketplaceBuyActionRecovery();
+            }
+        });
     }
 
     function mooncakeFindUpgradeActionToHrid(hrid) {
@@ -37895,6 +38016,16 @@
         return mooncakeIsPhoneMarketUi() || viewportWidth <= 600;
     }
 
+    const MOONCAKE_MARKET_PRICING_SURFACE_SELECTOR = [
+        '[class*="MarketplacePanel_orderBooksContainer"]',
+        '[class*="MarketplacePanel_itemSummaryTable"]'
+    ].join(', ');
+
+    function mooncakeHasVisibleMarketplacePricingSurface() {
+        return [...document.querySelectorAll(MOONCAKE_MARKET_PRICING_SURFACE_SELECTOR)]
+            .some(mooncakeIsVisibleElement);
+    }
+
     function mooncakeApplyMarketplaceResponsiveTableLayout({ orderBooksContainer = null, itemSummaryTable = null } = {}) {
         // Older versions forced the native tables through a grid/scroll wrapper
         // on phones. Clear those markers whenever the market redraws, then let
@@ -37915,13 +38046,17 @@
         }
     }
 
-    function scheduleMarketplaceOrderBookHourlyWageRefresh() {
+    function scheduleMarketplaceOrderBookHourlyWageRefresh(options = {}) {
+        const force = options?.force === true;
+        if (!force && mooncakeMarketplacePricingSurfaceState === false) return;
         if (_pendingOrderBookRaf) return;
         _pendingOrderBookRaf = requestAnimationFrame(() => {
             _pendingOrderBookRaf = null;
             try {
                 const orderBooksContainer = document.querySelector('[class*="MarketplacePanel_orderBooksContainer"]');
-                if (!orderBooksContainer) {
+                const hasVisiblePricingSurface = mooncakeHasVisibleMarketplacePricingSurface();
+                mooncakeMarketplacePricingSurfaceState = hasVisiblePricingSurface;
+                if (!orderBooksContainer || !hasVisiblePricingSurface || !mooncakeIsVisibleElement(orderBooksContainer)) {
                     mooncakeStopListingAgeMinuteTimer();
                     return;
                 }
@@ -37964,13 +38099,17 @@
         });
     }
 
-    function scheduleMarketplaceSummaryHourlyWageRefresh() {
+    function scheduleMarketplaceSummaryHourlyWageRefresh(options = {}) {
+        const force = options?.force === true;
+        if (!force && mooncakeMarketplacePricingSurfaceState === false) return;
         if (_pendingSummaryRaf) return;
         _pendingSummaryRaf = requestAnimationFrame(() => {
             _pendingSummaryRaf = null;
             try {
                 const itemSummaryTable = document.querySelector('[class*="MarketplacePanel_itemSummaryTable"]');
-                if (itemSummaryTable) {
+                const hasVisiblePricingSurface = mooncakeHasVisibleMarketplacePricingSurface();
+                mooncakeMarketplacePricingSurfaceState = hasVisiblePricingSurface;
+                if (itemSummaryTable && hasVisiblePricingSurface && mooncakeIsVisibleElement(itemSummaryTable)) {
                     if (isMarketplaceHourlyWageEnabled()) {
                         addHourlyWageToMarketplaceSummary(itemSummaryTable);
                     } else {
@@ -37984,9 +38123,9 @@
         });
     }
 
-    function scheduleMarketplaceHourlyWageRefresh() {
-        scheduleMarketplaceOrderBookHourlyWageRefresh();
-        scheduleMarketplaceSummaryHourlyWageRefresh();
+    function scheduleMarketplaceHourlyWageRefresh(options = {}) {
+        scheduleMarketplaceOrderBookHourlyWageRefresh(options);
+        scheduleMarketplaceSummaryHourlyWageRefresh(options);
         scheduleMooncakeMarketJumpHelpers();
     }
 
@@ -38148,12 +38287,12 @@
 
                 // 处理市场挂单明细表格（去抖：每帧最多执行一次）
                 if (needOrderBook) {
-                    scheduleMarketplaceOrderBookHourlyWageRefresh();
+                    scheduleMarketplaceOrderBookHourlyWageRefresh({ force: true });
                 }
 
                 // 处理市场各等级挂单表格（去抖：每帧最多执行一次）
                 if (needSummary) {
-                    scheduleMarketplaceSummaryHourlyWageRefresh();
+                    scheduleMarketplaceSummaryHourlyWageRefresh({ force: true });
                 }
 
                 if (needMarketJumpHelpers) {
@@ -38165,7 +38304,7 @@
             };
 
             enhancementDetailTableObserver = subscribeDocumentMutations('market-detail', handleMutations);
-            scheduleMarketplaceOrderBookHourlyWageRefresh();
+            scheduleMarketplaceOrderBookHourlyWageRefresh({ force: true });
         } catch (err) {
             console.error('[Better Loot Tracker] hookEnhancementDetailTable 设置失败:', err);
         }
@@ -39343,6 +39482,12 @@
                 }, 360);
                 scheduleMooncakeMarketHistoryCard(420);
             }
+            if (!isMooncakeInjectedMarketClick && marketControl?.closest?.('[class*="MarketplacePanel"], [class*="MainPanel_marketplaceModalContent"]')) {
+                // A tab can reveal an already-mounted table without adding a
+                // child node. Force one verification after a user market action
+                // so background quote refreshes may remain suspended elsewhere.
+                scheduleMarketplaceHourlyWageRefresh({ force: true });
+            }
             if (!isMooncakeInjectedMarketClick && myStuffNavigation) {
                 scheduleEnhancementTabEnsureAfterMyStuffNavigation();
             }
@@ -39506,6 +39651,7 @@
         setTimeout(startMooncakeChatLaborObserver, 1200);
         hookMooncakeMarketHistoryEvents();
         hookMooncakeOrderModalEconomics();
+        hookMooncakeCompactMarketplaceBuyActionRecovery();
         hookMooncakeInventoryRightClickMarket();
         startMooncakeInventoryWarehouse();
         hookMooncakeProtectionAssistant();
