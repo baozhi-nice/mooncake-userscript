@@ -2810,6 +2810,7 @@
         mooncakeMarketPricingRevision++;
         try { mooncakeClearEnhancementRouteCache(); } catch (_) {}
         try { mooncakeEnhanceQuickRecommendationCache.clear(); } catch (_) {}
+        try { scheduleMooncakeEnhanceProtectionBuyBox(0); } catch (_) {}
         try { mooncakeRefreshOrderModalEconomics(); } catch (_) {}
         try { mooncakeScheduleMyListingsTargetFilter(0, { showProgress: false }); } catch (_) {}
         try {
@@ -5172,6 +5173,7 @@
         if (priceChanged) {
             mooncakeMarketPricingRevision++;
             mooncakeClearEnhancementRouteCache();
+            try { scheduleMooncakeEnhanceProtectionBuyBox(0); } catch (_) {}
             if (typeof mooncakeRefreshOrderModalEconomics === 'function') {
                 mooncakeRefreshOrderModalEconomics();
             }
@@ -33535,7 +33537,36 @@
             .sort((left, right) => right.level - left.level);
     }
 
-    function mooncakeGetEnhanceMarketPlanRowSignature(quote, sellRecommendation, buyRecommendation) {
+    // The market table and the order-book rows must use the same +0-to-target
+    // route. The separate recommendation still starts at the item in the panel
+    // so its click action can safely fill the remaining enhancement plan.
+    function mooncakeGetEnhanceMarketPlanMarketRoute(itemHrid, targetLevel, marketData, targetPrice) {
+        const target = Math.floor(Number(targetLevel));
+        const price = Number(targetPrice) || 0;
+        if (!itemHrid || !Number.isInteger(target) || target < 1 || target > 20 || !(price > 0)) return null;
+
+        try {
+            const route = mooncakeCalculateEnhancementRouteAtPrice(itemHrid, target, marketData, price);
+            const hourlyWage = Number(route?.hourlyWage);
+            if (!route || !Number.isFinite(hourlyWage)) return null;
+            return {
+                ...route,
+                targetLevel: target,
+                targetPrice: price,
+                hourlyWage
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function mooncakeGetEnhanceMarketPlanRowSignature(
+        quote,
+        sellRecommendation,
+        buyRecommendation,
+        sellMarketRoute = null,
+        buyMarketRoute = null
+    ) {
         const recommendationSignature = recommendation => recommendation
             ? [
                 recommendation.protectAt,
@@ -33546,6 +33577,17 @@
                 Number(recommendation.totalCost) || 0
             ].join(':')
             : '-';
+        const marketRouteSignature = route => route
+            ? [
+                route.routeType || '',
+                route.protectAt,
+                route.protectionItemHrid || '',
+                Number(route.expectedActions) || 0,
+                Number(route.expectedProtects) || 0,
+                Number(route.hourlyWage) || 0,
+                Number(route.totalCost) || 0
+            ].join(':')
+            : '-';
         return [
             quote.level,
             quote.ask,
@@ -33553,7 +33595,9 @@
             quote.askIsHistorical ? 1 : 0,
             quote.bidIsHistorical ? 1 : 0,
             recommendationSignature(sellRecommendation),
-            recommendationSignature(buyRecommendation)
+            recommendationSignature(buyRecommendation),
+            marketRouteSignature(sellMarketRoute),
+            marketRouteSignature(buyMarketRoute)
         ].join('|');
     }
 
@@ -33663,7 +33707,17 @@
         });
     }
 
-    function mooncakeCreateEnhanceMarketPlanSideRow(panel, itemHrid, startLevel, quote, sellRecommendation, buyRecommendation, rowSignature = '') {
+    function mooncakeCreateEnhanceMarketPlanSideRow(
+        panel,
+        itemHrid,
+        startLevel,
+        quote,
+        sellRecommendation,
+        buyRecommendation,
+        sellMarketRoute = null,
+        buyMarketRoute = null,
+        rowSignature = ''
+    ) {
         const row = document.createElement('div');
         row.className = 'mooncake-enh-market-plan-row';
         row.dataset.level = String(quote.level);
@@ -33672,7 +33726,9 @@
         row.dataset.sig = rowSignature || mooncakeGetEnhanceMarketPlanRowSignature(
             quote,
             sellRecommendation,
-            buyRecommendation
+            buyRecommendation,
+            sellMarketRoute,
+            buyMarketRoute
         );
         mooncakeSetEnhanceMarketPlanRowRouteData(row, 'ask', sellRecommendation);
         mooncakeSetEnhanceMarketPlanRowRouteData(row, 'bid', buyRecommendation);
@@ -33701,7 +33757,7 @@
             background: 'rgba(137, 157, 218, .28)'
         });
 
-        const createQuoteButton = (side, price, recommendation, priceColor, isHistorical) => {
+        const createQuoteButton = (side, price, recommendation, marketRoute, priceColor, isHistorical) => {
             const button = document.createElement('button');
             button.type = 'button';
             button.className = `mooncake-enh-market-plan-quote mooncake-enh-market-plan-quote-${side}`;
@@ -33709,9 +33765,11 @@
                 ? (isZH ? '卖' : 'Ask')
                 : (isZH ? '买' : 'Bid');
             button.dataset.sideLabel = sideLabel;
-            const hasRoute = !!recommendation && price > 0;
-            button.dataset.routeReady = hasRoute ? '1' : '0';
-            button.disabled = !hasRoute || mooncakeEnhanceQuickApplyDepth > 0;
+            const canApplyRecommendation = !!recommendation && price > 0;
+            const marketHourlyWage = Number(marketRoute?.hourlyWage);
+            const hasMarketRoute = price > 0 && Number.isFinite(marketHourlyWage);
+            button.dataset.routeReady = canApplyRecommendation ? '1' : '0';
+            button.disabled = !canApplyRecommendation || mooncakeEnhanceQuickApplyDepth > 0;
             Object.assign(button.style, {
                 display: 'grid',
                 gridTemplateColumns: 'minmax(64px, 1fr) minmax(62px, .95fr) minmax(56px, .82fr)',
@@ -33729,7 +33787,7 @@
                 textAlign: 'right',
                 font: 'inherit',
                 fontVariantNumeric: 'tabular-nums',
-                cursor: hasRoute ? 'pointer' : 'default'
+                cursor: canApplyRecommendation ? 'pointer' : 'default'
             });
             const priceLine = document.createElement('strong');
             priceLine.className = 'mooncake-enh-market-plan-quote-price';
@@ -33753,7 +33811,7 @@
                 : (isZH ? '不保护' : 'No P');
             const protect = document.createElement('span');
             protect.className = 'mooncake-enh-market-plan-quote-protection';
-            protect.textContent = hasRoute ? protectionText : '-';
+            protect.textContent = canApplyRecommendation ? protectionText : '-';
             Object.assign(protect.style, {
                 color: protects > 1e-9 ? '#85e9aa' : 'rgba(215, 224, 247, .60)',
                 fontSize: '11px',
@@ -33769,11 +33827,10 @@
             });
             const hourly = document.createElement('span');
             hourly.className = 'mooncake-enh-market-plan-quote-hourly';
-            const hourlyWage = Number(recommendation?.hourlyWage);
-            hourly.textContent = hasRoute && Number.isFinite(hourlyWage)
-                ? mooncakeFormatHourlyWage(hourlyWage)
+            hourly.textContent = hasMarketRoute
+                ? mooncakeFormatHourlyWage(marketHourlyWage)
                 : '-';
-            hourly.dataset.hourlyWage = Number.isFinite(hourlyWage) ? String(hourlyWage) : 'NaN';
+            hourly.dataset.hourlyWage = hasMarketRoute ? String(marketHourlyWage) : 'NaN';
             hourly.dataset.historical = isHistorical ? '1' : '0';
             Object.assign(hourly.style, {
                 fontSize: '11px',
@@ -33798,14 +33855,14 @@
             mobilePrice.style.opacity = isHistorical ? '.62' : '1';
             const mobileHourly = document.createElement('span');
             mobileHourly.className = 'mooncake-enh-market-plan-quote-mobile-hourly';
-            mobileHourly.textContent = hasRoute && Number.isFinite(hourlyWage)
-                ? mooncakeFormatHourlyWage(hourlyWage)
+            mobileHourly.textContent = hasMarketRoute
+                ? mooncakeFormatHourlyWage(marketHourlyWage)
                 : '-';
-            mobileHourly.dataset.hourlyWage = Number.isFinite(hourlyWage) ? String(hourlyWage) : 'NaN';
+            mobileHourly.dataset.hourlyWage = hasMarketRoute ? String(marketHourlyWage) : 'NaN';
             mobileHourly.dataset.historical = isHistorical ? '1' : '0';
             const mobileProtect = document.createElement('span');
             mobileProtect.className = 'mooncake-enh-market-plan-quote-mobile-protection';
-            mobileProtect.textContent = hasRoute ? protectionText : '-';
+            mobileProtect.textContent = canApplyRecommendation ? protectionText : '-';
             mobileProtect.style.color = protects > 1e-9 ? '#85e9aa' : 'rgba(215, 224, 247, .60)';
             mobileProtect.style.opacity = isHistorical ? '.68' : '1';
             const createSeparator = () => {
@@ -33820,22 +33877,36 @@
             mooncakeApplyEnhanceMarketPlanHourlyTone(hourly, targetHourlyWage);
             mooncakeApplyEnhanceMarketPlanHourlyTone(mobileHourly, targetHourlyWage);
 
-            if (hasRoute) {
+            if (canApplyRecommendation || hasMarketRoute) {
                 const sideLabel = side === 'ask' ? (isZH ? '卖一' : 'Ask') : (isZH ? '买一' : 'Bid');
                 const priceSource = isHistorical
                     ? (isZH ? '近 7d 成交均价' : '7d average trade price')
                     : sideLabel;
-                button.title = isZH
-                    ? `左键填入${priceSource}方案；右键打开 +${quote.level} 市场`
-                    : `Left click to apply the ${priceSource} plan; right click to open the +${quote.level} market`;
+                const marketRouteLabel = isZH
+                    ? `市场工时按 +0 到 +${quote.level} 计算，与挂单行一致`
+                    : `Market wage is calculated from +0 to +${quote.level}, matching listing rows`;
+                button.title = canApplyRecommendation
+                    ? (isZH
+                        ? `${marketRouteLabel}；左键填入当前 +${startLevel} 的${priceSource}方案；右键打开市场`
+                        : `${marketRouteLabel}; left click applies the current +${startLevel} ${priceSource} plan; right click opens the market`)
+                    : marketRouteLabel;
                 bindTooltip(button, () => {
-                    const actions = mooncakeFormatExpectedQty(recommendation.expectedActions);
+                    const actions = mooncakeFormatExpectedQty(recommendation?.expectedActions);
                     const protectsText = mooncakeFormatExpectedQty(protects);
+                    const marketHourlyText = hasMarketRoute
+                        ? `${mooncakeFormatHourlyWage(marketHourlyWage)}/h`
+                        : '-';
+                    const currentPlanText = canApplyRecommendation
+                        ? `+${startLevel} ${isZH ? '到' : 'to'} +${quote.level} · ${actions} ${isZH ? '次' : 'actions'} / ${protectsText} ${isZH ? '个保护' : 'protects'}`
+                        : '-';
                     return `<div class="tt-header">+${quote.level} ${priceSource}</div>`
                         + `<span class="tt-label">${isZH ? '估值:' : 'Valuation:'}</span> <span class="tt-value">${formatMoney(price)}</span>\n`
-                        + `<span class="tt-label">${isZH ? '保护:' : 'Protect:'}</span> <span class="tt-value">${protectionText}</span>\n`
-                        + `<span class="tt-label">${isZH ? '期望:' : 'Expected:'}</span> <span class="tt-value">${actions} ${isZH ? '次' : 'actions'} / ${protectsText} ${isZH ? '个保护' : 'protects'}</span>`;
+                        + `<span class="tt-label">${isZH ? '市场工时:' : 'Market wage:'}</span> <span class="tt-value">${marketHourlyText} (${isZH ? '+0 到' : '+0 to'} +${quote.level})</span>\n`
+                        + `<span class="tt-label">${isZH ? '保护:' : 'Protect:'}</span> <span class="tt-value">${canApplyRecommendation ? protectionText : '-'}</span>\n`
+                        + `<span class="tt-label">${isZH ? '当前方案:' : 'Current plan:'}</span> <span class="tt-value">${currentPlanText}</span>`;
                 });
+            }
+            if (canApplyRecommendation) {
                 button.addEventListener('click', async event => {
                     event.preventDefault();
                     event.stopPropagation();
@@ -33875,9 +33946,9 @@
 
         row.append(
             levelCell,
-            createQuoteButton('ask', quote.ask, sellRecommendation, '#f6ce64', quote.askIsHistorical),
+            createQuoteButton('ask', quote.ask, sellRecommendation, sellMarketRoute, '#f6ce64', quote.askIsHistorical),
             divider,
-            createQuoteButton('bid', quote.bid, buyRecommendation, '#9fdcf0', quote.bidIsHistorical)
+            createQuoteButton('bid', quote.bid, buyRecommendation, buyMarketRoute, '#9fdcf0', quote.bidIsHistorical)
         );
         row.addEventListener('contextmenu', openMarket);
         return row;
@@ -34064,9 +34135,9 @@
         });
         [
             isZH ? '等级' : 'Level',
-            isZH ? '卖一（价格 · 工时 · 保护）' : 'Ask (price · wage · protect)',
+            isZH ? '卖一（价格 · 市场工时 · 保护）' : 'Ask (price · market wage · protect)',
             '',
-            isZH ? '买一（价格 · 工时 · 保护）' : 'Bid (price · wage · protect)'
+            isZH ? '买一（价格 · 市场工时 · 保护）' : 'Bid (price · market wage · protect)'
         ].forEach((text, index) => {
             const label = document.createElement('span');
             label.className = [
@@ -34105,8 +34176,8 @@
         const subtitle = column?.querySelector('.mooncake-enh-market-plan-subtitle');
         if (subtitle) {
             subtitle.textContent = isZH
-                ? `${getItemName(itemHrid) || itemHrid} · 从 +${startLevel}`
-                : `${getItemName(itemHrid) || itemHrid} · from +${startLevel}`;
+                ? `${getItemName(itemHrid) || itemHrid} · 当前 +${startLevel} · 工时按市场 +0 路线`
+                : `${getItemName(itemHrid) || itemHrid} · current +${startLevel} · market wage from +0`;
         }
         const target = column.querySelector('.mooncake-enh-market-plan-target');
         if (target) {
@@ -34222,12 +34293,20 @@
                     const quote = levels[index];
                     let sellRecommendation = null;
                     let buyRecommendation = null;
+                    let sellMarketRoute = null;
+                    let buyMarketRoute = null;
                     try {
                         sellRecommendation = quote.ask > 0
                             ? mooncakeGetEnhancePanelTraditionalRecommendation(itemHrid, startLevel, quote.level, marketData, quote.ask, pricingContext)
                             : null;
                         buyRecommendation = quote.bid > 0
                             ? mooncakeGetEnhancePanelTraditionalRecommendation(itemHrid, startLevel, quote.level, marketData, quote.bid, pricingContext)
+                            : null;
+                        sellMarketRoute = quote.ask > 0
+                            ? mooncakeGetEnhanceMarketPlanMarketRoute(itemHrid, quote.level, marketData, quote.ask)
+                            : null;
+                        buyMarketRoute = quote.bid > 0
+                            ? mooncakeGetEnhanceMarketPlanMarketRoute(itemHrid, quote.level, marketData, quote.bid)
                             : null;
                     } catch (error) {
                         console.warn(`[MoonCake] +${quote.level} 强化行情计算失败:`, error);
@@ -34236,7 +34315,9 @@
                     const rowSignature = `${itemHrid}|${startLevel}|${mooncakeGetEnhanceMarketPlanRowSignature(
                         quote,
                         sellRecommendation,
-                        buyRecommendation
+                        buyRecommendation,
+                        sellMarketRoute,
+                        buyMarketRoute
                     )}`;
                     const existingRow = rowsByLevel.get(quote.level) || null;
                     let row = existingRow;
@@ -34248,6 +34329,8 @@
                             quote,
                             sellRecommendation,
                             buyRecommendation,
+                            sellMarketRoute,
+                            buyMarketRoute,
                             rowSignature
                         );
                         if (existingRow) existingRow.replaceWith(row);
@@ -34325,6 +34408,7 @@
         const dataSignature = JSON.stringify([
             itemHrid,
             startLevel,
+            mooncakeMarketPricingRevision,
             pricingContext?.dependencySignature || 'pricing-unavailable',
             priceSignature
         ]);
@@ -34409,6 +34493,8 @@
                         itemHrid,
                         startLevel,
                         quote,
+                        null,
+                        null,
                         null,
                         null,
                         `${itemHrid}|${startLevel}|pending|${quote.level}:${quote.ask}/${quote.bid}`
