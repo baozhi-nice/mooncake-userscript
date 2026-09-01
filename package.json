@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "check": "node scripts/build.mjs --check"
+    "check": "node scripts/build.mjs --check",
+    "test:anti-suicide": "node scripts/test-anti-suicide-system.mjs",
+    "test:my-listing-types": "node scripts/test-my-listing-types.mjs"
   },
   "devDependencies": {
     "terser": "5.50.0"
