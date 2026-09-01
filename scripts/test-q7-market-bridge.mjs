@@ -42,12 +42,13 @@ const fallbackMarketData = {
 const q7MarketData = {
     '/items/shared': { 0: { a: -1, b: 77 } }
 };
+const q7SourceTimestamp = Math.floor(Date.now() / 1000) - 60;
 const localStorage = {
     getItem(key) {
         if (key === 'mwi-q7-market-refresh.snapshot.v1') {
             return JSON.stringify({
-                fetchedAt: 1_800_000_001_000,
-                sourceTimestamp: 1_800_000_001,
+                fetchedAt: q7SourceTimestamp * 1000,
+                sourceTimestamp: q7SourceTimestamp,
                 marketData: q7MarketData
             });
         }
@@ -61,7 +62,8 @@ const calls = {
     orderModal: 0,
     myListings: 0,
     marketplace: 0,
-    chat: 0
+    chat: 0,
+    enhancementRefresh: []
 };
 
 const context = vm.createContext({
@@ -73,6 +75,7 @@ const context = vm.createContext({
     mooncakeScheduleMyListingsTargetFilter() { calls.myListings++; },
     mooncakeMyListingsManagementState: null,
     currentMarketItem: null,
+    mooncakeScheduleCurrentEnhancementMarketRefresh(itemHrid) { calls.enhancementRefresh.push(itemHrid); },
     scheduleMarketplaceHourlyWageRefresh() { calls.marketplace++; },
     refreshMooncakeChatLabor() { calls.chat++; },
     mooncakeCacheQ7MarketOrderBooks() {},
@@ -105,21 +108,22 @@ const snapshots = context.__bridgeTest.getSnapshotCache();
 snapshots['/items/shared:0'] = { bid: 90, ask: 100, priceBandMin: 1, priceBandMax: 1000 };
 snapshots['/items/unrelated:0'] = { bid: 10, ask: 20 };
 handler({ detail: { success: true } });
-assert.equal(context.__bridgeTest.getMarketDataCache()['/items/shared'][0].a, -1, 'Q7 cache must replace MoonCake memory data');
-assert.equal(context.__bridgeTest.getMarketDataCache()['/items/shared'][0].b, 77, 'Q7 bid must replace MoonCake memory data');
+assert.equal(context.__bridgeTest.getMarketDataCache()['/items/shared'][0].a, -1, 'Q7 cache must seed MoonCake memory data when no live quote exists');
+assert.equal(context.__bridgeTest.getMarketDataCache()['/items/shared'][0].b, 77, 'Q7 bid must seed MoonCake memory data when no live quote exists');
 assert.equal(context.__bridgeTest.getMarketDataCache()['/items/shared'][0].p, 95, 'fallback metadata must remain available');
 assert.equal(context.__bridgeTest.getMarketDataCache()['/items/official_only'][0].b, 350, 'fallback entries must remain available');
 const sharedSnapshot = snapshots['/items/shared:0'];
-assert.equal(sharedSnapshot.bid, 77, 'Q7 must replace the higher-priority live snapshot bid');
-assert.equal(sharedSnapshot.ask, -1, 'Q7 must replace the higher-priority live snapshot ask');
-assert.equal(sharedSnapshot.time, 1_800_000_001, 'Q7 snapshots must use the Q7 source timestamp');
+assert.equal(sharedSnapshot.bid, 77, 'Q7 must replace a legacy snapshot bid');
+assert.equal(sharedSnapshot.ask, -1, 'Q7 must replace a legacy snapshot ask');
+assert.equal(sharedSnapshot.time, q7SourceTimestamp, 'Q7 snapshots must use the Q7 source timestamp');
+assert.equal(sharedSnapshot.source, 'q7-snapshot', 'Q7 snapshots must be marked as fallback data');
 assert.equal(sharedSnapshot.priceBandMin, 1, 'Q7 snapshots must retain the lower price band');
 assert.equal(sharedSnapshot.priceBandMax, 1000, 'Q7 snapshots must retain the upper price band');
 assert.equal(snapshots['/items/unrelated:0'].bid, 10, 'unrelated live snapshots must remain intact');
 const resolvedQ7Quote = context.__bridgeTest.resolveEnhancementMarketQuotes('/items/shared', 0, 888, 999, 123);
 assert.equal(resolvedQ7Quote.bid, 77, 'Q7 bid must override stale renderer input');
 assert.equal(resolvedQ7Quote.ask, -1, 'Q7 no-ask marker must override stale renderer input');
-assert.equal(resolvedQ7Quote.time, 1_800_000_001, 'Q7 source timestamp must be returned with the quote');
+assert.equal(resolvedQ7Quote.time, q7SourceTimestamp, 'Q7 source timestamp must be returned with the quote');
 assert.equal(context.__bridgeTest.getPricingRevision(), 1, 'price revision must advance');
 assert.deepEqual(calls, {
     clearRoute: 1,
@@ -127,22 +131,33 @@ assert.deepEqual(calls, {
     orderModal: 1,
     myListings: 1,
     marketplace: 1,
-    chat: 1
+    chat: 1,
+    enhancementRefresh: []
 }, 'all price-dependent surfaces must be scheduled');
 
 handler({ detail: { success: false } });
 assert.equal(context.__bridgeTest.getPricingRevision(), 1, 'failed Q7 requests must not refresh MoonCake data');
 
+context.currentMarketItem = { itemHrid: '/items/shared', enhancementLevel: 0 };
 context.__bridgeTest.updateMarketCacheFromWS({
     itemHrid: '/items/shared',
     orderBooks: [{ asks: [{ price: 999 }], bids: [{ price: 888 }] }],
     priceBandMins: [1],
     priceBandMaxs: [1000]
 });
-assert.equal(context.__bridgeTest.getMarketDataCache()['/items/shared'][0].a, -1, 'WebSocket updates must not overwrite Q7 asks');
-assert.equal(context.__bridgeTest.getMarketDataCache()['/items/shared'][0].b, 77, 'WebSocket updates must not overwrite Q7 bids');
-assert.equal(snapshots['/items/shared:0'].ask, -1, 'WebSocket snapshots must retain Q7 asks');
-assert.equal(snapshots['/items/shared:0'].bid, 77, 'WebSocket snapshots must retain Q7 bids');
+assert.equal(context.__bridgeTest.getMarketDataCache()['/items/shared'][0].a, 999, 'the open game order book must overwrite stale Q7 asks');
+assert.equal(context.__bridgeTest.getMarketDataCache()['/items/shared'][0].b, 888, 'the open game order book must overwrite stale Q7 bids');
+assert.equal(snapshots['/items/shared:0'].ask, 999, 'WebSocket snapshots must retain the live ask');
+assert.equal(snapshots['/items/shared:0'].bid, 888, 'WebSocket snapshots must retain the live bid');
+assert.equal(snapshots['/items/shared:0'].source, 'game-order-book', 'WebSocket snapshots must be marked as live game data');
+assert.equal(calls.enhancementRefresh.at(-1), '/items/shared', 'opening a material must schedule its visible enhancement data to redraw');
+const resolvedLiveQuote = context.__bridgeTest.resolveEnhancementMarketQuotes('/items/shared', 0, 77, -1, q7SourceTimestamp);
+assert.equal(resolvedLiveQuote.bid, 888, 'the resolver must prefer live game bids over Q7');
+assert.equal(resolvedLiveQuote.ask, 999, 'the resolver must prefer live game asks over Q7');
+
+handler({ detail: { success: true } });
+assert.equal(context.__bridgeTest.getMarketDataCache()['/items/shared'][0].a, 999, 'a later Q7 refresh must not replace a live material ask');
+assert.equal(context.__bridgeTest.getMarketDataCache()['/items/shared'][0].b, 888, 'a later Q7 refresh must not replace a live material bid');
 
 context.__bridgeTest.updateMarketCacheFromWS({
     itemHrid: '/items/official_only',

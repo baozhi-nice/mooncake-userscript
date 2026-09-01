@@ -2754,6 +2754,8 @@
     let mooncakeMarketPricingRevision = 0;
     let mooncakeQ7MarketOverlay = null;
     let mooncakeQ7MarketOverlayTimestamp = null;
+    const MOONCAKE_MARKET_QUOTE_SOURCE_GAME = 'game-order-book';
+    const MOONCAKE_MARKET_QUOTE_SOURCE_Q7 = 'q7-snapshot';
 
     function getMarketApiUrl() {
         const host = location.hostname;
@@ -2800,6 +2802,10 @@
         };
     }
 
+    function mooncakeIsLiveGameMarketSnapshot(snapshot) {
+        return snapshot?.source === MOONCAKE_MARKET_QUOTE_SOURCE_GAME;
+    }
+
     function mooncakeRefreshExternalMarketPricingSurfaces() {
         mooncakeMarketPricingRevision++;
         try { mooncakeClearEnhancementRouteCache(); } catch (_) {}
@@ -2841,18 +2847,23 @@
                 const q7Quote = mooncakeGetQ7MarketOverlayQuote(itemHrid, rawLevel);
                 if (!q7Quote) continue;
                 const level = String(rawLevel);
+                const snapshotKey = `${itemHrid}:${level}`;
+                const previousSnapshot = marketDetailSnapshotCache[snapshotKey];
+                // The game sends the order book for an item the player has just
+                // opened. Preserve that direct quote until the next game update;
+                // Q7 remains a fallback for levels that have not been viewed.
+                if (mooncakeIsLiveGameMarketSnapshot(previousSnapshot)) continue;
                 marketDataCache[itemHrid][level] = {
                     ...(marketDataCache[itemHrid][level] || {}),
                     a: q7Quote.a,
                     b: q7Quote.b
                 };
-                const snapshotKey = `${itemHrid}:${level}`;
-                const previousSnapshot = marketDetailSnapshotCache[snapshotKey];
                 marketDetailSnapshotCache[snapshotKey] = {
                     ...previousSnapshot,
                     bid: q7Quote.b,
                     ask: q7Quote.a,
                     time: mooncakeQ7MarketOverlayTimestamp,
+                    source: MOONCAKE_MARKET_QUOTE_SOURCE_Q7,
                     priceBandMin: previousSnapshot?.priceBandMin,
                     priceBandMax: previousSnapshot?.priceBandMax
                 };
@@ -2956,8 +2967,19 @@
 
     function mooncakeResolveEnhancementMarketQuotes(itemHrid, enhancementLevel, bid, ask, timestamp = null) {
         const level = Math.max(0, Math.min(20, Math.floor(Number(enhancementLevel) || 0)));
-        // A Q7 -1 is an explicit empty side of the order book, not a missing value
-        // that should fall back to a stale quote passed by an older render.
+        const snapshot = marketDetailSnapshotCache?.[`${itemHrid}:${level}`];
+        // A direct game order book is authoritative for the item the player is
+        // viewing. Q7 fills gaps for the rest of the market, but cannot replace
+        // the live price the game just delivered.
+        if (mooncakeIsLiveGameMarketSnapshot(snapshot)) {
+            return {
+                bid: snapshot.bid,
+                ask: snapshot.ask,
+                time: snapshot.time ?? timestamp
+            };
+        }
+        // A Q7 -1 is an explicit empty side of its fallback order book, not a
+        // missing value that should fall back to an older renderer input.
         const q7Quote = mooncakeGetQ7MarketOverlayQuote(itemHrid, level);
         if (q7Quote) {
             return {
@@ -2966,7 +2988,6 @@
                 time: mooncakeQ7MarketOverlayTimestamp ?? timestamp
             };
         }
-        const snapshot = marketDetailSnapshotCache?.[`${itemHrid}:${level}`];
         const marketLevel = getMarketData()?.marketData?.[itemHrid]?.[String(level)];
         return {
             // The order-book snapshot is the newest source. It also makes delayed renders
@@ -5118,11 +5139,11 @@
 
             const askPrice = mooncakeGetOrderBookBestPrice(book, 'asks');
             const bidPrice = mooncakeGetOrderBookBestPrice(book, 'bids');
-            // Keep Q7's explicit quote (including -1 for no orders) authoritative
-            // for MoonCake calculations after the game sends another order-book update.
-            const q7Quote = mooncakeGetQ7MarketOverlayQuote(itemHrid, level);
-            const effectiveAsk = q7Quote ? q7Quote.a : askPrice;
-            const effectiveBid = q7Quote ? q7Quote.b : bidPrice;
+            // This payload comes from the market currently open in the game.
+            // It must replace a stale global snapshot so material costs update
+            // immediately after the player opens that material.
+            const effectiveAsk = askPrice;
+            const effectiveBid = bidPrice;
             const previous = marketDataCache[itemHrid][level];
             const previousSnapshot = marketDetailSnapshotCache[`${itemHrid}:${level}`];
             const priceBandMin = mooncakeGetOrderBookPriceBandValue(priceBandMins, level);
@@ -5140,6 +5161,7 @@
                 bid: effectiveBid,
                 ask: effectiveAsk,
                 time: snapshotTime,
+                source: MOONCAKE_MARKET_QUOTE_SOURCE_GAME,
                 // Preserve a prior valid band if this particular payload only
                 // contains order-book quotes.
                 priceBandMin: hasPriceBand ? priceBandMin : previousSnapshot?.priceBandMin,
