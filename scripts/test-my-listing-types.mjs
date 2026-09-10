@@ -192,4 +192,30 @@ assert.match(source, /mooncakeResolveMyListingIdFromLiveSnapshot\(descriptor\)/,
 assert.match(source, /width:78px !important/, 'the type column must retain a fixed desktop width');
 assert.match(source, /width:70px !important/, 'the type column must stay compact on mobile layouts');
 
+const marketUpdateTimeSandbox = {};
+vm.runInNewContext(`
+    ${extractFunction('mooncakeNormalizeMarketDataUpdateTimestamp')}
+    ${extractFunction('mooncakeFormatMyListingsMarketUpdateTime')}
+    globalThis.formatMarketUpdate = mooncakeFormatMyListingsMarketUpdateTime;
+`, marketUpdateTimeSandbox);
+const localMarketTimestamp = Math.floor(new Date(2026, 8, 10, 21, 6, 0).getTime() / 1000);
+assert.equal(marketUpdateTimeSandbox.formatMarketUpdate(localMarketTimestamp), '21:06', 'the toolbar must use a compact local clock');
+assert.equal(
+    marketUpdateTimeSandbox.formatMarketUpdate(localMarketTimestamp, 'date'),
+    '09/10 21:06',
+    'the visible toolbar time must expose its date without using extra timers'
+);
+assert.equal(
+    marketUpdateTimeSandbox.formatMarketUpdate(localMarketTimestamp * 1000, 'full'),
+    '2026/09/10 21:06:00',
+    'the tooltip must retain the full source timestamp and accept legacy millisecond caches'
+);
+assert.match(source, /mooncakeSetMarketDataUpdateTimestamp\(\s*q7Snapshot\.sourceTimestamp,\s*MOONCAKE_MARKET_DATA_UPDATE_SOURCE_Q7\s*\)/, 'Q7 must expose its source timestamp, not fetchedAt');
+assert.match(source, /mooncakeSetMarketDataUpdateTimestamp\(\s*data\.timestamp,\s*MOONCAKE_MARKET_DATA_UPDATE_SOURCE_PUBLIC\s*\)/, 'the public market response timestamp must be retained');
+assert.match(source, /mooncakeSetMarketDataUpdateTimestamp\(\s*mwiToolsMarket\.timestamp,\s*MOONCAKE_MARKET_DATA_UPDATE_SOURCE_MWI_TOOLS\s*\)/, 'the MWITools cache source timestamp must be retained');
+assert.match(source, /controlHost\.prepend\(time\)/, 'the update time must appear before the existing My Listings filters');
+assert.match(source, /if \(time\.textContent !== textContent\) time\.textContent = textContent;/, 'an unchanged timestamp must not create a self-triggering mutation loop');
+assert.match(source, /MOONCAKE_MY_LISTINGS_MARKET_UPDATE_ATTR}[\s\S]{0,180}?\.join\(','\)/, 'the timestamp node must be ignored by My Listings mutation subscribers');
+assert.match(source, /mooncakeEnsureMyListingsMarketUpdateTime\(table, root\)/, 'the update time must follow My Listings table lifecycle changes');
+
 console.log('My listing type checks passed.');

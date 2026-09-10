@@ -6,7 +6,12 @@
     "build": "node scripts/build.mjs",
     "check": "node scripts/build.mjs --check",
     "test:anti-suicide": "node scripts/test-anti-suicide-system.mjs",
-    "test:my-listing-types": "node scripts/test-my-listing-types.mjs"
+    "test:my-listing-types": "node scripts/test-my-listing-types.mjs",
+    "test:market-summary": "node scripts/test-market-summary-hourly-resilience.mjs",
+    "test:personal-trades": "node scripts/test-market-personal-trade-history.mjs",
+    "test:market-trades": "node scripts/test-market-trade-log.mjs",
+    "test:sunny-market": "node scripts/test-sunny-market-card-avoidance.mjs",
+    "test:warehouse-queue": "node scripts/test-inventory-warehouse-queue.mjs"
   },
   "devDependencies": {
     "terser": "5.50.0"

@@ -24,6 +24,7 @@
     const MOONCAKE_Q7_MARKET_REPORT_MAX_LEVEL = 20;
     const MOONCAKE_Q7_MARKET_REPORT_MAX_DEPTH = 5;
     const MOONCAKE_Q7_MARKET_REPORT_CACHE_LIMIT = 100;
+    const MOONCAKE_Q7_MARKET_REPORT_RAW_CACHE_LIMIT = 2;
     const MOONCAKE_Q7_MARKET_REPORT_DEBOUNCE_MS = 2000;
     const MOONCAKE_Q7_MARKET_REPORT_FRESHNESS_MS = 1000;
     const MOONCAKE_Q7_MARKET_REPORT_WAIT_MS = 15000;
@@ -2771,8 +2772,18 @@
     let mooncakeMarketPricingRevision = 0;
     let mooncakeQ7MarketOverlay = null;
     let mooncakeQ7MarketOverlayTimestamp = null;
+    let mooncakeMarketDataUpdateTimestamp = null;
+    let mooncakeMarketDataUpdateSource = '';
     const MOONCAKE_MARKET_QUOTE_SOURCE_GAME = 'game-order-book';
     const MOONCAKE_MARKET_QUOTE_SOURCE_Q7 = 'q7-snapshot';
+    const MOONCAKE_MARKET_DATA_UPDATE_SOURCE_Q7 = 'q7';
+    const MOONCAKE_MARKET_DATA_UPDATE_SOURCE_PUBLIC = 'public-api';
+    const MOONCAKE_MARKET_DATA_UPDATE_SOURCE_MWI_TOOLS = 'mwi-tools';
+    // The game and the Q7 reporter use separate clocks. A few seconds of
+    // tolerance avoids replacing an order book that arrived just after a
+    // report was collected, while still letting a genuinely newer snapshot
+    // repair an old in-memory quote.
+    const MOONCAKE_MARKET_QUOTE_TIMESTAMP_SKEW_SECONDS = 5;
 
     function getMarketApiUrl() {
         const host = location.hostname;
@@ -2786,6 +2797,38 @@
         return "https://www.milkywayidle.com/game_data/marketplace.json";
     }
 
+    function mooncakeNormalizeMarketDataUpdateTimestamp(value) {
+        let timestamp = Number(value);
+        if (!Number.isFinite(timestamp) || timestamp <= 0) return null;
+        // All current market endpoints use Unix seconds, while a few legacy
+        // caches stored milliseconds. Accept both without changing semantics.
+        if (timestamp >= 1e12) timestamp /= 1000;
+        timestamp = Math.trunc(timestamp);
+        return timestamp > 0 ? timestamp : null;
+    }
+
+    function mooncakeSetMarketDataUpdateTimestamp(value, source = '') {
+        const timestamp = mooncakeNormalizeMarketDataUpdateTimestamp(value);
+        const normalizedSource = String(source || '');
+        if (!timestamp && !normalizedSource) return false;
+        // The toolbar describes the freshest market snapshot known to
+        // MoonCake. A delayed userscript cache must never move that clock
+        // backwards or erase a valid timestamp with an undated snapshot.
+        if (mooncakeMarketDataUpdateTimestamp &&
+            (!timestamp || timestamp < mooncakeMarketDataUpdateTimestamp)) {
+            return false;
+        }
+        if (timestamp === mooncakeMarketDataUpdateTimestamp && normalizedSource === mooncakeMarketDataUpdateSource) {
+            return false;
+        }
+        mooncakeMarketDataUpdateTimestamp = timestamp;
+        mooncakeMarketDataUpdateSource = normalizedSource;
+        // The toolbar may not exist yet. A later My Listings lifecycle pass
+        // will create it, so a missing surface here is intentionally harmless.
+        try { mooncakeSyncMyListingsMarketUpdateTime(); } catch (_) {}
+        return true;
+    }
+
     function mooncakeReadQ7MarketOverlay() {
         try {
             const snapshot = JSON.parse(localStorage.getItem(MOONCAKE_Q7_MARKET_SNAPSHOT_KEY) || 'null');
@@ -2796,10 +2839,12 @@
             }
             const sourceTimestamp = Number(snapshot.sourceTimestamp);
             const fetchedAt = Number(snapshot.fetchedAt);
+            const normalizedSourceTimestamp = mooncakeNormalizeMarketDataUpdateTimestamp(sourceTimestamp);
             return {
                 marketData,
-                timestamp: Number.isFinite(sourceTimestamp) && sourceTimestamp > 0
-                    ? Math.trunc(sourceTimestamp)
+                sourceTimestamp: normalizedSourceTimestamp,
+                timestamp: normalizedSourceTimestamp
+                    ? normalizedSourceTimestamp
                     : (Number.isFinite(fetchedAt) ? Math.floor(fetchedAt / 1000) : Math.floor(Date.now() / 1000))
             };
         } catch (_) {
@@ -2819,8 +2864,30 @@
         };
     }
 
+    function mooncakeClearQ7MarketOverlay() {
+        let changed = !!mooncakeQ7MarketOverlay || mooncakeQ7MarketOverlayTimestamp !== null;
+        mooncakeQ7MarketOverlay = null;
+        mooncakeQ7MarketOverlayTimestamp = null;
+        for (const [key, snapshot] of Object.entries(marketDetailSnapshotCache || {})) {
+            if (snapshot?.source !== MOONCAKE_MARKET_QUOTE_SOURCE_Q7) continue;
+            delete marketDetailSnapshotCache[key];
+            changed = true;
+        }
+        return changed;
+    }
+
     function mooncakeIsLiveGameMarketSnapshot(snapshot) {
         return snapshot?.source === MOONCAKE_MARKET_QUOTE_SOURCE_GAME;
+    }
+
+    function mooncakeShouldKeepLiveGameMarketSnapshot(snapshot, incomingTimestamp) {
+        if (!mooncakeIsLiveGameMarketSnapshot(snapshot)) return false;
+        const liveTimestamp = Number(snapshot?.time);
+        const nextTimestamp = Number(incomingTimestamp);
+        // Missing timestamps should retain the direct game quote. Both normal
+        // sources include one, so this only protects malformed old cache data.
+        if (!(liveTimestamp > 0) || !(nextTimestamp > 0)) return true;
+        return Math.floor(liveTimestamp) + MOONCAKE_MARKET_QUOTE_TIMESTAMP_SKEW_SECONDS >= Math.floor(nextTimestamp);
     }
 
     function mooncakeRefreshExternalMarketPricingSurfaces() {
@@ -2852,10 +2919,33 @@
         if (!marketDataCache) {
             const externalMarket = readMWIToolsMarketData();
             marketDataCache = externalMarket?.marketData || {};
+            if (externalMarket?.timestamp) {
+                mooncakeSetMarketDataUpdateTimestamp(
+                    externalMarket.timestamp,
+                    MOONCAKE_MARKET_DATA_UPDATE_SOURCE_MWI_TOOLS
+                );
+            }
+        }
+
+        const baseTimestamp = mooncakeNormalizeMarketDataUpdateTimestamp(mooncakeMarketDataUpdateTimestamp);
+        const q7SourceTimestamp = mooncakeNormalizeMarketDataUpdateTimestamp(q7Snapshot.sourceTimestamp);
+        if (baseTimestamp &&
+            (!q7SourceTimestamp ||
+                q7SourceTimestamp + MOONCAKE_MARKET_QUOTE_TIMESTAMP_SKEW_SECONDS < baseTimestamp)) {
+            // A stale Q7 snapshot used to overwrite both today's public API
+            // prices and the visible update time. Remove its in-memory overlay
+            // as well, otherwise quote resolution could keep using it after
+            // the base cache had already refreshed.
+            mooncakeClearQ7MarketOverlay();
+            return false;
         }
 
         mooncakeQ7MarketOverlay = q7Snapshot.marketData;
         mooncakeQ7MarketOverlayTimestamp = q7Snapshot.timestamp;
+        mooncakeSetMarketDataUpdateTimestamp(
+            q7Snapshot.sourceTimestamp,
+            MOONCAKE_MARKET_DATA_UPDATE_SOURCE_Q7
+        );
         for (const [itemHrid, levels] of Object.entries(mooncakeQ7MarketOverlay)) {
             if (!levels || typeof levels !== 'object') continue;
             if (!marketDataCache[itemHrid] || typeof marketDataCache[itemHrid] !== 'object') {
@@ -2867,10 +2957,11 @@
                 const level = String(rawLevel);
                 const snapshotKey = `${itemHrid}:${level}`;
                 const previousSnapshot = marketDetailSnapshotCache[snapshotKey];
-                // The game sends the order book for an item the player has just
-                // opened. Preserve that direct quote until the next game update;
-                // Q7 remains a fallback for levels that have not been viewed.
-                if (mooncakeIsLiveGameMarketSnapshot(previousSnapshot)) continue;
+                // A direct game quote wins while it is at least as recent as
+                // the reporter snapshot. Do not pin it forever: otherwise a
+                // material opened earlier in the session can keep an obsolete
+                // price after Q7 has collected a newer market snapshot.
+                if (mooncakeShouldKeepLiveGameMarketSnapshot(previousSnapshot, q7Snapshot.timestamp)) continue;
                 marketDataCache[itemHrid][level] = {
                     ...(marketDataCache[itemHrid][level] || {}),
                     a: q7Quote.a,
@@ -2899,17 +2990,27 @@
     async function fetchMarketApi() {
         try {
             const url = getMarketApiUrl();
-            const resp = await fetch(url);
+            // Avoid a second, browser-local cache layer. The public endpoint
+            // itself is still only a fallback; an open item's order book is
+            // always the real-time source.
+            const resp = await fetch(url, {
+                cache: 'no-store',
+                headers: { accept: 'application/json' }
+            });
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const data = await mooncakeReadJsonResponse(resp);
             if (data?.marketData) {
                 marketDataCache = data.marketData;
-                mooncakeMarketPricingRevision++;
-                mooncakeClearEnhancementRouteCache();
-                try { mooncakeScheduleMyListingsTargetFilter(0); } catch (_) {}
-                try {
-                    if (mooncakeMyListingsManagementState?.undercut) mooncakeScheduleMyListingsManagement();
-                } catch (_) {}
+                mooncakeSetMarketDataUpdateTimestamp(
+                    data.timestamp,
+                    MOONCAKE_MARKET_DATA_UPDATE_SOURCE_PUBLIC
+                );
+                // Reapply a fresher reporter snapshot after refreshing the
+                // fallback API. If Q7 is unavailable, still redraw all price
+                // consumers from the replacement data.
+                if (!mooncakeApplyQ7MarketCacheUpdate()) {
+                    mooncakeRefreshExternalMarketPricingSurfaces();
+                }
             }
         } catch (e) {
             console.warn('[MoonCake] Failed to fetch market API:', e);
@@ -2968,7 +3069,13 @@
         const listings = Array.isArray(orderBook?.[side]) ? orderBook[side] : [];
         let best = side === 'asks' ? Infinity : -Infinity;
         for (const listing of listings) {
-            const price = Number(listing?.price);
+            // Native WebSocket payloads use compact [price, quantity] tuples
+            // in some clients, while others expose listing objects. Reading
+            // only `.price` silently turned every tuple quote into -1.
+            const rawPrice = Array.isArray(listing)
+                ? listing[0]
+                : (listing?.price ?? listing?.p);
+            const price = Number(rawPrice);
             if (!(price > 0) || !Number.isFinite(price)) continue;
             best = side === 'asks' ? Math.min(best, price) : Math.max(best, price);
         }
@@ -2989,7 +3096,9 @@
         // A direct game order book is authoritative for the item the player is
         // viewing. Q7 fills gaps for the rest of the market, but cannot replace
         // the live price the game just delivered.
-        if (mooncakeIsLiveGameMarketSnapshot(snapshot)) {
+        const q7Quote = mooncakeGetQ7MarketOverlayQuote(itemHrid, level);
+        if (mooncakeIsLiveGameMarketSnapshot(snapshot) &&
+            (!q7Quote || mooncakeShouldKeepLiveGameMarketSnapshot(snapshot, mooncakeQ7MarketOverlayTimestamp))) {
             return {
                 bid: snapshot.bid,
                 ask: snapshot.ask,
@@ -2998,7 +3107,6 @@
         }
         // A Q7 -1 is an explicit empty side of its fallback order book, not a
         // missing value that should fall back to an older renderer input.
-        const q7Quote = mooncakeGetQ7MarketOverlayQuote(itemHrid, level);
         if (q7Quote) {
             return {
                 bid: q7Quote.b,
@@ -3020,6 +3128,11 @@
     const MOONCAKE_ORDER_BOOK_ARCHIVE_LIMIT_KEY = 'Mooncake_orderBookArchive_limit_v1';
     const MOONCAKE_ORDER_BOOK_ARCHIVE_DB = 'MooncakeOrderBookArchive';
     const MOONCAKE_ORDER_BOOK_ARCHIVE_STORE = 'snapshots';
+    const MOONCAKE_MARKET_TRADE_LOG_STORE = 'trades';
+    const MOONCAKE_MARKET_TRADE_LOG_STATE_STORE = 'tradeListingState';
+    const MOONCAKE_MARKET_TRADE_LOG_LIMIT = 20000;
+    const MOONCAKE_MARKET_TRADE_LOG_PAGE_LIMIT = 250;
+    const MOONCAKE_MARKET_TRADE_LOG_CAPTURE_DELAY_MS = 80;
     const MOONCAKE_ORDER_BOOK_ARCHIVE_DEFAULT_LIMIT = 3000;
     const MOONCAKE_ORDER_BOOK_ARCHIVE_MIN_LIMIT = 100;
     const MOONCAKE_ORDER_BOOK_ARCHIVE_MAX_LIMIT = 100000;
@@ -3033,6 +3146,11 @@
     let mooncakeOrderBookArchiveCaptureTimer = 0;
     let mooncakeOrderBookArchiveCaptureGeneration = 0;
     let mooncakeOrderBookArchivePendingPayload = null;
+    let mooncakeMarketTradeLogCaptureTimer = 0;
+    let mooncakeMarketTradeLogPendingBatches = [];
+    let mooncakeMarketTradeLogWriteChain = Promise.resolve();
+    let mooncakeMarketTradeLogTrimAt = 0;
+    let mooncakeMarketTradeLogPageRefreshTimer = 0;
 
     function mooncakeIsOrderBookArchiveEnabled() {
         try { return localStorage.getItem(MOONCAKE_ORDER_BOOK_ARCHIVE_ENABLED_KEY) !== '0'; }
@@ -3061,7 +3179,10 @@
 
     function mooncakeSetOrderBookArchiveEnabled(enabled) {
         try { localStorage.setItem(MOONCAKE_ORDER_BOOK_ARCHIVE_ENABLED_KEY, enabled ? '1' : '0'); } catch (_) {}
-        if (!enabled) mooncakeClearOrderBookArchiveCaptureSchedule();
+        if (!enabled) {
+            mooncakeClearOrderBookArchiveCaptureSchedule();
+            mooncakeClearMarketTradeLogCaptureSchedule();
+        }
         document.querySelectorAll('[data-mooncake-order-archive-switch]').forEach(button => {
             button.textContent = isZH ? `挂单记录：${enabled ? '开' : '关'}` : `Order archive: ${enabled ? 'On' : 'Off'}`;
             button.setAttribute('aria-pressed', String(enabled));
@@ -3081,6 +3202,14 @@
             mooncakeOrderBookArchiveCaptureTimer = 0;
         }
         mooncakeOrderBookArchivePendingPayload = null;
+    }
+
+    function mooncakeClearMarketTradeLogCaptureSchedule() {
+        if (mooncakeMarketTradeLogCaptureTimer) {
+            clearTimeout(mooncakeMarketTradeLogCaptureTimer);
+            mooncakeMarketTradeLogCaptureTimer = 0;
+        }
+        mooncakeMarketTradeLogPendingBatches = [];
     }
 
     function mooncakeScheduleOrderBookArchiveCapture(marketItemOrderBooks) {
@@ -3124,12 +3253,24 @@
     function mooncakeOpenOrderBookArchiveDb() {
         if (mooncakeOrderBookArchiveDbPromise) return mooncakeOrderBookArchiveDbPromise;
         mooncakeOrderBookArchiveDbPromise = new Promise((resolve, reject) => {
-            const request = indexedDB.open(MOONCAKE_ORDER_BOOK_ARCHIVE_DB, 1);
+            const request = indexedDB.open(MOONCAKE_ORDER_BOOK_ARCHIVE_DB, 2);
             request.onupgradeneeded = () => {
                 const db = request.result;
-                const store = db.createObjectStore(MOONCAKE_ORDER_BOOK_ARCHIVE_STORE, { keyPath: 'id' });
-                store.createIndex('itemLevel', 'itemLevel', { unique: false });
-                store.createIndex('timestamp', 'timestamp', { unique: false });
+                if (!db.objectStoreNames.contains(MOONCAKE_ORDER_BOOK_ARCHIVE_STORE)) {
+                    const store = db.createObjectStore(MOONCAKE_ORDER_BOOK_ARCHIVE_STORE, { keyPath: 'id' });
+                    store.createIndex('itemLevel', 'itemLevel', { unique: false });
+                    store.createIndex('timestamp', 'timestamp', { unique: false });
+                }
+                if (!db.objectStoreNames.contains(MOONCAKE_MARKET_TRADE_LOG_STORE)) {
+                    const tradeStore = db.createObjectStore(MOONCAKE_MARKET_TRADE_LOG_STORE, { keyPath: 'id' });
+                    tradeStore.createIndex('characterId', 'characterId', { unique: false });
+                    tradeStore.createIndex('characterTimestamp', ['characterId', 'timestamp'], { unique: false });
+                    tradeStore.createIndex('timestamp', 'timestamp', { unique: false });
+                }
+                if (!db.objectStoreNames.contains(MOONCAKE_MARKET_TRADE_LOG_STATE_STORE)) {
+                    const stateStore = db.createObjectStore(MOONCAKE_MARKET_TRADE_LOG_STATE_STORE, { keyPath: 'id' });
+                    stateStore.createIndex('lastSeenAt', 'lastSeenAt', { unique: false });
+                }
             };
             request.onsuccess = () => resolve(request.result);
             request.onerror = () => reject(request.error);
@@ -3150,6 +3291,257 @@
     function mooncakeGetMarketListingIdKey(value) {
         const listingId = mooncakeNormalizeMarketListingId(value);
         return listingId === null ? '' : String(listingId);
+    }
+
+    function mooncakeNormalizeMarketTradeLogQuantity(value) {
+        const quantity = Number(value);
+        return Number.isFinite(quantity) && quantity > 0 ? Math.floor(quantity) : 0;
+    }
+
+    function mooncakeNormalizeMarketTradeLogListing(listing, fallbackCharacterId = '') {
+        if (!listing || typeof listing !== 'object') return null;
+        const listingId = mooncakeGetMarketListingIdKey(listing.id ?? listing.marketListingId ?? listing.listingId);
+        const characterId = String(listing.characterID ?? listing.characterId ?? fallbackCharacterId ?? '').trim();
+        const itemHrid = String(listing.itemHrid ?? listing.itemHRID ?? '').trim();
+        const unitPrice = Math.floor(Number(listing.workingPrice ?? listing.price));
+        const filledQuantity = mooncakeNormalizeMarketTradeLogQuantity(listing.filledQuantity);
+        if (!listingId || !characterId || !itemHrid.startsWith('/items/') || !Number.isFinite(unitPrice) || unitPrice <= 0) return null;
+        const side = String(listing.side ?? '').toLowerCase();
+        const rawIsSell = listing.isSell;
+        let isSell = null;
+        if (rawIsSell === true || rawIsSell === 1 || rawIsSell === '1' || rawIsSell === 'true' || side === 'sell' || side.endsWith('/sell')) {
+            isSell = true;
+        } else if (rawIsSell === false || rawIsSell === 0 || rawIsSell === '0' || rawIsSell === 'false' || side === 'buy' || side.endsWith('/buy')) {
+            isSell = false;
+        }
+        if (isSell === null) return null;
+        return {
+            listingId,
+            characterId,
+            itemHrid,
+            enhancementLevel: Math.max(0, Math.min(20, Math.floor(Number(listing.enhancementLevel) || 0))),
+            isSell,
+            unitPrice,
+            orderQuantity: mooncakeNormalizeMarketTradeLogQuantity(listing.orderQuantity),
+            filledQuantity,
+            status: String(listing.status ?? '').trim()
+        };
+    }
+
+    function mooncakePlanMarketTradeLogFill(previousState, filledQuantity, mode) {
+        const nextFilled = mooncakeNormalizeMarketTradeLogQuantity(filledQuantity);
+        const hasPreviousState = !!previousState;
+        const previousFilled = hasPreviousState
+            ? mooncakeNormalizeMarketTradeLogQuantity(previousState.filledQuantity)
+            : mode === 'snapshot'
+                ? nextFilled
+                : 0;
+        return {
+            fromFilled: previousFilled,
+            toFilled: nextFilled,
+            checkpoint: Math.max(previousFilled, nextFilled),
+            delta: Math.max(0, nextFilled - previousFilled)
+        };
+    }
+
+    function mooncakeBuildMarketTradeLogEntry(listing, previousState, mode, observedAt = Date.now()) {
+        if (!listing?.listingId || !listing?.characterId) return null;
+        const stateMatchesListing = previousState
+            && String(previousState.characterId || '') === listing.characterId
+            && String(previousState.itemHrid || '') === listing.itemHrid
+            && Boolean(previousState.isSell) === listing.isSell;
+        const plan = mooncakePlanMarketTradeLogFill(
+            stateMatchesListing ? previousState : null,
+            listing.filledQuantity,
+            mode
+        );
+        const timestamp = Math.max(0, Math.floor(Number(observedAt) || Date.now()));
+        const stateId = `${listing.characterId}:${listing.listingId}`;
+        const itemLevel = `${listing.itemHrid}#${listing.enhancementLevel}`;
+        const state = {
+            id: stateId,
+            characterId: listing.characterId,
+            listingId: listing.listingId,
+            itemHrid: listing.itemHrid,
+            itemLevel,
+            enhancementLevel: listing.enhancementLevel,
+            isSell: listing.isSell,
+            unitPrice: listing.unitPrice,
+            orderQuantity: listing.orderQuantity,
+            filledQuantity: plan.checkpoint,
+            status: listing.status,
+            lastSeenAt: timestamp
+        };
+        if (plan.delta <= 0) return { state, trade: null };
+        return {
+            state,
+            trade: {
+                id: `${stateId}:${plan.fromFilled}:${plan.toFilled}`,
+                characterId: listing.characterId,
+                listingId: listing.listingId,
+                side: listing.isSell ? 'sell' : 'buy',
+                itemHrid: listing.itemHrid,
+                itemLevel,
+                enhancementLevel: listing.enhancementLevel,
+                quantity: plan.delta,
+                unitPrice: listing.unitPrice,
+                grossAmount: plan.delta * listing.unitPrice,
+                fromFilledQuantity: plan.fromFilled,
+                toFilledQuantity: plan.toFilled,
+                orderQuantity: listing.orderQuantity,
+                status: listing.status,
+                timestamp,
+                source: mode === 'snapshot' ? 'reconnect' : 'live'
+            }
+        };
+    }
+
+    function mooncakeCollectMarketTradeLogListings(collections, fallbackCharacterId = '') {
+        const listings = new Map();
+        const currentCharacterId = String(fallbackCharacterId || mooncakeCharacterId || '').trim();
+        if (!currentCharacterId) return [];
+        collections.forEach(collection => {
+            mooncakeCollectionEntries(collection).forEach(([, value]) => {
+                const listing = mooncakeNormalizeMarketTradeLogListing(value, fallbackCharacterId);
+                if (!listing || listing.characterId !== currentCharacterId) return;
+                listings.set(`${listing.characterId}:${listing.listingId}`, listing);
+            });
+        });
+        return [...listings.values()];
+    }
+
+    async function mooncakeStoreMarketTradeLogListings(listings, mode, observedAt) {
+        if (!listings.length) return 0;
+        const db = await mooncakeOpenOrderBookArchiveDb();
+        if (!db) return 0;
+        return new Promise(resolve => {
+            let createdCount = 0;
+            let settled = false;
+            const finish = count => {
+                if (settled) return;
+                settled = true;
+                resolve(count);
+            };
+            const tx = db.transaction([MOONCAKE_MARKET_TRADE_LOG_STORE, MOONCAKE_MARKET_TRADE_LOG_STATE_STORE], 'readwrite');
+            const trades = tx.objectStore(MOONCAKE_MARKET_TRADE_LOG_STORE);
+            const states = tx.objectStore(MOONCAKE_MARKET_TRADE_LOG_STATE_STORE);
+            listings.forEach(listing => {
+                const getRequest = states.get(`${listing.characterId}:${listing.listingId}`);
+                getRequest.onsuccess = () => {
+                    const entry = mooncakeBuildMarketTradeLogEntry(listing, getRequest.result, mode, observedAt);
+                    if (!entry) return;
+                    states.put(entry.state);
+                    if (entry.trade) {
+                        trades.put(entry.trade);
+                        createdCount++;
+                    }
+                };
+                getRequest.onerror = () => {
+                    try { tx.abort(); } catch (_) {}
+                };
+            });
+            tx.oncomplete = () => finish(createdCount);
+            tx.onerror = () => finish(0);
+            tx.onabort = () => finish(0);
+        });
+    }
+
+    async function mooncakeTrimMarketTradeLog(db) {
+        if (!db) return;
+        const count = await new Promise(resolve => {
+            const request = db.transaction(MOONCAKE_MARKET_TRADE_LOG_STORE, 'readonly')
+                .objectStore(MOONCAKE_MARKET_TRADE_LOG_STORE).count();
+            request.onsuccess = () => resolve(Number(request.result) || 0);
+            request.onerror = () => resolve(0);
+        });
+        const excess = count - MOONCAKE_MARKET_TRADE_LOG_LIMIT;
+        if (excess <= 0) return;
+        await new Promise(resolve => {
+            let removed = 0;
+            const tx = db.transaction(MOONCAKE_MARKET_TRADE_LOG_STORE, 'readwrite');
+            const cursorRequest = tx.objectStore(MOONCAKE_MARKET_TRADE_LOG_STORE).index('timestamp').openCursor();
+            cursorRequest.onsuccess = () => {
+                const cursor = cursorRequest.result;
+                if (!cursor || removed >= excess) return;
+                cursor.delete();
+                removed++;
+                cursor.continue();
+            };
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => resolve();
+            tx.onabort = () => resolve();
+        });
+    }
+
+    function mooncakeScheduleMarketTradeLogPageRefresh() {
+        if (mooncakeMarketTradeLogPageRefreshTimer) return;
+        mooncakeMarketTradeLogPageRefreshTimer = setTimeout(() => {
+            mooncakeMarketTradeLogPageRefreshTimer = 0;
+            const host = document.querySelector('[data-mooncake-order-archive-page]');
+            if (host?.dataset.mooncakeOrderArchiveView !== 'trades') return;
+            const panel = host.closest('#better-loot-tracker-config-panel');
+            if (!mooncakeIsEnhancementSettingsTabVisible(panel, 'archive')) return;
+            // A completed trade can arrive while a native select popup is open.
+            // Refresh only the rows so the filter controls remain interactive.
+            const refreshResults = host._mooncakeRefreshMarketTradeLogResults;
+            if (typeof refreshResults === 'function') {
+                refreshResults({ preserveScroll: true }).catch(() => {});
+            }
+        }, 180);
+    }
+
+    function mooncakeFlushMarketTradeLogCapture() {
+        mooncakeMarketTradeLogCaptureTimer = 0;
+        if (!mooncakeIsOrderBookArchiveEnabled()) {
+            mooncakeMarketTradeLogPendingBatches = [];
+            return;
+        }
+        const batches = mooncakeMarketTradeLogPendingBatches.splice(0);
+        if (!batches.length) return;
+        mooncakeMarketTradeLogWriteChain = mooncakeMarketTradeLogWriteChain
+            .then(async () => {
+                let createdCount = 0;
+                for (const batch of batches) {
+                    const listings = mooncakeCollectMarketTradeLogListings(batch.collections, batch.characterId);
+                    createdCount += await mooncakeStoreMarketTradeLogListings(listings, batch.mode, batch.timestamp);
+                }
+                if (!createdCount) return;
+                const now = Date.now();
+                if (now - mooncakeMarketTradeLogTrimAt > 60000) {
+                    mooncakeMarketTradeLogTrimAt = now;
+                    const db = await mooncakeOpenOrderBookArchiveDb();
+                    mooncakeTrimMarketTradeLog(db).catch(() => {});
+                }
+                mooncakeScheduleMarketTradeLogPageRefresh();
+            })
+            .catch(error => console.warn('[MoonCake] 交易记录保存失败:', error))
+            .finally(() => {
+                if (mooncakeMarketTradeLogPendingBatches.length && !mooncakeMarketTradeLogCaptureTimer) {
+                    mooncakeScheduleMarketTradeLogCapture([], 'incremental');
+                }
+            });
+    }
+
+    function mooncakeScheduleMarketTradeLogCapture(collections, mode = 'incremental') {
+        if (!mooncakeIsOrderBookArchiveEnabled()) return;
+        const values = Array.isArray(collections) ? collections.filter(value => value != null) : [collections].filter(value => value != null);
+        if (values.length) {
+            mooncakeMarketTradeLogPendingBatches.push({
+                collections: values,
+                mode: mode === 'snapshot' ? 'snapshot' : 'incremental',
+                characterId: String(mooncakeCharacterId ?? '').trim(),
+                timestamp: Date.now()
+            });
+        }
+        if (mooncakeMarketTradeLogCaptureTimer || !mooncakeMarketTradeLogPendingBatches.length) return;
+        mooncakeMarketTradeLogCaptureTimer = setTimeout(() => {
+            const run = () => mooncakeFlushMarketTradeLogCapture();
+            if (typeof requestIdleCallback === 'function') {
+                requestIdleCallback(run, { timeout: 500 });
+            } else {
+                run();
+            }
+        }, MOONCAKE_MARKET_TRADE_LOG_CAPTURE_DELAY_MS);
     }
 
     function mooncakeGetMyMarketListingIds() {
@@ -4526,6 +4918,7 @@
         // Reporting is optional. Do not keep reopening a broken remote endpoint.
         mooncakeQ7MarketReporterUnavailable = true;
         mooncakeQ7PendingMarketReport = null;
+        mooncakeQ7MarketOrderBookCache.clear();
         mooncakeClearQ7PendingMarketReportTimers();
         mooncakeCloseQ7MarketReportSocket();
     }
@@ -4565,27 +4958,58 @@
         };
     }
 
+    function mooncakeGetQ7MarketReportCacheLevel(itemHrid) {
+        const pending = mooncakeQ7PendingMarketReport;
+        if (pending?.itemHrid === itemHrid) return pending.level;
+        const current = currentMarketItem;
+        if (current?.itemHrid !== itemHrid) return null;
+        return Math.max(0, Math.min(
+            MOONCAKE_Q7_MARKET_REPORT_MAX_LEVEL,
+            Math.trunc(Number(current.enhancementLevel) || 0)
+        ));
+    }
+
+    function mooncakeGetQ7CachedMarketOrderBookReport(cached, level) {
+        if (!cached) return null;
+        const normalizedLevel = Math.max(0, Math.min(
+            MOONCAKE_Q7_MARKET_REPORT_MAX_LEVEL,
+            Math.trunc(Number(level) || 0)
+        ));
+        const existing = cached.variants?.get(normalizedLevel);
+        if (existing) return existing;
+        const book = cached.orderBooks?.[normalizedLevel];
+        if (!book) return null;
+        const report = mooncakeBuildQ7MarketOrderBookReport(normalizedLevel, book);
+        cached.variants?.set(normalizedLevel, report);
+        return report;
+    }
+
     function mooncakeCacheQ7MarketOrderBooks(marketItemOrderBooks) {
+        if (!mooncakeIsQ7MarketReportHost() || mooncakeQ7MarketReporterUnavailable) return;
         const itemHrid = marketItemOrderBooks?.itemHrid;
         const orderBooks = marketItemOrderBooks?.orderBooks;
         if (typeof itemHrid !== 'string' || !itemHrid.startsWith('/items/') || !Array.isArray(orderBooks)) return;
 
-        const variants = new Map();
-        orderBooks.forEach((book, level) => {
-            if (!book || level > MOONCAKE_Q7_MARKET_REPORT_MAX_LEVEL) return;
-            variants.set(level, mooncakeBuildQ7MarketOrderBookReport(level, book));
-        });
-        if (!variants.size) return;
+        // Reporting only ever sends the level being viewed. Building and sorting
+        // every 0-20 order book for every native packet made busy material
+        // markets monopolize the WebSocket message task.
+        const level = mooncakeGetQ7MarketReportCacheLevel(itemHrid);
+        if (!Number.isInteger(level) || !orderBooks[level]) return;
 
         const receivedAt = Date.now();
+        const cached = { variants: new Map(), orderBooks, receivedAt };
+        if (!mooncakeGetQ7CachedMarketOrderBookReport(cached, level)) return;
         mooncakeQ7MarketOrderBookCache.delete(itemHrid);
-        mooncakeQ7MarketOrderBookCache.set(itemHrid, { variants, receivedAt });
-        while (mooncakeQ7MarketOrderBookCache.size > MOONCAKE_Q7_MARKET_REPORT_CACHE_LIMIT) {
+        mooncakeQ7MarketOrderBookCache.set(itemHrid, cached);
+        // Raw game order books can be large. Keep at most the current and
+        // immediately previous market selections so a delayed report request
+        // still works without retaining dozens of complete books.
+        while (mooncakeQ7MarketOrderBookCache.size > MOONCAKE_Q7_MARKET_REPORT_RAW_CACHE_LIMIT) {
             mooncakeQ7MarketOrderBookCache.delete(mooncakeQ7MarketOrderBookCache.keys().next().value);
         }
 
         const pending = mooncakeQ7PendingMarketReport;
-        if (pending?.itemHrid === itemHrid && variants.has(pending.level) &&
+        if (pending?.itemHrid === itemHrid && mooncakeGetQ7CachedMarketOrderBookReport(cached, pending.level) &&
             receivedAt >= pending.selectedAt - MOONCAKE_Q7_MARKET_REPORT_FRESHNESS_MS) {
             pending.ready = true;
             mooncakeTrySendQ7MarketReport(itemHrid);
@@ -4624,7 +5048,7 @@
         if (!pending || (expectedItemHrid && pending.itemHrid !== expectedItemHrid) || !pending.ready) return false;
         const cached = mooncakeQ7MarketOrderBookCache.get(pending.itemHrid);
         if (!cached || cached.receivedAt < pending.selectedAt - MOONCAKE_Q7_MARKET_REPORT_FRESHNESS_MS) return false;
-        const data = cached.variants.get(pending.level);
+        const data = mooncakeGetQ7CachedMarketOrderBookReport(cached, pending.level);
         if (!data) return false;
         const socket = mooncakeQ7MarketReportSocket;
         if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -4647,6 +5071,7 @@
             }
             if (mooncakeQ7PendingMarketReport === pending) {
                 mooncakeQ7PendingMarketReport = null;
+                mooncakeQ7MarketOrderBookCache.delete(pending.itemHrid);
                 mooncakeClearQ7PendingMarketReportTimers();
                 mooncakeCloseQ7MarketReportSocket();
             }
@@ -4671,7 +5096,8 @@
             mooncakeQ7PendingMarketReportCheckTimer = 0;
             const pending = mooncakeQ7PendingMarketReport;
             const cached = mooncakeQ7MarketOrderBookCache.get(itemHrid);
-            if (!pending || pending.itemKey !== itemKey || !cached || !cached.variants.has(level) ||
+            if (!pending || pending.itemKey !== itemKey || !cached ||
+                !mooncakeGetQ7CachedMarketOrderBookReport(cached, level) ||
                 cached.receivedAt < pending.selectedAt - MOONCAKE_Q7_MARKET_REPORT_FRESHNESS_MS) return;
             pending.ready = true;
             mooncakeTrySendQ7MarketReport();
@@ -4687,6 +5113,7 @@
 
     function mooncakeResetQ7MarketReporter() {
         mooncakeQ7PendingMarketReport = null;
+        mooncakeQ7MarketOrderBookCache.clear();
         mooncakeClearQ7PendingMarketReportTimers();
         mooncakeCloseQ7MarketReportSocket();
     }
@@ -4726,6 +5153,7 @@
 
     window.addEventListener('pagehide', mooncakeResetQ7MarketReporter);
     window.addEventListener('pagehide', mooncakeClearOrderBookArchiveCaptureSchedule);
+    window.addEventListener('pagehide', mooncakeClearMarketTradeLogCaptureSchedule);
 
     async function mooncakeTrimOrderBookArchive(db) {
         if (!db) return;
@@ -4839,6 +5267,415 @@
         });
     }
 
+    function mooncakeGetMarketTradeLogItemName(itemHrid) {
+        try { return getItemName(itemHrid) || itemHrid || '-'; }
+        catch (_) { return itemHrid || '-'; }
+    }
+
+    function mooncakeNormalizeMarketTradeLogFilterInteger(value, min = 0, max = Number.MAX_SAFE_INTEGER) {
+        if (value === undefined || value === null || value === '' || value === 'all') return null;
+        const numeric = Number(value);
+        return Number.isInteger(numeric) && numeric >= min && numeric <= max ? numeric : null;
+    }
+
+    function mooncakeNormalizeMarketTradeLogFilterTimestamp(value) {
+        if (value === undefined || value === null || value === '') return null;
+        const timestamp = Number(value);
+        return Number.isFinite(timestamp) && timestamp >= 0 ? timestamp : null;
+    }
+
+    function mooncakeParseMarketTradeLogDateTimeInput(value) {
+        const normalized = String(value ?? '').trim();
+        if (!normalized) return null;
+        const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(normalized);
+        if (!match) return null;
+        const [, yearText, monthText, dayText, hourText, minuteText] = match;
+        const parts = [yearText, monthText, dayText, hourText, minuteText].map(Number);
+        const [year, month, day, hour, minute] = parts;
+        const date = new Date(year, month - 1, day, hour, minute, 0, 0);
+        if (!Number.isFinite(date.getTime()) ||
+            date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day ||
+            date.getHours() !== hour || date.getMinutes() !== minute) return null;
+        return date.getTime();
+    }
+
+    function mooncakeFormatMarketTradeLogDateTimeInput(timestamp) {
+        const date = new Date(Number(timestamp));
+        if (!Number.isFinite(date.getTime())) return '';
+        const pad = value => String(value).padStart(2, '0');
+        return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    }
+
+    function mooncakeGetDefaultMarketTradeLogDateRange(nowTimestamp = Date.now()) {
+        const normalizedNow = mooncakeNormalizeMarketTradeLogFilterTimestamp(nowTimestamp) ?? Date.now();
+        const startTimestamp = normalizedNow - 24 * 60 * 60 * 1000;
+        return {
+            startTimestamp,
+            endTimestamp: normalizedNow,
+            startDateTime: mooncakeFormatMarketTradeLogDateTimeInput(startTimestamp),
+            endDateTime: mooncakeFormatMarketTradeLogDateTimeInput(normalizedNow)
+        };
+    }
+
+    function mooncakeGetMarketTradeLogEnhancementLevel(row) {
+        return Math.max(0, Math.floor(Number(row?.enhancementLevel) || 0));
+    }
+
+    function mooncakeGetMarketTradeLogItemLevel(row) {
+        return Math.max(0, Math.floor(Number(getBaseItemLevel(row?.itemHrid)) || 0));
+    }
+
+    function mooncakeMarketTradeLogMatchesFilter(row, filters = {}) {
+        const startTimestamp = mooncakeNormalizeMarketTradeLogFilterTimestamp(filters.startTimestamp);
+        const endTimestamp = mooncakeNormalizeMarketTradeLogFilterTimestamp(filters.endTimestamp);
+        if (startTimestamp !== null || endTimestamp !== null) {
+            const rowTimestamp = mooncakeNormalizeMarketTradeLogFilterTimestamp(row?.timestamp);
+            if (rowTimestamp === null ||
+                (startTimestamp !== null && rowTimestamp < startTimestamp) ||
+                (endTimestamp !== null && rowTimestamp > endTimestamp)) return false;
+        }
+        const side = String(filters.side || 'all');
+        if (side !== 'all' && row?.side !== side) return false;
+        const enhancementLevel = mooncakeNormalizeMarketTradeLogFilterInteger(filters.enhancementLevel, 0, 20);
+        if (enhancementLevel !== null && mooncakeGetMarketTradeLogEnhancementLevel(row) !== enhancementLevel) return false;
+        const itemLevel = mooncakeNormalizeMarketTradeLogFilterInteger(filters.itemLevel, 0, 100);
+        if (itemLevel !== null && mooncakeGetMarketTradeLogItemLevel(row) !== itemLevel) return false;
+        const query = String(filters.nameQuery ?? filters.query ?? '').trim().toLocaleLowerCase();
+        if (!query) return true;
+        const itemName = String(mooncakeGetMarketTradeLogItemName(row?.itemHrid)).toLocaleLowerCase();
+        return [itemName, String(row?.itemHrid || '').toLocaleLowerCase(), `+${mooncakeGetMarketTradeLogEnhancementLevel(row)}`]
+            .some(value => value.includes(query));
+    }
+
+    async function mooncakeReadMarketTradeLog(characterId, filters = {}, limit = MOONCAKE_MARKET_TRADE_LOG_PAGE_LIMIT) {
+        const normalizedCharacterId = String(characterId || '').trim();
+        const db = await mooncakeOpenOrderBookArchiveDb();
+        if (!db || !normalizedCharacterId) return { rows: [], hasMore: false };
+        const maxRows = Math.max(1, Math.floor(Number(limit) || MOONCAKE_MARKET_TRADE_LOG_PAGE_LIMIT));
+        const startTimestamp = mooncakeNormalizeMarketTradeLogFilterTimestamp(filters.startTimestamp);
+        const endTimestamp = mooncakeNormalizeMarketTradeLogFilterTimestamp(filters.endTimestamp);
+        const lowerTimestamp = startTimestamp ?? 0;
+        const upperTimestamp = endTimestamp ?? Number.MAX_SAFE_INTEGER;
+        if (lowerTimestamp > upperTimestamp) return { rows: [], hasMore: false };
+        return new Promise(resolve => {
+            const rows = [];
+            let hasMore = false;
+            const tx = db.transaction(MOONCAKE_MARKET_TRADE_LOG_STORE, 'readonly');
+            const index = tx.objectStore(MOONCAKE_MARKET_TRADE_LOG_STORE).index('characterTimestamp');
+            const range = IDBKeyRange.bound(
+                [normalizedCharacterId, lowerTimestamp],
+                [normalizedCharacterId, upperTimestamp]
+            );
+            const request = index.openCursor(range, 'prev');
+            request.onsuccess = () => {
+                const cursor = request.result;
+                if (!cursor) return resolve({ rows, hasMore });
+                if (mooncakeMarketTradeLogMatchesFilter(cursor.value, filters)) {
+                    if (rows.length >= maxRows) {
+                        hasMore = true;
+                        return resolve({ rows, hasMore });
+                    }
+                    rows.push(cursor.value);
+                }
+                cursor.continue();
+            };
+            request.onerror = () => resolve({ rows, hasMore });
+        });
+    }
+
+    async function mooncakeCountMarketTradeLog(characterId) {
+        const normalizedCharacterId = String(characterId || '').trim();
+        const db = await mooncakeOpenOrderBookArchiveDb();
+        if (!db || !normalizedCharacterId) return 0;
+        return new Promise(resolve => {
+            const request = db.transaction(MOONCAKE_MARKET_TRADE_LOG_STORE, 'readonly')
+                .objectStore(MOONCAKE_MARKET_TRADE_LOG_STORE)
+                .index('characterId')
+                .count(IDBKeyRange.only(normalizedCharacterId));
+            request.onsuccess = () => resolve(Number(request.result) || 0);
+            request.onerror = () => resolve(0);
+        });
+    }
+
+    function mooncakeFormatMarketTradeLogItem(row) {
+        const name = mooncakeGetMarketTradeLogItemName(row?.itemHrid);
+        const level = Math.max(0, Math.floor(Number(row?.enhancementLevel) || 0));
+        return level > 0 ? `${name} +${level}` : name;
+    }
+
+    function mooncakeFormatMarketTradeLogTime(timestamp) {
+        const time = new Date(Number(timestamp));
+        return Number.isNaN(time.getTime()) ? '-' : time.toLocaleString();
+    }
+
+    function mooncakeCreateMarketTradeLogCell(text, attribute, color = '') {
+        const cell = document.createElement('span');
+        if (attribute) cell.setAttribute(attribute, '1');
+        cell.textContent = text;
+        if (color) cell.style.color = color;
+        return cell;
+    }
+
+    function mooncakeRenderMarketTradeLogRows(container, rows) {
+        container.replaceChildren();
+        if (!rows.length) {
+            const empty = document.createElement('div');
+            empty.setAttribute('data-mooncake-order-archive-empty', '1');
+            empty.textContent = isZH ? '暂无符合条件的交易记录。' : 'No matching trade records.';
+            container.appendChild(empty);
+            return;
+        }
+        const table = document.createElement('div');
+        table.setAttribute('data-mooncake-market-trade-log-table', '1');
+        const header = document.createElement('div');
+        header.setAttribute('data-mooncake-market-trade-log-row', 'header');
+        [
+            isZH ? '成交时间' : 'Time',
+            isZH ? '类型' : 'Side',
+            isZH ? '物品' : 'Item',
+            isZH ? '数量' : 'Qty',
+            isZH ? '单价' : 'Unit price',
+            isZH ? '成交额' : 'Gross'
+        ].forEach(label => header.appendChild(mooncakeCreateMarketTradeLogCell(label, 'data-mooncake-market-trade-log-cell')));
+        table.appendChild(header);
+        rows.forEach(row => {
+            const line = document.createElement('div');
+            line.setAttribute('data-mooncake-market-trade-log-row', '1');
+            const isSell = row?.side === 'sell';
+            const sideLabel = isSell ? (isZH ? '卖出' : 'Sell') : (isZH ? '买入' : 'Buy');
+            const listingId = String(row?.listingId ?? '');
+            line.title = listingId
+                ? `${isZH ? '订单 ID' : 'Listing ID'}: ${listingId}`
+                : '';
+            line.append(
+                mooncakeCreateMarketTradeLogCell(mooncakeFormatMarketTradeLogTime(row?.timestamp), 'data-mooncake-market-trade-log-cell'),
+                mooncakeCreateMarketTradeLogCell(sideLabel, 'data-mooncake-market-trade-log-cell', isSell ? '#9bedad' : '#9ddfff'),
+                mooncakeCreateMarketTradeLogCell(mooncakeFormatMarketTradeLogItem(row), 'data-mooncake-market-trade-log-cell'),
+                mooncakeCreateMarketTradeLogCell(mooncakeFormatArchiveExactNumber(row?.quantity), 'data-mooncake-market-trade-log-cell'),
+                mooncakeCreateMarketTradeLogCell(mooncakeFormatArchiveExactNumber(row?.unitPrice), 'data-mooncake-market-trade-log-cell', '#ffd66f'),
+                mooncakeCreateMarketTradeLogCell(mooncakeFormatArchiveExactNumber(row?.grossAmount), 'data-mooncake-market-trade-log-cell', '#e8efff')
+            );
+            table.appendChild(line);
+        });
+        container.appendChild(table);
+    }
+
+    async function mooncakeRenderMarketTradeLogPage(host, body, revision) {
+        if (!host || !body) return;
+        const previousFilters = host._mooncakeMarketTradeLogFilters || {};
+        const defaultDateRange = mooncakeGetDefaultMarketTradeLogDateRange();
+        const previousStartDateTime = String(previousFilters.startDateTime || '');
+        const previousEndDateTime = String(previousFilters.endDateTime || '');
+        const previousStartTimestamp = mooncakeParseMarketTradeLogDateTimeInput(previousStartDateTime);
+        const previousEndTimestamp = mooncakeParseMarketTradeLogDateTimeInput(previousEndDateTime);
+        const reuseCustomDateRange = previousFilters.dateRangeFollowsNow === false &&
+            previousStartTimestamp !== null && previousEndTimestamp !== null &&
+            previousStartTimestamp <= previousEndTimestamp;
+        let dateRangeFollowsNow = !reuseCustomDateRange;
+        const filters = {
+            startDateTime: reuseCustomDateRange
+                ? previousStartDateTime
+                : defaultDateRange.startDateTime,
+            endDateTime: reuseCustomDateRange
+                ? previousEndDateTime
+                : defaultDateRange.endDateTime,
+            nameQuery: String(previousFilters.nameQuery ?? previousFilters.query ?? ''),
+            enhancementLevel: mooncakeNormalizeMarketTradeLogFilterInteger(previousFilters.enhancementLevel, 0, 20),
+            itemLevel: mooncakeNormalizeMarketTradeLogFilterInteger(previousFilters.itemLevel, 0, 100),
+            side: ['all', 'buy', 'sell'].includes(previousFilters.side) ? previousFilters.side : 'all'
+        };
+        const toolbar = document.createElement('div');
+        toolbar.setAttribute('data-mooncake-market-trade-log-toolbar', '1');
+        const stats = document.createElement('span');
+        stats.setAttribute('data-mooncake-market-trade-log-stats', '1');
+        stats.textContent = isZH ? '读取中...' : 'Loading...';
+
+        const createFilter = (labelText, control, kind) => {
+            const label = document.createElement('label');
+            label.setAttribute('data-mooncake-market-trade-log-filter', kind);
+            const labelNode = document.createElement('span');
+            labelNode.textContent = labelText;
+            label.append(labelNode, control);
+            return label;
+        };
+        const appendOptions = (select, options, selectedValue) => {
+            const normalizedSelected = String(selectedValue ?? 'all');
+            options.forEach(([value, label]) => {
+                const option = document.createElement('option');
+                option.value = String(value);
+                option.textContent = label;
+                option.selected = option.value === normalizedSelected;
+                select.appendChild(option);
+            });
+        };
+        const dateRange = document.createElement('div');
+        dateRange.setAttribute('data-mooncake-market-trade-log-date-range', '1');
+        const startDateTimeLabel = document.createElement('span');
+        startDateTimeLabel.setAttribute('data-mooncake-market-trade-log-date-boundary', 'start');
+        startDateTimeLabel.textContent = isZH ? '从' : 'From';
+        const startDateTime = document.createElement('input');
+        startDateTime.type = 'datetime-local';
+        startDateTime.step = '60';
+        startDateTime.required = true;
+        startDateTime.value = filters.startDateTime;
+        startDateTime.setAttribute('data-mooncake-market-trade-log-start-time', '1');
+        startDateTime.setAttribute('aria-label', isZH ? '开始时间' : 'Start time');
+        const dateRangeSeparator = document.createElement('span');
+        dateRangeSeparator.setAttribute('data-mooncake-market-trade-log-date-boundary', 'end');
+        dateRangeSeparator.textContent = isZH ? '至' : 'To';
+        const endDateTime = document.createElement('input');
+        endDateTime.type = 'datetime-local';
+        endDateTime.step = '60';
+        endDateTime.required = true;
+        endDateTime.value = filters.endDateTime;
+        endDateTime.setAttribute('data-mooncake-market-trade-log-end-time', '1');
+        endDateTime.setAttribute('aria-label', isZH ? '结束时间' : 'End time');
+        dateRange.append(startDateTimeLabel, startDateTime, dateRangeSeparator, endDateTime);
+        const search = document.createElement('input');
+        search.type = 'search';
+        search.value = filters.nameQuery;
+        search.placeholder = isZH ? '输入物品名称' : 'Item name';
+        search.setAttribute('data-mooncake-market-trade-log-search', '1');
+        search.setAttribute('aria-label', isZH ? '物品名称' : 'Item name');
+        const enhancement = document.createElement('select');
+        enhancement.setAttribute('data-mooncake-market-trade-log-enhancement', '1');
+        enhancement.setAttribute('aria-label', isZH ? '强化等级' : 'Enhancement level');
+        appendOptions(enhancement, [
+            ['all', isZH ? '全部' : 'All'],
+            ...Array.from({ length: 21 }, (_, level) => [level, `+${level}`])
+        ], filters.enhancementLevel ?? 'all');
+        const itemLevel = document.createElement('select');
+        itemLevel.setAttribute('data-mooncake-market-trade-log-item-level', '1');
+        itemLevel.setAttribute('aria-label', isZH ? '物品等级' : 'Item level');
+        const knownItemLevels = [...new Set(mooncakeGetRankingItemLevelOptions()
+            .map(Number)
+            .filter(level => Number.isInteger(level) && level > 0))]
+            .sort((a, b) => b - a);
+        appendOptions(itemLevel, [
+            ['all', isZH ? '全部' : 'All'],
+            ...knownItemLevels.map(level => [level, String(level)]),
+            [0, isZH ? '非装备' : 'Non-equipment']
+        ], filters.itemLevel ?? 'all');
+        const side = document.createElement('select');
+        side.setAttribute('data-mooncake-market-trade-log-side', '1');
+        side.setAttribute('aria-label', isZH ? '买卖' : 'Side');
+        appendOptions(side, [
+            ['all', isZH ? '全部' : 'All'],
+            ['buy', isZH ? '买入' : 'Buy'],
+            ['sell', isZH ? '卖出' : 'Sell']
+        ], filters.side);
+        const result = document.createElement('div');
+        result.setAttribute('data-mooncake-market-trade-log-results', '1');
+        result.innerHTML = `<div data-mooncake-order-archive-empty>${isZH ? '读取中...' : 'Loading...'}</div>`;
+        toolbar.append(
+            createFilter(isZH ? '日期区间' : 'Date range', dateRange, 'date-range'),
+            createFilter(isZH ? '物品名称' : 'Item', search, 'name'),
+            createFilter(isZH ? '强化等级' : 'Enhancement', enhancement, 'enhancement'),
+            createFilter(isZH ? '物品等级' : 'Item level', itemLevel, 'item-level'),
+            createFilter(isZH ? '买卖' : 'Side', side, 'side'),
+            stats
+        );
+        body.replaceChildren(toolbar, result);
+
+        let inputTimer = 0;
+        let refreshSequence = 0;
+        const syncDateRangeConstraints = () => {
+            if (endDateTime.value) startDateTime.max = endDateTime.value;
+            else startDateTime.removeAttribute('max');
+            if (startDateTime.value) endDateTime.min = startDateTime.value;
+            else endDateTime.removeAttribute('min');
+        };
+        syncDateRangeConstraints();
+        const refresh = async (options = {}) => {
+            const requestSequence = ++refreshSequence;
+            const preserveScroll = options.preserveScroll === true;
+            const scrollTop = preserveScroll ? result.scrollTop : 0;
+            const scrollLeft = preserveScroll ? result.scrollLeft : 0;
+            const rollingDateRange = dateRangeFollowsNow
+                ? mooncakeGetDefaultMarketTradeLogDateRange()
+                : null;
+            if (rollingDateRange) {
+                startDateTime.value = rollingDateRange.startDateTime;
+                endDateTime.value = rollingDateRange.endDateTime;
+                syncDateRangeConstraints();
+            }
+            const nextFilters = {
+                startDateTime: String(startDateTime.value || ''),
+                endDateTime: String(endDateTime.value || ''),
+                dateRangeFollowsNow,
+                nameQuery: String(search.value || ''),
+                enhancementLevel: String(enhancement.value || 'all'),
+                itemLevel: String(itemLevel.value || 'all'),
+                side: String(side.value || 'all')
+            };
+            host._mooncakeMarketTradeLogFilters = nextFilters;
+            const startTimestamp = rollingDateRange?.startTimestamp ??
+                mooncakeParseMarketTradeLogDateTimeInput(nextFilters.startDateTime);
+            const endMinuteTimestamp = mooncakeParseMarketTradeLogDateTimeInput(nextFilters.endDateTime);
+            if (startTimestamp === null || endMinuteTimestamp === null || startTimestamp > endMinuteTimestamp) {
+                stats.textContent = isZH ? '请选择有效的日期区间' : 'Choose a valid date range';
+                const missingBoundary = startTimestamp === null || endMinuteTimestamp === null;
+                result.innerHTML = `<div data-mooncake-order-archive-empty>${isZH
+                    ? (missingBoundary ? '请选择开始和结束时间' : '开始时间不能晚于结束时间')
+                    : (missingBoundary ? 'Choose both a start and end time' : 'Start time must not be after end time')}</div>`;
+                return;
+            }
+            const readFilters = {
+                ...nextFilters,
+                startTimestamp,
+                endTimestamp: rollingDateRange?.endTimestamp ??
+                    Math.min(Number.MAX_SAFE_INTEGER, endMinuteTimestamp + 60 * 1000 - 1)
+            };
+            result.innerHTML = `<div data-mooncake-order-archive-empty>${isZH ? '读取中...' : 'Loading...'}</div>`;
+            const characterId = String(mooncakeCharacterId ?? '').trim();
+            const [{ rows, hasMore }, total] = await Promise.all([
+                mooncakeReadMarketTradeLog(characterId, readFilters),
+                mooncakeCountMarketTradeLog(characterId)
+            ]);
+            if (requestSequence !== refreshSequence ||
+                !mooncakeIsOrderBookArchiveRenderCurrent(host, revision) ||
+                host.dataset.mooncakeOrderArchiveView !== 'trades') return;
+            const shown = rows.length;
+            stats.textContent = characterId
+                ? (isZH
+                    ? `本地 ${total} 条${hasMore ? `，显示前 ${shown} 条` : `，显示 ${shown} 条`}`
+                    : `${total} local${hasMore ? `; first ${shown}` : `; showing ${shown}`}`)
+                : (isZH ? '等待角色数据' : 'Waiting for character data');
+            mooncakeRenderMarketTradeLogRows(result, rows);
+            if (preserveScroll) {
+                result.scrollTop = scrollTop;
+                result.scrollLeft = scrollLeft;
+            }
+        };
+        host._mooncakeRefreshMarketTradeLogResults = refresh;
+        const freezeRollingDateRange = () => {
+            dateRangeFollowsNow = false;
+        };
+        startDateTime.addEventListener('input', freezeRollingDateRange);
+        endDateTime.addEventListener('input', freezeRollingDateRange);
+        startDateTime.addEventListener('change', () => {
+            dateRangeFollowsNow = false;
+            syncDateRangeConstraints();
+            refresh().catch(() => {});
+        });
+        endDateTime.addEventListener('change', () => {
+            dateRangeFollowsNow = false;
+            syncDateRangeConstraints();
+            refresh().catch(() => {});
+        });
+        search.addEventListener('input', () => {
+            if (inputTimer) clearTimeout(inputTimer);
+            inputTimer = setTimeout(() => {
+                inputTimer = 0;
+                refresh().catch(() => {});
+            }, 160);
+        });
+        enhancement.addEventListener('change', () => refresh().catch(() => {}));
+        itemLevel.addEventListener('change', () => refresh().catch(() => {}));
+        side.addEventListener('change', () => refresh().catch(() => {}));
+        await refresh();
+    }
+
     async function mooncakeGetOrderBookArchiveStats(options = {}) {
         const shouldCancel = typeof options.shouldCancel === 'function' ? options.shouldCancel : () => false;
         if (shouldCancel()) return { count: 0, bytes: 0, originUsage: 0, originQuota: 0, cancelled: true };
@@ -4895,8 +5732,8 @@
                 : `Origin storage: ${mooncakeFormatArchiveBytes(stats.originUsage)} / ${mooncakeFormatArchiveBytes(stats.originQuota)} (${ratio.toFixed(2)}%)`);
         }
         parts.push(isZH
-            ? '归档正文保存在 IndexedDB；localStorage 仅保存开关和上限。'
-            : 'Snapshots use IndexedDB; localStorage only stores small settings.');
+            ? '挂单快照和交易记录保存在 IndexedDB；localStorage 仅保存开关和上限。'
+            : 'Snapshots and trade records use IndexedDB; localStorage only stores small settings.');
         return parts.join('\n');
     }
 
@@ -4915,6 +5752,13 @@
         if (numeric < 1024) return `${Math.round(numeric)} B`;
         if (numeric < 1024 * 1024) return `${(numeric / 1024).toFixed(1)} KB`;
         return `${(numeric / 1024 / 1024).toFixed(2)} MB`;
+    }
+
+    function mooncakeFormatArchiveRecordCompactTime(timestamp) {
+        const time = new Date(timestamp);
+        if (Number.isNaN(time.getTime())) return '-';
+        const pad = value => String(value).padStart(2, '0');
+        return `${pad(time.getMonth() + 1)}/${pad(time.getDate())} ${pad(time.getHours())}:${pad(time.getMinutes())}`;
     }
 
     function mooncakeRenderOrderBookArchiveSide(title, rows, color, ownListingIds = new Set(), archiveOwnerCharacterId = '') {
@@ -4936,10 +5780,10 @@
                 const mineTag = isMine
                     ? `<span title="${isZH ? '我的挂单' : 'My listing'}" aria-label="${isZH ? '我的挂单' : 'My listing'}" style="display:inline-block;margin-right:3px;color:#ffd56e;font-size:12px;filter:drop-shadow(0 0 2px rgba(255,191,70,.48));vertical-align:1px;">🏷️</span>`
                     : '';
-                return `<div style="display:grid;grid-template-columns:minmax(54px,.75fr) minmax(70px,1fr) minmax(76px,1.15fr);gap:6px;min-height:21px;padding:2px 0;border-bottom:1px solid rgba(255,255,255,.045);text-align:center;font-size:12px;line-height:17px;"><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(226,232,255,.78);font-variant-numeric:tabular-nums;">${mineTag}${mooncakeEscapeHtml(mooncakeFormatArchiveExactNumber(row.quantity))}</span><b style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${color};font-variant-numeric:tabular-nums;">${mooncakeEscapeHtml(mooncakeFormatArchiveExactNumber(row.price))}</b><span title="${listingIdHtml}" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(205,216,244,.68);font-variant-numeric:tabular-nums;">${listingIdHtml}</span></div>`;
+                return `<div data-mooncake-order-archive-side-row="1" style="display:grid;grid-template-columns:minmax(54px,.75fr) minmax(70px,1fr) minmax(76px,1.15fr);gap:6px;min-height:21px;padding:2px 0;border-bottom:1px solid rgba(255,255,255,.045);text-align:center;font-size:12px;line-height:17px;"><span data-mooncake-order-archive-side-quantity="1" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(226,232,255,.78);font-variant-numeric:tabular-nums;">${mineTag}${mooncakeEscapeHtml(mooncakeFormatArchiveExactNumber(row.quantity))}</span><b data-mooncake-order-archive-side-price="1" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${color};font-variant-numeric:tabular-nums;">${mooncakeEscapeHtml(mooncakeFormatArchiveExactNumber(row.price))}</b><span data-mooncake-order-archive-side-listing-id="1" title="${listingIdHtml}" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(205,216,244,.68);font-variant-numeric:tabular-nums;">${listingIdHtml}</span></div>`;
             }).join('')
             : `<div style="padding:12px 0;text-align:center;color:rgba(220,226,240,.45);font-size:12px;">-</div>`;
-        return `<section style="min-width:0;font-size:12px;"><div style="margin-bottom:2px;color:rgba(214,224,255,.82);font-size:12px;font-weight:800;text-align:center;line-height:18px;">${title}</div><div style="display:grid;grid-template-columns:minmax(54px,.75fr) minmax(70px,1fr) minmax(76px,1.15fr);gap:6px;padding:2px 0;border-bottom:1px solid rgba(125,151,219,.22);text-align:center;color:rgba(205,216,244,.58);font-size:10px;line-height:15px;"><span>${isZH ? '数量' : 'Quantity'}</span><span>${isZH ? '价格' : 'Price'}</span><span>${isZH ? '订单 ID' : 'Order ID'}</span></div>${body}</section>`;
+        return `<section data-mooncake-order-archive-side="1" style="min-width:0;font-size:12px;"><div data-mooncake-order-archive-side-title="1" style="margin-bottom:2px;color:rgba(214,224,255,.82);font-size:12px;font-weight:800;text-align:center;line-height:18px;">${title}</div><div data-mooncake-order-archive-side-header="1" style="display:grid;grid-template-columns:minmax(54px,.75fr) minmax(70px,1fr) minmax(76px,1.15fr);gap:6px;padding:2px 0;border-bottom:1px solid rgba(125,151,219,.22);text-align:center;color:rgba(205,216,244,.58);font-size:10px;line-height:15px;"><span>${isZH ? '数量' : 'Quantity'}</span><span>${isZH ? '价格' : 'Price'}</span><span>${isZH ? '订单 ID' : 'Order ID'}</span></div>${body}</section>`;
     }
 
     function mooncakeShowOrderBookArchiveRecord(panel, row) {
@@ -4949,7 +5793,7 @@
         const ownListingIds = mooncakeGetMyMarketListingIds();
         const archiveOwnerCharacterId = row.ownerCharacterId == null ? '' : String(row.ownerCharacterId);
         detail.innerHTML = `
-            <div style="display:flex;justify-content:space-between;gap:10px;margin-bottom:8px;color:rgba(222,231,255,.66);font-size:11px;"><span>${mooncakeEscapeHtml(time)}</span><span>${isZH ? '🏷️ 我的挂单 · 数量 / 价格 / 订单 ID' : '🏷️ My listing · Qty / Price / Order ID'}</span></div>
+            <div data-mooncake-order-archive-detail-meta="1" style="display:flex;justify-content:space-between;gap:10px;margin-bottom:8px;color:rgba(222,231,255,.66);font-size:11px;"><span>${mooncakeEscapeHtml(time)}</span><span>${isZH ? '🏷️ 我的挂单 · 数量 / 价格 / 订单 ID' : '🏷️ My listing · Qty / Price / Order ID'}</span></div>
             <div data-mooncake-order-archive-sides style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
                 ${mooncakeRenderOrderBookArchiveSide(isZH ? '卖单' : 'Asks', row.asks || [], '#ffd66f', ownListingIds, archiveOwnerCharacterId)}
                 ${mooncakeRenderOrderBookArchiveSide(isZH ? '买单' : 'Bids', row.bids || [], '#9ddfff', ownListingIds, archiveOwnerCharacterId)}
@@ -4959,6 +5803,7 @@
     function mooncakeInvalidateOrderBookArchivePage(host) {
         if (!host) return;
         host._mooncakeOrderArchiveRevision = (Number(host._mooncakeOrderArchiveRevision) || 0) + 1;
+        host._mooncakeRefreshMarketTradeLogResults = null;
         if (typeof host._mooncakeCancelOrderArchiveStats === 'function') {
             host._mooncakeCancelOrderArchiveStats();
         }
@@ -5031,10 +5876,36 @@
         host._mooncakeCancelOrderArchiveStats = cancel;
     }
 
+    function mooncakeGetOrderBookArchiveView(host) {
+        return host?.dataset.mooncakeOrderArchiveView === 'trades' ? 'trades' : 'snapshots';
+    }
+
+    function mooncakeCreateOrderBookArchiveViewTabs(view) {
+        const tabs = document.createElement('div');
+        tabs.setAttribute('data-mooncake-order-archive-view-tabs', '1');
+        tabs.setAttribute('role', 'tablist');
+        [
+            ['snapshots', isZH ? '挂单快照' : 'Order snapshots'],
+            ['trades', isZH ? '交易记录' : 'Trade log']
+        ].forEach(([key, label]) => {
+            const tab = document.createElement('button');
+            tab.type = 'button';
+            tab.textContent = label;
+            tab.setAttribute('data-mooncake-order-archive-view-tab', key);
+            tab.setAttribute('role', 'tab');
+            tab.setAttribute('aria-selected', String(key === view));
+            tab.tabIndex = key === view ? 0 : -1;
+            tabs.appendChild(tab);
+        });
+        return tabs;
+    }
+
     async function mooncakeRenderOrderBookArchivePage(host) {
         if (!host) return;
         mooncakeInvalidateOrderBookArchivePage(host);
         const revision = Number(host._mooncakeOrderArchiveRevision) || 0;
+        const view = mooncakeGetOrderBookArchiveView(host);
+        host.dataset.mooncakeOrderArchiveView = view;
         const context = mooncakeResolveOrderBookArchiveContext();
         const itemHrid = context?.itemHrid || '';
         const level = context?.level || 0;
@@ -5042,11 +5913,23 @@
         header.setAttribute('data-mooncake-order-archive-page-header', '1');
         const archiveLimit = mooncakeGetOrderBookArchiveLimit();
         const contextTitle = context
-            ? `${mooncakeEscapeHtml(getItemName(itemHrid) || itemHrid)} +${level}`
+            ? `${mooncakeGetMarketTradeLogItemName(itemHrid)} +${level}`
             : (isZH ? '尚未选择市场物品' : 'No marketplace item selected');
-        header.innerHTML = `<strong data-mooncake-order-archive-title>${isZH ? '挂单记录' : 'Order archive'} · ${contextTitle}</strong><span data-mooncake-order-archive-stats>${isZH ? '统计中...' : 'Calculating...'}</span><label data-mooncake-order-archive-limit-label title="${isZH ? '所有物品、所有等级合计保留的快照上限' : 'Global snapshot limit across every item and level'}"><span>${isZH ? '保留' : 'Keep'}</span><input type="number" min="${MOONCAKE_ORDER_BOOK_ARCHIVE_MIN_LIMIT}" max="${MOONCAKE_ORDER_BOOK_ARCHIVE_MAX_LIMIT}" step="100" value="${archiveLimit}" data-mooncake-order-archive-limit></label><span data-mooncake-order-archive-bytes></span>`;
+        const title = document.createElement('strong');
+        title.setAttribute('data-mooncake-order-archive-title', '1');
+        title.textContent = view === 'trades'
+            ? (isZH ? '交易记录' : 'Trade log')
+            : `${isZH ? '挂单快照' : 'Order snapshots'} · ${contextTitle}`;
+        header.append(mooncakeCreateOrderBookArchiveViewTabs(view), title);
         const body = document.createElement('div');
         body.setAttribute('data-mooncake-order-archive-page-body', '1');
+        if (view === 'trades') {
+            body.setAttribute('data-mooncake-market-trade-log-page', '1');
+            host.replaceChildren(header, body);
+            await mooncakeRenderMarketTradeLogPage(host, body, revision);
+            return;
+        }
+        header.insertAdjacentHTML('beforeend', `<span data-mooncake-order-archive-stats>${isZH ? '统计中...' : 'Calculating...'}</span><label data-mooncake-order-archive-limit-label title="${isZH ? '所有物品、所有等级合计保留的快照上限' : 'Global snapshot limit across every item and level'}"><span>${isZH ? '保留' : 'Keep'}</span><input type="number" min="${MOONCAKE_ORDER_BOOK_ARCHIVE_MIN_LIMIT}" max="${MOONCAKE_ORDER_BOOK_ARCHIVE_MAX_LIMIT}" step="100" value="${archiveLimit}" data-mooncake-order-archive-limit></label><span data-mooncake-order-archive-bytes></span>`);
         body.innerHTML = `<div data-mooncake-order-archive-list></div><div data-mooncake-order-archive-detail><div data-mooncake-order-archive-empty>${context ? (isZH ? '读取中...' : 'Loading...') : (isZH ? '请先在市场中打开一个物品，再回到这里查看记录。' : 'Open an item in the marketplace, then return here to review its archive.')}</div></div>`;
         host.replaceChildren(header, body);
 
@@ -5094,7 +5977,15 @@
             rows.forEach((row, index) => {
                 const button = document.createElement('button');
                 button.type = 'button';
-                button.textContent = new Date(row.timestamp).toLocaleString();
+                const fullTime = new Date(row.timestamp).toLocaleString();
+                button.title = fullTime;
+                const desktopLabel = document.createElement('span');
+                desktopLabel.setAttribute('data-mooncake-order-archive-record-full-label', '1');
+                desktopLabel.textContent = fullTime;
+                const mobileLabel = document.createElement('span');
+                mobileLabel.setAttribute('data-mooncake-order-archive-record-compact-label', '1');
+                mobileLabel.textContent = mooncakeFormatArchiveRecordCompactTime(row.timestamp);
+                button.append(desktopLabel, mobileLabel);
                 button.setAttribute('data-mooncake-order-archive-record', index === 0 ? 'active' : '');
                 button.addEventListener('click', () => {
                     list.querySelectorAll('[data-mooncake-order-archive-record]').forEach(node => node.setAttribute('data-mooncake-order-archive-record', ''));
@@ -5174,7 +6065,11 @@
             if (!previousSnapshot || previousSnapshot.ask !== effectiveAsk || previousSnapshot.bid !== effectiveBid) {
                 snapshotQuotesChanged = true;
             }
-            marketDataCache[itemHrid][level] = { a: effectiveAsk, b: effectiveBid };
+            marketDataCache[itemHrid][level] = {
+                ...(previous || {}),
+                a: effectiveAsk,
+                b: effectiveBid
+            };
             marketDetailSnapshotCache[`${itemHrid}:${level}`] = {
                 bid: effectiveBid,
                 ask: effectiveAsk,
@@ -5236,6 +6131,10 @@
         const mwiToolsMarket = readMWIToolsMarketData();
         if (mwiToolsMarket?.marketData && Object.keys(mwiToolsMarket.marketData).length > 0) {
             marketDataCache = mwiToolsMarket.marketData;
+            mooncakeSetMarketDataUpdateTimestamp(
+                mwiToolsMarket.timestamp,
+                MOONCAKE_MARKET_DATA_UPDATE_SOURCE_MWI_TOOLS
+            );
             return mwiToolsMarket;
         }
         const coreMarket = readMWICoreMarketData();
@@ -5906,7 +6805,8 @@
         '.mooncake-order-economics-metric',
         '.mooncake-order-economics-row',
         '.mooncake-chat-labor-bubble',
-        '.mooncake-market-history-price-cell'
+        '.mooncake-market-history-price-cell',
+        '.mooncake-market-history-hourly-cell'
     ].join(', ');
 
     // Hover remains convenient on desktop, while these non-command value
@@ -5918,7 +6818,9 @@
         '.mooncake-market-inline-hourly-wage',
         '.mooncake-order-economics-metric',
         '.mooncake-order-economics-row',
-        '.mooncake-chat-labor-bubble'
+        '.mooncake-chat-labor-bubble',
+        '.mooncake-market-history-price-cell',
+        '.mooncake-market-history-hourly-cell'
     ].join(', ');
 
     let _tooltipShownAt = 0;
@@ -10301,6 +11203,7 @@
         'action_completed'
     ]);
     const BLT_WS_TYPE_PATTERN = /"type"\s*:\s*"([^"]+)"/;
+    const BLT_WS_MARKET_ITEM_HRID_PATTERN = /"itemHrid"\s*:\s*"([^"]+)"/;
 
     function shouldParseBltWsMessage(message) {
         if (typeof message !== 'string') return false;
@@ -10308,6 +11211,91 @@
         if (!type) return message.includes('"endCharacterAction"');
         if (!BLT_WS_MESSAGE_TYPES.has(type)) return false;
         return true;
+    }
+
+    // Large market order-book packets arrive through the browser's native
+    // `message` event. Never parse or normalize them while the game is
+    // dispatching that event. Retain a tiny, per-item latest queue so a packet
+    // for the material just opened cannot be overwritten by an unrelated
+    // market update in the same event burst.
+    const MOONCAKE_MARKET_WS_IDLE_TIMEOUT_MS = 180;
+    const MOONCAKE_MARKET_WS_PENDING_ITEM_LIMIT = 3;
+    let mooncakePendingMarketOrderBookMessages = new Map();
+    let mooncakePendingMarketOrderBookProcessHandle = null;
+    let mooncakePendingMarketOrderBookProcessUsesIdleCallback = false;
+
+    function mooncakeClearPendingMarketOrderBookProcessing() {
+        const handle = mooncakePendingMarketOrderBookProcessHandle;
+        const usedIdleCallback = mooncakePendingMarketOrderBookProcessUsesIdleCallback;
+        mooncakePendingMarketOrderBookProcessHandle = null;
+        mooncakePendingMarketOrderBookProcessUsesIdleCallback = false;
+        mooncakePendingMarketOrderBookMessages.clear();
+        if (handle === null) return;
+        if (usedIdleCallback && typeof cancelIdleCallback === 'function') {
+            try { cancelIdleCallback(handle); return; } catch (_) {}
+        }
+        clearTimeout(handle);
+    }
+
+    function mooncakeSchedulePendingMarketOrderBookProcessing() {
+        if (mooncakePendingMarketOrderBookProcessHandle !== null) return;
+        const flush = () => {
+            mooncakePendingMarketOrderBookProcessHandle = null;
+            mooncakePendingMarketOrderBookProcessUsesIdleCallback = false;
+            const preferredItemHrid = currentMarketItem?.itemHrid || mooncakeQ7PendingMarketReport?.itemHrid || '';
+            let messageKey = preferredItemHrid && mooncakePendingMarketOrderBookMessages.has(preferredItemHrid)
+                ? preferredItemHrid
+                : '';
+            if (!messageKey) {
+                // Map insertion order makes this the newest unprocessed packet.
+                for (const key of mooncakePendingMarketOrderBookMessages.keys()) messageKey = key;
+            }
+            const message = messageKey ? mooncakePendingMarketOrderBookMessages.get(messageKey) : null;
+            if (messageKey) mooncakePendingMarketOrderBookMessages.delete(messageKey);
+            if (!message) return;
+            try {
+                const obj = JSON.parse(message);
+                if (obj?.type === 'market_item_order_books_updated' && obj.marketItemOrderBooks) {
+                    updateMarketCacheFromWS(obj.marketItemOrderBooks);
+                }
+            } catch (error) {
+                console.error('[Better Loot Tracker] Error parsing deferred market WebSocket message:', error);
+            }
+            // Limit each idle turn to one large payload. This keeps the
+            // performance fix intact even when a player switches items fast.
+            if (mooncakePendingMarketOrderBookMessages.size) {
+                mooncakeSchedulePendingMarketOrderBookProcessing();
+            }
+        };
+        if (typeof requestIdleCallback === 'function') {
+            mooncakePendingMarketOrderBookProcessUsesIdleCallback = true;
+            mooncakePendingMarketOrderBookProcessHandle = requestIdleCallback(flush, {
+                timeout: MOONCAKE_MARKET_WS_IDLE_TIMEOUT_MS
+            });
+        } else {
+            mooncakePendingMarketOrderBookProcessHandle = setTimeout(flush, 32);
+        }
+    }
+
+    function mooncakeQueueMarketOrderBookWebSocketMessage(message) {
+        if (typeof message !== 'string') return;
+        const itemHrid = BLT_WS_MARKET_ITEM_HRID_PATTERN.exec(message)?.[1] || '';
+        // An unrecognised packet still gets a slot, but recognized item updates
+        // replace only their own previous packet rather than every item.
+        const messageKey = itemHrid || `unknown:${Date.now()}`;
+        mooncakePendingMarketOrderBookMessages.delete(messageKey);
+        mooncakePendingMarketOrderBookMessages.set(messageKey, message);
+
+        const protectedItemHrid = currentMarketItem?.itemHrid || mooncakeQ7PendingMarketReport?.itemHrid || '';
+        while (mooncakePendingMarketOrderBookMessages.size > MOONCAKE_MARKET_WS_PENDING_ITEM_LIMIT) {
+            const iterator = mooncakePendingMarketOrderBookMessages.keys();
+            let evictedKey = iterator.next().value;
+            if (evictedKey === protectedItemHrid && mooncakePendingMarketOrderBookMessages.size > 1) {
+                evictedKey = iterator.next().value;
+            }
+            mooncakePendingMarketOrderBookMessages.delete(evictedKey);
+        }
+        mooncakeSchedulePendingMarketOrderBookProcessing();
     }
 
     function mooncakeHandleCharacterWebSocketMessage(obj) {
@@ -10326,12 +11314,15 @@
             mooncakeReplaceCharacterActions(obj.characterActions, 'websocket-init');
             mooncakeCaptureOwnListingAnchors(obj.myMarketListings);
             mooncakeUpdateListingFundsListings(obj.myMarketListings, { replace: true });
+            mooncakeScheduleMarketTradeLogCapture([obj.myMarketListings], 'snapshot');
             mooncakeScheduleCharacterStateSync(120);
             return true;
         }
         if (obj.type === 'market_listings_updated') {
             mooncakeCaptureOwnListingAnchors(obj.endMarketListings, { uploadAfterPersist: true });
             mooncakeUpdateListingFundsListings(obj.endMarketListings);
+            mooncakeRecordMarketPersonalTradeHistory(obj.marketListings, obj.endMarketListings);
+            mooncakeScheduleMarketTradeLogCapture([obj.marketListings, obj.endMarketListings], 'incremental');
             return true;
         }
         if (obj.type === 'actions_updated' && Array.isArray(obj.endCharacterActions)) {
@@ -10431,6 +11422,14 @@
                 const message = oriGet.call(this);
                 Object.defineProperty(this, "data", { value: message });
 
+                const messageType = typeof message === 'string'
+                    ? BLT_WS_TYPE_PATTERN.exec(message)?.[1]
+                    : '';
+                if (messageType === 'market_item_order_books_updated') {
+                    mooncakeQueueMarketOrderBookWebSocketMessage(message);
+                    return message;
+                }
+
                 if (!shouldParseBltWsMessage(message)) {
                     return message;
                 }
@@ -10461,8 +11460,6 @@
                                 try { mooncakeScheduleCurrentEnhancementMarketRefresh(currentMarketItem.itemHrid); } catch (_) {}
                             }
                         }
-                    } else if (obj && obj.type === "market_item_order_books_updated" && obj.marketItemOrderBooks) {
-                        updateMarketCacheFromWS(obj.marketItemOrderBooks);
                     } else if (obj && (obj.type === "action_completed" || obj.endCharacterAction)) {
                         updateMooncakeEnhanceSnapshotFromAction(obj.endCharacterAction);
                     }
@@ -10488,6 +11485,7 @@
     }
 
     hookWebSocket();
+    window.addEventListener('pagehide', mooncakeClearPendingMarketOrderBookProcessing);
 
     function parseMooncakeEnhanceItemHash(hash) {
         if (!hash || typeof hash !== 'string') return null;
@@ -13401,6 +14399,7 @@
     const MOONCAKE_ANTI_SUICIDE_ENHANCEMENT_MIN_LEVEL = 13;
     const MOONCAKE_ANTI_SUICIDE_STYLE_ID = 'MooncakeAntiSuicideStyle';
     const MOONCAKE_ANTI_SUICIDE_MODAL_ID = 'MooncakeAntiSuicideModal';
+    const MOONCAKE_ANTI_SUICIDE_REPLAY_WINDOW_MS = 3000;
     let mooncakeAntiSuicideBound = false;
     let mooncakeAntiSuicideModal = null;
     let mooncakeAntiSuicideAllowedAction = null;
@@ -13610,7 +14609,7 @@
         const context = mooncakeAntiSuicideGetAlchemyContext(mooncakeGetItemHridFromContainer(itemContainer));
         if (!context) return null;
         const actionTarget = element.closest?.('[class*="Item_clickable"]') || itemContainer;
-        return { ...context, actionTarget };
+        return { ...context, actionTarget, selectionTarget: true };
     }
 
     function mooncakeAntiSuicideFindEnhancementTarget(target) {
@@ -13630,6 +14629,7 @@
         return {
             kind: 'enhancement',
             actionTarget,
+            selectionTarget: true,
             itemHrid,
             itemName: getItemName(itemHrid) || (isZH ? '星空强化器' : 'Celestial Enhancer'),
             level,
@@ -13642,27 +14642,201 @@
         };
     }
 
-    function mooncakeAntiSuicideConsumeAllowedAction(actionTarget) {
+    function mooncakeAntiSuicideAllowedActionMatches(allowed, descriptor) {
+        if (!allowed || !descriptor?.actionTarget) return false;
+        if (allowed.kind !== descriptor.kind || allowed.itemHrid !== descriptor.itemHrid) return false;
+        // React may rebuild a selector option while the confirmation overlay is
+        // open. The selected enhancement level is part of the action identity;
+        // alchemy selection has no independent level to compare.
+        return allowed.kind !== 'enhancement' || Number(allowed.level) === Number(descriptor.level);
+    }
+
+    function mooncakeAntiSuicideConsumeAllowedAction(descriptor, event = null) {
         const allowed = mooncakeAntiSuicideAllowedAction;
         if (!allowed || Date.now() > allowed.expiresAt) {
             mooncakeAntiSuicideAllowedAction = null;
             return false;
         }
-        if (allowed.target !== actionTarget) return false;
-        mooncakeAntiSuicideAllowedAction = null;
+        if (!mooncakeAntiSuicideAllowedActionMatches(allowed, descriptor)) return false;
+        // HTMLElement.click() is synthetic. Keep the short-lived permit after
+        // that replay so a game UI that only accepts pointer input can receive
+        // one immediate real retry without reopening the confirmation loop.
+        if (event?.isTrusted !== false) mooncakeAntiSuicideAllowedAction = null;
         return true;
     }
 
-    function mooncakeAntiSuicideReplayAction(actionTarget) {
-        if (!(actionTarget instanceof HTMLElement) || !actionTarget.isConnected) return;
-        mooncakeAntiSuicideAllowedAction = { target: actionTarget, expiresAt: Date.now() + 1500 };
+    function mooncakeAntiSuicideCanReplayTarget(target) {
+        return target instanceof Element && target.isConnected && typeof target.dispatchEvent === 'function';
+    }
+
+    function mooncakeAntiSuicideGetReplayTargets(descriptor) {
+        const targets = [];
+        const appendTarget = target => {
+            if (!mooncakeAntiSuicideCanReplayTarget(target) || targets.includes(target)) return;
+            targets.push(target);
+        };
+        // The handler that commits an item selection lives on the clickable
+        // item container. Replaying a nested SVG/use node first can trigger
+        // the selector's click-away behavior before that handler runs.
+        appendTarget(descriptor?.actionTarget);
+        if (!descriptor?.selectionTarget || !descriptor?.itemHrid) return targets;
+
+        // The game's selector is sometimes rebuilt while the warning is open.
+        // Locate the fresh option by its immutable item identity so confirming
+        // can still complete the selection instead of making the player click
+        // it again and reopening the warning.
+        const expectedHrid = mooncakeNormalizeEnhanceItemHrid(descriptor.itemHrid);
+        const expectedLevel = Number(descriptor.level);
+        const candidates = document.querySelectorAll(
+            '[class*="ItemSelector_itemList"] [class*="ItemSelector_itemContainer"], '
+            + '[class*="ItemSelector_itemList"] [class*="Item_itemContainer"]'
+        );
+        candidates.forEach(candidate => {
+            const candidateHrid = mooncakeNormalizeEnhanceItemHrid(mooncakeGetItemHridFromContainer(candidate));
+            if (candidateHrid !== expectedHrid) return;
+            if (descriptor.kind === 'enhancement' && mooncakeGetItemEnhancementLevelFromContainer(candidate) !== expectedLevel) return;
+            appendTarget(candidate.querySelector?.('[class*="Item_clickable"]') || candidate);
+        });
+        // Preserve the exact original DOM target only as a final fallback;
+        // some game versions use it for nested controls, but it must not
+        // preempt the item container's selection handler.
+        appendTarget(descriptor?.replayTarget);
+        return targets;
+    }
+
+    function mooncakeAntiSuicideReplaySelectionMatches(descriptor) {
+        if (!descriptor?.selectionTarget) return true;
+        if (descriptor.kind === 'alchemy') {
+            const panel = document.querySelector('[class*="AlchemyPanel_alchemyPanel"]');
+            return mooncakeAntiSuicideGetAlchemySourceHrid(panel) === descriptor.itemHrid;
+        }
+        if (descriptor.kind === 'enhancement') {
+            const panel = mooncakeFindEnhancingPanel();
+            return mooncakeNormalizeEnhanceItemHrid(mooncakeGetEnhanceBaseItemHrid(panel)) === descriptor.itemHrid &&
+                mooncakeGetEnhanceBaseItemLevel(panel) === Number(descriptor.level);
+        }
+        return false;
+    }
+
+    function mooncakeAntiSuicideDispatchReplayActivation(target) {
+        if (!mooncakeAntiSuicideCanReplayTarget(target)) return false;
+        const eventBase = { bubbles: true, cancelable: true, composed: true, view: window };
+        const dispatch = (EventConstructor, type, options = {}) => {
+            if (typeof EventConstructor !== 'function') return;
+            try { target.dispatchEvent(new EventConstructor(type, { ...eventBase, ...options })); } catch (_) {}
+        };
+        // Several current game selectors commit on pointer/mouse down, not on
+        // HTMLElement.click(). Replay the full activation sequence before the
+        // native click fallback, including for SVG/image nodes clicked by hand.
+        dispatch(window.PointerEvent, 'pointerdown', { pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 1 });
+        dispatch(window.MouseEvent, 'mousedown', { button: 0, buttons: 1 });
+        dispatch(window.PointerEvent, 'pointerup', { pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 0 });
+        dispatch(window.MouseEvent, 'mouseup', { button: 0, buttons: 0 });
+        if (typeof target.click === 'function') {
+            try { target.click(); } catch (_) {}
+        } else {
+            dispatch(window.MouseEvent, 'click', { button: 0, buttons: 0 });
+        }
+        return true;
+    }
+
+    function mooncakeAntiSuicideConsumeAllowedReplayTarget(element, event = null) {
+        const allowed = mooncakeAntiSuicideAllowedAction;
+        if (!allowed || Date.now() > allowed.expiresAt) {
+            mooncakeAntiSuicideAllowedAction = null;
+            return false;
+        }
+        const targets = allowed.replayTargets || [];
+        const matches = targets.some(target => target === element || target?.contains?.(element) || element?.contains?.(target));
+        if (!matches) return false;
+        if (event?.isTrusted !== false) mooncakeAntiSuicideAllowedAction = null;
+        return true;
+    }
+
+    function mooncakeAntiSuicideReplayAction(descriptor) {
+        const replayTargets = mooncakeAntiSuicideGetReplayTargets(descriptor);
+        if (!replayTargets.length) return;
+        const allowedAction = {
+            target: descriptor.actionTarget,
+            kind: descriptor.kind,
+            itemHrid: descriptor.itemHrid,
+            level: descriptor.level,
+            replayTargets,
+            expiresAt: Date.now() + MOONCAKE_ANTI_SUICIDE_REPLAY_WINDOW_MS
+        };
+        mooncakeAntiSuicideAllowedAction = allowedAction;
         requestAnimationFrame(() => {
-            if (mooncakeAntiSuicideAllowedAction?.target !== actionTarget || !actionTarget.isConnected) return;
-            actionTarget.click();
+            if (mooncakeAntiSuicideAllowedAction !== allowedAction) return;
+            mooncakeAntiSuicideDispatchReplayActivation(replayTargets[0]);
+            if (!descriptor.selectionTarget) return;
+            requestAnimationFrame(() => {
+                if (mooncakeAntiSuicideAllowedAction !== allowedAction || mooncakeAntiSuicideReplaySelectionMatches(descriptor)) return;
+                const freshTargets = mooncakeAntiSuicideGetReplayTargets(descriptor);
+                freshTargets.forEach(target => {
+                    if (!allowedAction.replayTargets.includes(target)) allowedAction.replayTargets.push(target);
+                });
+                const fallbackTarget = freshTargets.find(target => target !== replayTargets[0]);
+                if (fallbackTarget) mooncakeAntiSuicideDispatchReplayActivation(fallbackTarget);
+            });
         });
         setTimeout(() => {
-            if (mooncakeAntiSuicideAllowedAction?.target === actionTarget) mooncakeAntiSuicideAllowedAction = null;
-        }, 1600);
+            if (mooncakeAntiSuicideAllowedAction === allowedAction) mooncakeAntiSuicideAllowedAction = null;
+        }, MOONCAKE_ANTI_SUICIDE_REPLAY_WINDOW_MS + 100);
+    }
+
+    function mooncakeAntiSuicideShouldPassThroughSelection(descriptor) {
+        // Selecting an alchemy source is reversible: the player still has to
+        // explicitly start the native action afterwards. Let the real click
+        // reach the game, then hold the confirmation overlay above it. This
+        // avoids relying on an untrusted synthetic replay for React's portal
+        // selector while keeping the destructive action inaccessible.
+        return descriptor?.kind === 'alchemy' && descriptor.selectionTarget === true;
+    }
+
+    function mooncakeAntiSuicideIsVisible(element) {
+        if (!(element instanceof Element) || !element.isConnected || !element.getClientRects?.().length) return false;
+        const style = window.getComputedStyle?.(element);
+        return style?.display !== 'none' && style?.visibility !== 'hidden';
+    }
+
+    function mooncakeAntiSuicideGetAlchemySelectedItemSelector(panel, itemHrid) {
+        const expectedHrid = mooncakeNormalizeEnhanceItemHrid(itemHrid);
+        if (!panel || !expectedHrid) return null;
+        const candidates = panel.querySelectorAll(
+            '[class*="ItemSelector_itemSelector"], [class*="ItemSelector_itemContainer"]'
+        );
+        for (const candidate of candidates) {
+            if (candidate.closest?.('[class*="ItemSelector_itemList"]')) continue;
+            if (mooncakeNormalizeEnhanceItemHrid(mooncakeGetItemHridFromContainer(candidate)) === expectedHrid) return candidate;
+        }
+        return null;
+    }
+
+    function mooncakeAntiSuicideClearPassedThroughAlchemySelection(descriptor) {
+        if (!descriptor?.selectionPassThrough || descriptor.kind !== 'alchemy' || !descriptor.itemHrid) return;
+        const expectedHrid = mooncakeNormalizeEnhanceItemHrid(descriptor.itemHrid);
+        let attempt = 0;
+        const clear = () => {
+            const panel = document.querySelector('[class*="AlchemyPanel_alchemyPanel"]');
+            if (!panel || mooncakeAntiSuicideGetAlchemySourceHrid(panel) !== expectedHrid) return;
+
+            const openList = [...document.querySelectorAll('[class*="ItemSelector_itemList"]')]
+                .find(list => mooncakeAntiSuicideIsVisible(list));
+            const removeButton = openList?.querySelector?.('[class*="ItemSelector_removeButton"]');
+            if (removeButton) {
+                removeButton.click();
+                return;
+            }
+
+            const selector = mooncakeAntiSuicideGetAlchemySelectedItemSelector(panel, expectedHrid);
+            const clickTarget = selector?.querySelector?.('[class*="Item_clickable"]') || selector;
+            if (clickTarget) clickTarget.click();
+            if (attempt < 4) {
+                attempt += 1;
+                requestAnimationFrame(clear);
+            }
+        };
+        requestAnimationFrame(clear);
     }
 
     function mooncakeEnsureAntiSuicideStyle() {
@@ -13736,7 +14910,11 @@
             overlay.remove();
             mooncakeAntiSuicideModal = null;
             if (previousFocus?.isConnected) previousFocus.focus?.({ preventScroll: true });
-            if (replay) mooncakeAntiSuicideReplayAction(descriptor.actionTarget);
+            if (descriptor.selectionPassThrough) {
+                if (!replay) mooncakeAntiSuicideClearPassedThroughAlchemySelection(descriptor);
+                return;
+            }
+            if (replay) mooncakeAntiSuicideReplayAction(descriptor);
         };
 
         const onKeydown = event => {
@@ -13856,6 +15034,7 @@
         if (event.defaultPrevented || mooncakeAntiSuicideModal) return;
         const element = mooncakeAntiSuicideGetElement(event.target);
         if (!element || element.closest?.(`#${MOONCAKE_ANTI_SUICIDE_MODAL_ID}`)) return;
+        if (mooncakeAntiSuicideConsumeAllowedReplayTarget(element, event)) return;
 
         let descriptor = null;
         if (mooncakeIsAntiSuicideAlchemyEnabled()) {
@@ -13865,7 +15044,13 @@
             descriptor = mooncakeAntiSuicideFindEnhancementTarget(element);
         }
         if (!descriptor?.actionTarget) return;
-        if (mooncakeAntiSuicideConsumeAllowedAction(descriptor.actionTarget)) return;
+        descriptor.replayTarget = element;
+        if (mooncakeAntiSuicideConsumeAllowedAction(descriptor, event)) return;
+        if (mooncakeAntiSuicideShouldPassThroughSelection(descriptor)) {
+            descriptor.selectionPassThrough = true;
+            mooncakeOpenAntiSuicideModal(descriptor);
+            return;
+        }
         mooncakeBlockAntiSuicideEvent(event);
         mooncakeOpenAntiSuicideModal(descriptor);
     }
@@ -13881,6 +15066,7 @@
             if (!(active instanceof Element)) return;
             const syntheticClick = {
                 target: active,
+                isTrusted: event.isTrusted,
                 defaultPrevented: false,
                 preventDefault: () => event.preventDefault(),
                 stopImmediatePropagation: () => event.stopImmediatePropagation(),
@@ -15209,6 +16395,8 @@
     let mooncakeMarketplacePricingSurfaceState = null;
     const mooncakeOrderBookRenderGenerations = new WeakMap();
     let _summaryRenderGeneration = 0;
+    const MOONCAKE_SUMMARY_HOURLY_DATA_RETRY_DELAYS = [140, 480, 1400];
+    const mooncakeSummaryHourlyDataRetryStates = new WeakMap();
     let _enhancementTabRenderGeneration = 0;
     let _pendingMarketJumpRaf = null;
     let _pendingMarketJumpFollowupTimer = 0;
@@ -15674,8 +16862,11 @@
     const MOONCAKE_RECENT_MARKET_NAV_STYLE_ID = 'MooncakeRecentMarketNavigationStyles';
     const MOONCAKE_MOBILE_BAR_ID = 'MooncakeMarketMobileJumpBar';
     const MOONCAKE_MOBILE_MENU_ID = 'MooncakeMarketMobileJumpMenu';
-    const MOONCAKE_MOBILE_MARKET_HELPER_Z_INDEX = '8';
-    const MOONCAKE_MOBILE_MARKET_HELPER_MENU_Z_INDEX = '9';
+    // The compact marketplace is a native modal at z-index 800. Keep the
+    // handset helper immediately above it so an inventory-originated market
+    // dialog cannot hide the only entry point back to the helper menu.
+    const MOONCAKE_MOBILE_MARKET_HELPER_Z_INDEX = '802';
+    const MOONCAKE_MOBILE_MARKET_HELPER_MENU_Z_INDEX = '803';
     const MOONCAKE_MARKET_JUMP_HELPERS_ENABLED_KEY = 'Mooncake_marketJumpHelpers_enabled_v1';
     const MOONCAKE_MARKET_STOCK_NAV_SKILLS = [
         { id: 'milking', outfit: 'dairyhands' },
@@ -16017,6 +17208,7 @@
         '#MooncakeMarketHistoryCard',
         '#MooncakeMarketHistoryMobileCard',
         '[data-mooncake-history-floating="1"]',
+        '[data-mooncake-market-personal-trade-history="1"]',
         `[${MOONCAKE_ENHANCEMENT_TAB_BUTTON_ATTR}="1"]`,
         `[${MOONCAKE_ENHANCEMENT_TAB_PANEL_ATTR}="1"]`,
         '#enhancement-market-info',
@@ -16062,6 +17254,23 @@
     const MOONCAKE_MARKET_HISTORY_MOBILE_ID = 'MooncakeMarketHistoryMobileCard';
     const MOONCAKE_MARKET_HISTORY_FLOAT_SELECTOR = '[data-mooncake-history-floating="1"]';
     const MOONCAKE_MARKET_HISTORY_FOLLOWING_SELECTOR = '[data-mooncake-history-following="1"]';
+    const MOONCAKE_MARKET_PERSONAL_TRADE_HISTORY_ENABLED_KEY = 'Mooncake_marketPersonalTradeHistory_enabled_v1';
+    const MOONCAKE_MARKET_PERSONAL_TRADE_HISTORY_STORAGE_PREFIX = 'Mooncake_marketPersonalTradeHistory_v1';
+    const MOONCAKE_MARKET_PERSONAL_TRADE_HISTORY_MAX_ENTRIES = 500;
+    const MOONCAKE_MARKET_PERSONAL_TRADE_HISTORY_ATTR = 'data-mooncake-market-personal-trade-history';
+    const MOONCAKE_MOOKET_CONFIG_KEY = 'mooket_config';
+    const MOONCAKE_MOOKET_OVERLAY_ID = 'mooket_safe_overlay';
+    // Sunny adds its own market information surface beside the selected item.
+    // The transaction card uses that same narrow header area, so it yields the
+    // surface instead of competing with Sunny's layout or stacking order.
+    const MOONCAKE_SUNNY_MARKET_INFO_SELECTOR = [
+        '[id*="sunny" i]',
+        '[class*="sunny" i]',
+        '[data-sunnymwi-market]',
+        '[data-sunny-mwi-market]',
+        '[data-sunnymwi-market-history]',
+        '[data-sunny-mwi-market-history]'
+    ].join(', ');
     // Anchored cards use the elevated market-detail parent. Dragged cards move
     // to body, so they must sit just above the game's market modal (z-index 800)
     // without using the global maximum layer reserved for dialogs and menus.
@@ -16114,6 +17323,353 @@
     let mooncakeMarketHistoryStackingState = null;
     let mooncakeBargainRecipeIndex = null;
     const mooncakeBargainHistoryPriceCache = new Map();
+    let mooncakeMarketPersonalTradeHistory = {};
+    let mooncakeMarketPersonalTradeHistoryLoadedKey = '';
+    let mooncakeMarketPersonalTradeHistoryWriteTimer = 0;
+    let mooncakeMarketPersonalTradeHistoryRenderTimer = 0;
+
+    function mooncakeIsMarketPersonalTradeHistoryEnabled() {
+        try {
+            return localStorage.getItem(MOONCAKE_MARKET_PERSONAL_TRADE_HISTORY_ENABLED_KEY) !== '0';
+        } catch (_) {
+            return true;
+        }
+    }
+
+    function mooncakeGetMarketPersonalTradeHistoryStorageKey() {
+        const characterId = String(mooncakeCharacterId || '').trim();
+        if (!characterId) return '';
+        const hostname = String(location?.hostname || 'unknown').toLowerCase();
+        return `${MOONCAKE_MARKET_PERSONAL_TRADE_HISTORY_STORAGE_PREFIX}:${hostname}:${characterId}`;
+    }
+
+    function mooncakeNormalizeMarketPersonalTradePrice(value) {
+        const price = Number(value);
+        return Number.isFinite(price) && price > 0 ? Math.floor(price) : 0;
+    }
+
+    function mooncakeNormalizeMarketPersonalTradeHistoryEntry(entry) {
+        if (!entry || typeof entry !== 'object') return null;
+        const sell = mooncakeNormalizeMarketPersonalTradePrice(entry.sell);
+        const buy = mooncakeNormalizeMarketPersonalTradePrice(entry.buy);
+        if (!sell && !buy) return null;
+        const sellAt = Number(entry.sellAt);
+        const buyAt = Number(entry.buyAt);
+        const updatedAt = Number(entry.updatedAt);
+        return {
+            ...(sell ? { sell, sellAt: Number.isFinite(sellAt) ? sellAt : 0 } : {}),
+            ...(buy ? { buy, buyAt: Number.isFinite(buyAt) ? buyAt : 0 } : {}),
+            updatedAt: Number.isFinite(updatedAt)
+                ? updatedAt
+                : Math.max(Number.isFinite(sellAt) ? sellAt : 0, Number.isFinite(buyAt) ? buyAt : 0)
+        };
+    }
+
+    function mooncakePruneMarketPersonalTradeHistory(history) {
+        return Object.fromEntries(
+            Object.entries(history || {})
+                .map(([key, entry]) => [key, mooncakeNormalizeMarketPersonalTradeHistoryEntry(entry)])
+                .filter(([, entry]) => !!entry)
+                .sort((left, right) => Number(right[1].updatedAt || 0) - Number(left[1].updatedAt || 0))
+                .slice(0, MOONCAKE_MARKET_PERSONAL_TRADE_HISTORY_MAX_ENTRIES)
+        );
+    }
+
+    function mooncakeReadMarketPersonalTradeHistory(storageKey) {
+        if (!storageKey) return {};
+        try {
+            const raw = JSON.parse(localStorage.getItem(storageKey) || 'null');
+            return raw && typeof raw === 'object' && !Array.isArray(raw)
+                ? mooncakePruneMarketPersonalTradeHistory(raw)
+                : {};
+        } catch (_) {
+            return {};
+        }
+    }
+
+    function mooncakeWriteMarketPersonalTradeHistory(storageKey = mooncakeMarketPersonalTradeHistoryLoadedKey) {
+        if (!storageKey) return;
+        const history = mooncakePruneMarketPersonalTradeHistory(mooncakeMarketPersonalTradeHistory);
+        if (storageKey === mooncakeMarketPersonalTradeHistoryLoadedKey) {
+            mooncakeMarketPersonalTradeHistory = history;
+        }
+        try {
+            localStorage.setItem(storageKey, JSON.stringify(history));
+        } catch (_) {}
+    }
+
+    function mooncakeEnsureMarketPersonalTradeHistoryLoaded() {
+        const storageKey = mooncakeGetMarketPersonalTradeHistoryStorageKey();
+        if (storageKey === mooncakeMarketPersonalTradeHistoryLoadedKey) {
+            return mooncakeMarketPersonalTradeHistory;
+        }
+        if (mooncakeMarketPersonalTradeHistoryLoadedKey) {
+            if (mooncakeMarketPersonalTradeHistoryWriteTimer) {
+                clearTimeout(mooncakeMarketPersonalTradeHistoryWriteTimer);
+                mooncakeMarketPersonalTradeHistoryWriteTimer = 0;
+            }
+            mooncakeWriteMarketPersonalTradeHistory(mooncakeMarketPersonalTradeHistoryLoadedKey);
+        }
+        mooncakeMarketPersonalTradeHistoryLoadedKey = storageKey;
+        mooncakeMarketPersonalTradeHistory = mooncakeReadMarketPersonalTradeHistory(storageKey);
+        return mooncakeMarketPersonalTradeHistory;
+    }
+
+    function mooncakeScheduleMarketPersonalTradeHistoryWrite() {
+        if (mooncakeMarketPersonalTradeHistoryWriteTimer) return;
+        mooncakeMarketPersonalTradeHistoryWriteTimer = setTimeout(() => {
+            mooncakeMarketPersonalTradeHistoryWriteTimer = 0;
+            mooncakeWriteMarketPersonalTradeHistory();
+        }, 350);
+    }
+
+    function mooncakeNormalizeMarketPersonalTradeRecord(listing, timestamp = Date.now()) {
+        if (!listing || typeof listing !== 'object' || !(Number(listing.filledQuantity) > 0)) return null;
+        const itemHrid = typeof listing.itemHrid === 'string' ? listing.itemHrid.trim() : '';
+        if (!itemHrid.startsWith('/items/')) return null;
+        const enhancementLevel = Math.max(0, Math.min(20, Math.floor(Number(listing.enhancementLevel) || 0)));
+        const price = mooncakeNormalizeMarketPersonalTradePrice(listing.price);
+        if (!price) return null;
+        const isSell = listing.isSell === true || listing.isSell === 1 || listing.isSell === '1' || listing.isSell === 'true';
+        return {
+            key: `${itemHrid}:${enhancementLevel}`,
+            side: isSell ? 'sell' : 'buy',
+            price,
+            timestamp: Number.isFinite(Number(timestamp)) ? Number(timestamp) : Date.now()
+        };
+    }
+
+    function mooncakeApplyMarketPersonalTradeRecord(history, record) {
+        if (!history || !record?.key || !record?.side || !record.price) return null;
+        const previous = mooncakeNormalizeMarketPersonalTradeHistoryEntry(history[record.key]) || {};
+        const next = {
+            ...previous,
+            [record.side]: record.price,
+            [`${record.side}At`]: record.timestamp,
+            updatedAt: record.timestamp
+        };
+        history[record.key] = next;
+        return next;
+    }
+
+    function mooncakeRecordMarketPersonalTradeHistory(...collections) {
+        const history = mooncakeEnsureMarketPersonalTradeHistoryLoaded();
+        if (!mooncakeMarketPersonalTradeHistoryLoadedKey) return false;
+        const timestamp = Date.now();
+        let changed = false;
+        collections.forEach(collection => {
+            mooncakeCollectionEntries(collection).forEach(([, listing]) => {
+                const record = mooncakeNormalizeMarketPersonalTradeRecord(listing, timestamp);
+                if (!record) return;
+                mooncakeApplyMarketPersonalTradeRecord(history, record);
+                changed = true;
+            });
+        });
+        if (!changed) return false;
+        mooncakeScheduleMarketPersonalTradeHistoryWrite();
+        mooncakeScheduleMarketPersonalTradeHistoryDisplay(0);
+        return true;
+    }
+
+    function mooncakeIsMooketMarketPersonalTradeHistoryEnabled() {
+        if (!document.getElementById(MOONCAKE_MOOKET_OVERLAY_ID)) return false;
+        try {
+            const config = JSON.parse(localStorage.getItem(MOONCAKE_MOOKET_CONFIG_KEY) || 'null');
+            return config?.showTradeHistory !== false;
+        } catch (_) {
+            return true;
+        }
+    }
+
+    function mooncakeIsVisibleSunnyMarketInfoNode(node) {
+        if (!(node instanceof Element) || !node.isConnected) return false;
+        const rect = node.getBoundingClientRect();
+        if (!(rect.width > 0 && rect.height > 0)) return false;
+        const style = getComputedStyle(node);
+        return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+    }
+
+    function mooncakeFindSunnyMarketInfoSurface(marker, container) {
+        let candidate = marker;
+        while (candidate instanceof Element && candidate !== container) {
+            if (mooncakeIsVisibleSunnyMarketInfoNode(candidate)) {
+                const rect = candidate.getBoundingClientRect();
+                // The marker can be a tiny child inside Sunny's panel. Walk up
+                // to the first practical surface, but never treat the entire
+                // marketplace header as a conflict on its own.
+                if (rect.width >= 56 && rect.height >= 16 && rect.width <= 960 && rect.height <= 360) {
+                    return candidate;
+                }
+            }
+            candidate = candidate.parentElement;
+        }
+        return null;
+    }
+
+    function mooncakeDoesSunnyMarketSurfaceOverlapHistoryCard(surface, currentItem) {
+        const itemRect = currentItem.getBoundingClientRect();
+        if (!(itemRect.width > 0 && itemRect.height > 0)) return false;
+        const card = document.getElementById(MOONCAKE_MARKET_HISTORY_CARD_ID);
+        const cardRect = card?.isConnected ? card.getBoundingClientRect() : null;
+        const width = cardRect?.width > 0
+            ? cardRect.width
+            // The initial loading/no-record state can expand beyond a material
+            // card's final width, so reserve the desktop equipment width here.
+            : 340;
+        const left = cardRect?.width > 0
+            ? cardRect.left
+            : itemRect.right + MOONCAKE_MARKET_HISTORY_ANCHOR_MARGIN;
+        const top = cardRect?.height > 0 ? cardRect.top : itemRect.top - 20;
+        const right = cardRect?.width > 0 ? cardRect.right : left + width;
+        const bottom = cardRect?.height > 0 ? cardRect.bottom : top + 110;
+        const surfaceRect = surface.getBoundingClientRect();
+        const horizontalOverlap = Math.min(right, surfaceRect.right) - Math.max(left, surfaceRect.left);
+        const verticalOverlap = Math.min(bottom, surfaceRect.bottom) - Math.max(top, surfaceRect.top);
+        const verticalGap = verticalOverlap >= 0 ? 0 : -verticalOverlap;
+        return horizontalOverlap >= 28 && (verticalOverlap >= 8 || verticalGap <= 16);
+    }
+
+    function mooncakeHasSunnyMarketInfoConflict(currentItem) {
+        if (!(currentItem instanceof Element) || !currentItem.isConnected) return false;
+        const infoContainer = currentItem.closest?.('[class*="MarketplacePanel_infoContainer"]');
+        if (!infoContainer) return false;
+        const marketplacePanel = infoContainer.closest?.('[class*="MarketplacePanel_marketplacePanel"]');
+        const container = marketplacePanel || infoContainer;
+        return Array.from(container.querySelectorAll(MOONCAKE_SUNNY_MARKET_INFO_SELECTOR)).some(marker => {
+            // A Sunny button attached to the item icon is not the competing
+            // information panel. Only yield when Sunny owns a separate visible
+            // surface that actually enters the transaction-card zone.
+            if (currentItem.contains(marker)) return false;
+            const surface = mooncakeFindSunnyMarketInfoSurface(marker, container);
+            return !!surface && mooncakeDoesSunnyMarketSurfaceOverlapHistoryCard(surface, currentItem);
+        });
+    }
+
+    function mooncakeYieldMarketHistoryCardToSunny(currentItem) {
+        if (!mooncakeHasSunnyMarketInfoConflict(currentItem)) return false;
+        mooncakeMarketHistorySeq++;
+        mooncakeMarketHistoryCardAbortController?.abort();
+        mooncakeMarketHistoryCardAbortController = null;
+        mooncakeMarketHistoryActiveRequestKey = '';
+        mooncakeMarketHistoryLastRenderKey = '';
+        mooncakeMarketHistoryLastRenderAt = 0;
+        mooncakeRemoveMarketHistoryCards({ includeFloating: true });
+        return true;
+    }
+
+    function mooncakeRemoveMarketPersonalTradeHistoryDisplay() {
+        document.querySelectorAll(`[${MOONCAKE_MARKET_PERSONAL_TRADE_HISTORY_ATTR}="1"]`).forEach(node => node.remove());
+    }
+
+    function mooncakeFindMarketPriceRangeTextNode(currentItem) {
+        if (!currentItem?.isConnected) return null;
+        const rangePattern = /(?:可交易区间|tradeable\s+range|tradable\s+range)/i;
+        // The range lives beside the current item within MarketplacePanel_infoContainer,
+        // rather than inside the current item itself.
+        const searchRoot = currentItem.closest?.('[class*="MarketplacePanel_infoContainer"]') || currentItem;
+        const walker = document.createTreeWalker(searchRoot, NodeFilter.SHOW_TEXT);
+        let node = walker.nextNode();
+        while (node) {
+            if (rangePattern.test(node.textContent || '')) return node;
+            node = walker.nextNode();
+        }
+        return null;
+    }
+
+    function mooncakeBuildMarketPersonalTradeHistoryDisplay(badge, entry) {
+        badge.replaceChildren();
+        Object.assign(badge.style, {
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '4px',
+            marginRight: '8px',
+            whiteSpace: 'nowrap',
+            verticalAlign: 'middle',
+            fontSize: 'inherit',
+            fontWeight: '700',
+            color: 'rgba(220,231,255,.78)'
+        });
+        const appendPrice = (side, color, text) => {
+            const price = mooncakeNormalizeMarketPersonalTradePrice(entry?.[side]);
+            if (!price) return;
+            if (badge.childElementCount > 0) {
+                const divider = document.createElement('span');
+                divider.textContent = ' / ';
+                divider.style.color = 'rgba(220,231,255,.46)';
+                badge.appendChild(divider);
+            }
+            const value = document.createElement('span');
+            value.textContent = `${text} ${mooncakeFormatMarketHistoryPrice(price)}`;
+            value.title = side === 'sell'
+                ? (isZH ? '我的最近卖出成交价' : 'My latest completed sale price')
+                : (isZH ? '我的最近买入成交价' : 'My latest completed buy price');
+            value.style.color = color;
+            badge.appendChild(value);
+        };
+        appendPrice('sell', '#9bedad', isZH ? '卖' : 'Sell');
+        appendPrice('buy', '#ffaaa4', isZH ? '买' : 'Buy');
+    }
+
+    function mooncakeEnsureMarketPersonalTradeHistoryDisplay(currentItem, itemHrid, enhancementLevel = 0) {
+        if (!mooncakeIsMarketPersonalTradeHistoryEnabled() || mooncakeIsMooketMarketPersonalTradeHistoryEnabled()) {
+            mooncakeRemoveMarketPersonalTradeHistoryDisplay();
+            return;
+        }
+        const history = mooncakeEnsureMarketPersonalTradeHistoryLoaded();
+        const level = Math.max(0, Math.min(20, Math.floor(Number(enhancementLevel) || 0)));
+        const entry = mooncakeNormalizeMarketPersonalTradeHistoryEntry(history[`${itemHrid}:${level}`]);
+        const rangeTextNode = entry ? mooncakeFindMarketPriceRangeTextNode(currentItem) : null;
+        if (!entry || !rangeTextNode?.parentNode) {
+            mooncakeRemoveMarketPersonalTradeHistoryDisplay();
+            return;
+        }
+        const badgeHost = rangeTextNode.parentNode;
+        let badge = badgeHost.querySelector(`[${MOONCAKE_MARKET_PERSONAL_TRADE_HISTORY_ATTR}="1"]`);
+        document.querySelectorAll(`[${MOONCAKE_MARKET_PERSONAL_TRADE_HISTORY_ATTR}="1"]`).forEach(node => {
+            if (node !== badge) node.remove();
+        });
+        if (!badge) {
+            badge = document.createElement('span');
+            badge.setAttribute(MOONCAKE_MARKET_PERSONAL_TRADE_HISTORY_ATTR, '1');
+        }
+        const signature = [entry.sell || '', entry.sellAt || '', entry.buy || '', entry.buyAt || ''].join(':');
+        if (badge.dataset.mooncakeMarketPersonalTradeHistorySignature !== signature) {
+            badge.dataset.mooncakeMarketPersonalTradeHistorySignature = signature;
+            mooncakeBuildMarketPersonalTradeHistoryDisplay(badge, entry);
+        }
+        if (badge.parentNode !== badgeHost || badge.nextSibling !== rangeTextNode) {
+            badgeHost.insertBefore(badge, rangeTextNode);
+        }
+    }
+
+    function mooncakeScheduleMarketPersonalTradeHistoryDisplay(delay = 40) {
+        if (mooncakeMarketPersonalTradeHistoryRenderTimer) return;
+        mooncakeMarketPersonalTradeHistoryRenderTimer = setTimeout(() => {
+            mooncakeMarketPersonalTradeHistoryRenderTimer = 0;
+            const currentItem = mooncakeFindCurrentMarketItemNode();
+            const itemHrid = mooncakeParseItemHridFromPanel(currentItem);
+            if (!mooncakeShouldShowMarketJumpHelpers(currentItem) || !itemHrid) {
+                mooncakeRemoveMarketPersonalTradeHistoryDisplay();
+                return;
+            }
+            mooncakeEnsureMarketPersonalTradeHistoryDisplay(
+                currentItem,
+                itemHrid,
+                mooncakeGetCurrentMarketEnhanceLevel(0)
+            );
+        }, Math.max(0, Number(delay) || 0));
+    }
+
+    function mooncakeSetMarketPersonalTradeHistoryEnabled(enabled) {
+        try {
+            localStorage.setItem(MOONCAKE_MARKET_PERSONAL_TRADE_HISTORY_ENABLED_KEY, enabled ? '1' : '0');
+        } catch (_) {}
+        if (!enabled) {
+            mooncakeRemoveMarketPersonalTradeHistoryDisplay();
+            return;
+        }
+        mooncakeScheduleMarketPersonalTradeHistoryDisplay(0);
+    }
 
     function mooncakeIsMarketHistoryCardEnabled() {
         try {
@@ -16275,7 +17831,9 @@
         if (!drag || (card && drag.card !== card)) return;
         if (drag.frame) cancelAnimationFrame(drag.frame);
         try { drag.handle?.releasePointerCapture?.(drag.pointerId); } catch (_) {}
-        if (drag.handle?.isConnected) drag.handle.style.cursor = 'grab';
+        if (drag.handle?.isConnected) {
+            drag.handle.style.cursor = drag.card?.dataset.expanded === '1' ? 'grab' : 'pointer';
+        }
         mooncakeMarketHistoryMobileDrag = null;
     }
 
@@ -17970,8 +19528,8 @@
                     ${visibleColumns.median ? `<td title="${medianTitle}" style="padding:${cellPad};text-align:center;color:#FFA500;font-weight:700;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeFormatMarketHistoryPrice(row.medianPrice)}</td>` : ''}
                     ${visibleColumns.volume ? `<td style="padding:${cellPad};text-align:center;color:#87CEEB;font-weight:700;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeFormatHistoryPrice(row.volume)}</td>` : ''}
                     ${visibleColumns.buySell ? `<td style="padding:${cellPad};text-align:center;color:#90EE90;font-weight:700;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeFormatHistoryPrice(row.buyVolume)}/${mooncakeFormatHistoryPrice(row.sellVolume)}</td>` : ''}
-                    ${visibleColumns.range ? `<td class="mooncake-market-history-price-cell" data-mooncake-history-price-window="${days}" style="padding:${cellPad};text-align:center;color:#FFFF00;font-weight:700;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeBuildMarketHistoryOrderValue(`${mooncakeFormatMarketHistoryPrice(row.maxPrice)}/${mooncakeFormatMarketHistoryPrice(row.minPrice)}`, `${mooncakeFormatMarketHistoryPrice(row.minPrice)}/${mooncakeFormatMarketHistoryPrice(row.maxPrice)}`, sellFirst)}</td>` : ''}
-                    ${showHourly && visibleColumns.hourly ? `<td title="${medianTitle}" style="padding:${hourlyCellPad};text-align:center;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeBuildMarketHistoryOrderValue(hourlyRange.sellFirst, hourlyRange.buyFirst, sellFirst)}</td>` : ''}
+                    ${visibleColumns.range ? `<td class="mooncake-market-history-price-cell" data-mooncake-history-detail-trigger="range" data-mooncake-history-price-window="${days}" style="padding:${cellPad};text-align:center;color:#FFFF00;font-weight:700;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeBuildMarketHistoryOrderValue(`${mooncakeFormatMarketHistoryPrice(row.maxPrice)}/${mooncakeFormatMarketHistoryPrice(row.minPrice)}`, `${mooncakeFormatMarketHistoryPrice(row.minPrice)}/${mooncakeFormatMarketHistoryPrice(row.maxPrice)}`, sellFirst)}</td>` : ''}
+                    ${showHourly && visibleColumns.hourly ? `<td class="mooncake-market-history-hourly-cell" data-mooncake-history-detail-trigger="hourly" data-mooncake-history-price-window="${days}" title="${medianTitle}" style="padding:${hourlyCellPad};text-align:center;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeBuildMarketHistoryOrderValue(hourlyRange.sellFirst, hourlyRange.buyFirst, sellFirst)}</td>` : ''}
                 </tr>
             `;
         }).join('');
@@ -17979,7 +19537,7 @@
 
     function mooncakeBindMarketHistoryPriceTooltips(card, windows) {
         if (!card?.querySelectorAll) return;
-        card.querySelectorAll('.mooncake-market-history-price-cell').forEach(cell => {
+        card.querySelectorAll('.mooncake-market-history-price-cell, .mooncake-market-history-hourly-cell').forEach(cell => {
             const days = Math.max(1, Math.floor(Number(cell.getAttribute('data-mooncake-history-price-window')) || 1));
             const row = windows?.[days] || {};
             const itemHrid = String(card.dataset.itemHrid || '');
@@ -18104,8 +19662,8 @@
             overflowY: expanded ? 'auto' : 'hidden',
             zIndex: MOONCAKE_MARKET_HISTORY_FLOAT_Z_INDEX,
             padding: expanded ? '6px 34px 7px 6px' : '0',
-            cursor: '',
-            touchAction: 'auto',
+            cursor: expanded ? 'grab' : 'pointer',
+            touchAction: expanded ? 'none' : 'manipulation',
             userSelect: 'none',
             clipPath: collapsedLayout ? 'inset(0)' : '',
             contain: collapsedLayout ? 'layout paint' : '',
@@ -18243,17 +19801,6 @@
 
         const controls = document.createElement('span');
         controls.setAttribute('data-mooncake-history-card-controls', '1');
-        const dragHandle = mooncakeCreateMarketHistoryCardControl('⠿', isZH ? '按住拖动交易卡片' : 'Drag trading card', 'data-mooncake-history-mobile-drag-handle');
-        Object.assign(dragHandle.style, {
-            width: '24px',
-            minWidth: '24px',
-            height: '24px',
-            minHeight: '24px',
-            cursor: 'grab',
-            touchAction: 'none',
-            fontSize: '15px'
-        });
-        controls.appendChild(dragHandle);
         controls.appendChild(mooncakeCreateMarketHistoryCardControl('×', isZH ? '收起' : 'Collapse', 'data-mooncake-history-toggle'));
         Object.assign(controls.style, {
             position: 'absolute',
@@ -18363,10 +19910,8 @@
 
     function mooncakeBuildMobileMarketHistoryCollapsedHtml() {
         const toggleTitle = isZH ? '展开交易卡片' : 'Expand trading card';
-        const dragTitle = isZH ? '按住拖动交易卡片' : 'Drag trading card';
-        return `<span style="display:flex;width:58px;height:28px;align-items:center;justify-content:center;gap:0;pointer-events:auto;">
-            <button type="button" data-mooncake-history-toggle="1" title="${toggleTitle}" aria-label="${toggleTitle}" style="width:34px;height:28px;padding:0;border:0;background:transparent;color:#eef6ff;font-size:13px;font-weight:900;cursor:pointer;pointer-events:auto;">量</button>
-            <button type="button" data-mooncake-history-mobile-drag-handle="1" title="${dragTitle}" aria-label="${dragTitle}" style="width:24px;height:28px;padding:0;border:0;background:transparent;color:rgba(238,246,255,.72);font-size:15px;font-weight:800;line-height:1;cursor:grab;touch-action:none;pointer-events:auto;">⠿</button>
+        return `<span style="display:flex;width:58px;height:28px;align-items:center;justify-content:center;pointer-events:auto;">
+            <button type="button" data-mooncake-history-toggle="1" title="${toggleTitle}" aria-label="${toggleTitle}" style="width:58px;height:28px;padding:0;border:0;background:transparent;color:#eef6ff;font-size:13px;font-weight:900;cursor:pointer;pointer-events:auto;">量</button>
         </span>`;
     }
 
@@ -18584,9 +20129,15 @@
 
     function mooncakeStartMobileMarketHistoryDrag(event) {
         if (event.isPrimary === false || (event.pointerType === 'mouse' && event.button !== 0)) return;
-        const handle = event.target?.closest?.('[data-mooncake-history-mobile-drag-handle]');
-        const card = handle?.closest?.(`#${MOONCAKE_MARKET_HISTORY_MOBILE_ID}`);
-        if (!handle || !card?.isConnected) return;
+        const card = event.target?.closest?.(`#${MOONCAKE_MARKET_HISTORY_MOBILE_ID}`);
+        if (!card?.isConnected) return;
+        const interactiveTarget = event.target?.closest?.(
+            'button:not([data-mooncake-history-toggle]), a, input, select, textarea, [contenteditable="true"], .mooncake-history-timeline-target, [data-mooncake-history-timeline-detail]'
+        );
+        if (interactiveTarget) return;
+        // The collapsed launcher is a button, but it should still be movable
+        // on a deliberate hold-and-drag. A tap remains its expand action.
+        const handle = card;
         const rect = card.getBoundingClientRect();
         mooncakeMarketHistoryMobileDrag = {
             card,
@@ -18605,8 +20156,6 @@
         };
         handle.style.cursor = 'grabbing';
         try { handle.setPointerCapture?.(event.pointerId); } catch (_) {}
-        event.preventDefault();
-        event.stopPropagation();
     }
 
     function mooncakeMoveMobileMarketHistoryDrag(event) {
@@ -18620,7 +20169,6 @@
         const deltaX = event.clientX - drag.startX;
         const deltaY = event.clientY - drag.startY;
         if (!drag.moved && Math.hypot(deltaX, deltaY) < 4) {
-            event.preventDefault();
             return;
         }
         drag.moved = true;
@@ -18650,9 +20198,17 @@
             const finalTop = Number.isFinite(drag.pendingTop) ? drag.pendingTop : drag.card.getBoundingClientRect().top;
             mooncakeMoveMobileMarketHistoryCard(drag.card, finalLeft, finalTop, { width: drag.width, height: drag.height });
             mooncakeWriteMobileMarketHistoryPosition(drag.card);
+            drag.card.dataset.mooncakeHistorySuppressClick = '1';
+            setTimeout(() => {
+                if (drag.card?.dataset.mooncakeHistorySuppressClick === '1') {
+                    delete drag.card.dataset.mooncakeHistorySuppressClick;
+                }
+            }, 250);
         }
         try { drag.handle?.releasePointerCapture?.(event.pointerId); } catch (_) {}
-        if (drag.handle?.isConnected) drag.handle.style.cursor = 'grab';
+        if (drag.handle?.isConnected) {
+            drag.handle.style.cursor = drag.card?.dataset.expanded === '1' ? 'grab' : 'pointer';
+        }
         mooncakeMarketHistoryMobileDrag = null;
     }
 
@@ -18662,6 +20218,7 @@
             return null;
         }
         const isMobile = mooncakeIsPhoneMarketUi();
+        if (!isMobile && mooncakeYieldMarketHistoryCardToSunny(target.currentItem)) return null;
         if (!isMobile) mooncakeElevateMarketHistoryStacking(target.currentItem);
         const id = isMobile ? MOONCAKE_MARKET_HISTORY_MOBILE_ID : MOONCAKE_MARKET_HISTORY_CARD_ID;
         const otherId = isMobile ? MOONCAKE_MARKET_HISTORY_CARD_ID : MOONCAKE_MARKET_HISTORY_MOBILE_ID;
@@ -18763,6 +20320,7 @@
             mooncakeMarketHistoryLastRenderKey = '';
             return;
         }
+        if (!mooncakeIsPhoneMarketUi() && mooncakeYieldMarketHistoryCardToSunny(target.currentItem)) return;
         const renderKey = `${target.itemHrid}|${target.level}`;
         const isPhone = mooncakeIsPhoneMarketUi();
         const regularCard = document.getElementById(isPhone ? MOONCAKE_MARKET_HISTORY_MOBILE_ID : MOONCAKE_MARKET_HISTORY_CARD_ID);
@@ -18957,6 +20515,23 @@
                 event.stopPropagation();
                 return;
             }
+            const mobileCard = target.closest?.(`#${MOONCAKE_MARKET_HISTORY_MOBILE_ID}`);
+            if (mobileCard?.dataset.expanded === '1') {
+                const interactiveTarget = target.closest?.(
+                    'button, a, input, select, textarea, [contenteditable="true"], [data-mooncake-history-detail-trigger], .mooncake-history-timeline-target, [data-mooncake-history-timeline-detail]'
+                );
+                if (!interactiveTarget) {
+                    const suppressClick = mobileCard.dataset.mooncakeHistorySuppressClick === '1';
+                    delete mobileCard.dataset.mooncakeHistorySuppressClick;
+                    if (!suppressClick) {
+                        mooncakeSetMobileMarketHistoryExpanded(mobileCard, false);
+                        mooncakeRenderMobileMarketHistoryLauncher(mobileCard, mooncakeFindCurrentMarketItemNode());
+                    }
+                    event.preventDefault();
+                    event.stopPropagation();
+                    return;
+                }
+            }
             const floatingCard = target.closest?.(MOONCAKE_MARKET_HISTORY_FOLLOWING_SELECTOR);
             if (floatingCard) {
                 const interactiveTarget = target.closest?.(
@@ -19007,6 +20582,12 @@
             if (toggle) {
                 const card = toggle.closest(`#${MOONCAKE_MARKET_HISTORY_MOBILE_ID}`);
                 if (card) {
+                    if (card.dataset.mooncakeHistorySuppressClick === '1') {
+                        delete card.dataset.mooncakeHistorySuppressClick;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        return;
+                    }
                     const shouldExpand = card.dataset.expanded !== '1';
                     mooncakeSetMobileMarketHistoryExpanded(card, shouldExpand);
                     const marketTarget = mooncakeGetCurrentMarketHistoryTarget();
@@ -21120,7 +22701,7 @@
     const MOONCAKE_WAREHOUSE_CUSTOM_ID_RE = /^custom:[A-Za-z0-9_-]{1,80}$/;
     const MOONCAKE_WAREHOUSE_STYLE_PROPS = [
         'position', 'left', 'top', 'z-index', 'margin', 'width', 'height',
-        'pointer-events', 'transform', 'transition', 'visibility'
+        'display', 'opacity', 'pointer-events', 'transform', 'transition', 'visibility'
     ];
     const MOONCAKE_WAREHOUSE_ROOT_STYLE_PROPS = ['position', 'padding-top'];
     const MOONCAKE_WAREHOUSE_SUNNY_CONFLICT_SELECTOR = [
@@ -21146,6 +22727,11 @@
     let mooncakeWarehouseMenuSequence = 0;
     let mooncakeWarehouseResizeObserver = null;
     let mooncakeWarehouseVisibilityObserver = null;
+    let mooncakeWarehouseCurrentEquipmentObserver = null;
+    let mooncakeWarehouseObservedCurrentEquipment = null;
+    let mooncakeWarehouseObservedCurrentEquipmentSignature = '';
+    let mooncakeWarehouseObservedCurrentEquipmentRoot = null;
+    let mooncakeWarehouseCurrentEquipmentIntegrityDirty = false;
     let mooncakeWarehouseObservedRoot = null;
     let mooncakeWarehouseObservedWidth = null;
     let mooncakeWarehouseObservedRootVisible = false;
@@ -21650,7 +23236,7 @@
             equipment.push({
                 itemHrid: primary.hrid,
                 enhancementLevel: mooncakeWarehouseNormalizeLevel(primary.level),
-                role: actionIndex === 0 ? 'current-equipment' : 'queued-equipment',
+                role: queueIndex === 0 ? 'current-equipment' : 'queued-equipment',
                 sectionId: MOONCAKE_WAREHOUSE_SECTION_QUEUE,
                 group: 'equipment',
                 priority: 400,
@@ -21932,14 +23518,121 @@
         ownedStyles.set(property, { value: nextValue, priority: nextPriority });
     }
 
+    function mooncakeWarehouseRestoreOwnedInlineStyle(element, property) {
+        const snapshot = mooncakeWarehouseNodeStyleSnapshots.get(element)?.[property];
+        const ownedStyles = mooncakeWarehouseOwnedInlineStyles.get(element);
+        const owned = ownedStyles?.get(property);
+        if (!element || !snapshot || !owned) return;
+        const currentValue = element.style.getPropertyValue(property);
+        const currentPriority = element.style.getPropertyPriority(property);
+        if (currentValue === owned.value && currentPriority === owned.priority) {
+            if (snapshot.value) element.style.setProperty(property, snapshot.value, snapshot.priority || '');
+            else element.style.removeProperty(property);
+        }
+        ownedStyles.delete(property);
+        if (!ownedStyles.size) mooncakeWarehouseOwnedInlineStyles.delete(element);
+    }
+
+    function mooncakeWarehouseRefreshInlineStyleSnapshot(element, properties) {
+        const snapshot = mooncakeWarehouseNodeStyleSnapshots.get(element);
+        if (!element || !snapshot) return;
+        const ownedStyles = mooncakeWarehouseOwnedInlineStyles.get(element);
+        for (const property of properties) {
+            if (ownedStyles?.has(property)) continue;
+            snapshot[property] = {
+                value: element.style.getPropertyValue(property),
+                priority: element.style.getPropertyPriority(property)
+            };
+        }
+    }
+
+    function mooncakeWarehouseCurrentEquipmentNeedsRepair(target, root, checkLayout = true) {
+        if (!target || target.hidden || target.role !== 'current-equipment') return false;
+        const node = target.node;
+        if (!node?.isConnected || !root?.contains?.(node)) return true;
+        if (!mooncakeWarehouseNormalizeItemHrid(mooncakeGetItemHridFromContainer(node))) return true;
+        const expectedInlineStyles = {
+            position: 'absolute',
+            display: 'block',
+            opacity: '1',
+            transform: 'none',
+            visibility: 'visible'
+        };
+        for (const [property, value] of Object.entries(expectedInlineStyles)) {
+            if (node.style.getPropertyValue(property) !== value) return true;
+        }
+        if (!checkLayout) return false;
+        const style = getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) <= 0) return true;
+        const rect = node.getBoundingClientRect();
+        return !(rect.width > 0 && rect.height > 0);
+    }
+
+    function mooncakeWarehouseDisconnectCurrentEquipmentObserver() {
+        if (mooncakeWarehouseCurrentEquipmentObserver) mooncakeWarehouseCurrentEquipmentObserver.disconnect();
+        mooncakeWarehouseCurrentEquipmentObserver = null;
+        mooncakeWarehouseObservedCurrentEquipment = null;
+        mooncakeWarehouseObservedCurrentEquipmentSignature = '';
+        mooncakeWarehouseObservedCurrentEquipmentRoot = null;
+        mooncakeWarehouseCurrentEquipmentIntegrityDirty = false;
+    }
+
+    function mooncakeWarehouseGetCurrentEquipmentDomSignature(node) {
+        if (!node?.isConnected) return '';
+        return [
+            mooncakeWarehouseNormalizeItemHrid(mooncakeGetItemHridFromContainer(node)),
+            mooncakeWarehouseNormalizeLevel(mooncakeGetItemEnhancementLevelFromContainer(node)),
+            node.querySelector('[class*="Item_item__"]') ? 1 : 0
+        ].join('|');
+    }
+
+    function mooncakeWarehouseObserveCurrentEquipment(node, root, keepExistingShell = false) {
+        if (mooncakeWarehouseCurrentEquipmentObserver &&
+            mooncakeWarehouseObservedCurrentEquipment === node &&
+            mooncakeWarehouseObservedCurrentEquipmentRoot === root) return;
+        if (!node && keepExistingShell && mooncakeWarehouseCurrentEquipmentObserver &&
+            mooncakeWarehouseObservedCurrentEquipment?.isConnected &&
+            mooncakeWarehouseObservedCurrentEquipmentRoot === root &&
+            root?.contains?.(mooncakeWarehouseObservedCurrentEquipment)) return;
+        mooncakeWarehouseDisconnectCurrentEquipmentObserver();
+        if (!node || !root || typeof MutationObserver !== 'function') return;
+        mooncakeWarehouseObservedCurrentEquipment = node;
+        mooncakeWarehouseObservedCurrentEquipmentRoot = root;
+        mooncakeWarehouseObservedCurrentEquipmentSignature = mooncakeWarehouseGetCurrentEquipmentDomSignature(node);
+        mooncakeWarehouseCurrentEquipmentObserver = new MutationObserver(() => {
+            if (mooncakeWarehouseObservedCurrentEquipment !== node ||
+                mooncakeWarehouseObservedCurrentEquipmentRoot !== root) return;
+            if (!node.isConnected || !root.contains(node)) {
+                mooncakeScheduleWarehouseRender('current-equipment-dom');
+                return;
+            }
+            const nextSignature = mooncakeWarehouseGetCurrentEquipmentDomSignature(node);
+            const contentChanged = nextSignature !== mooncakeWarehouseObservedCurrentEquipmentSignature;
+            mooncakeWarehouseObservedCurrentEquipmentSignature = nextSignature;
+            const target = { node, role: 'current-equipment', hidden: false };
+            if (!contentChanged && !mooncakeWarehouseCurrentEquipmentNeedsRepair(target, root)) return;
+            mooncakeWarehouseCurrentEquipmentIntegrityDirty = true;
+            mooncakeScheduleWarehouseRender('current-equipment-dom');
+        });
+        mooncakeWarehouseCurrentEquipmentObserver.observe(node, {
+            attributes: true,
+            attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'href', 'xlink:href'],
+            childList: true,
+            characterData: true,
+            subtree: true
+        });
+    }
+
     function mooncakeWarehouseRestorePinnedNode(node) {
         if (!node) return;
         mooncakeWarehouseRestoreInlineStyles(node, mooncakeWarehouseNodeStyleSnapshots.get(node));
+        mooncakeWarehouseNodeStyleSnapshots.delete(node);
         node.removeAttribute(MOONCAKE_WAREHOUSE_PINNED_ATTR);
         node.removeAttribute(MOONCAKE_WAREHOUSE_ROLE_ATTR);
     }
 
     function mooncakeWarehouseRestorePresentation() {
+        mooncakeWarehouseDisconnectCurrentEquipmentObserver();
         for (const panel of document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}]`)) panel.remove();
         for (const node of mooncakeWarehousePinnedNodes) {
             mooncakeWarehouseRestorePinnedNode(node);
@@ -22090,10 +23783,26 @@
         return mooncakeWarehouseFindInventoryRoot();
     }
 
+    function mooncakeWarehouseGetDuplicateInventoryNodeScore(node) {
+        if (!node?.isConnected) return -1;
+        const style = getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        let score = 0;
+        if (style.display !== 'none') score += 4;
+        if (Number(style.opacity) > 0) score += 2;
+        if (rect.width > 0 && rect.height > 0) score += 2;
+        if (style.visibility !== 'hidden') score += 1;
+        if (style.transform === 'none') score += 1;
+        // The entering React node has not been pinned yet; on an otherwise
+        // equal transition frame it must replace the stale managed copy.
+        if (node.getAttribute(MOONCAKE_WAREHOUSE_PINNED_ATTR) !== '1') score += 0.5;
+        return score;
+    }
+
     function mooncakeWarehouseCollectInventoryNodes(root) {
         if (!root || mooncakeIsExternalProfitPanelNode(root)) return [];
         const entries = [];
-        const seen = new Set();
+        const entryIndexes = new Map();
         const visibleGrids = new Map();
         for (const node of root.querySelectorAll('[class*="Item_itemContainer"]')) {
             if (node.closest(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}]`)) continue;
@@ -22112,9 +23821,20 @@
             if (!itemHrid) continue;
             const enhancementLevel = mooncakeWarehouseNormalizeLevel(mooncakeGetItemEnhancementLevelFromContainer(node));
             const key = mooncakeWarehouseIdentityKey(itemHrid, enhancementLevel);
-            if (seen.has(key)) continue;
-            seen.add(key);
-            entries.push({ node, grid, itemHrid, enhancementLevel });
+            const entry = { node, grid, itemHrid, enhancementLevel };
+            const previousIndex = entryIndexes.get(key);
+            if (previousIndex === undefined) {
+                entryIndexes.set(key, entries.length);
+                entries.push(entry);
+                continue;
+            }
+            // During a React replacement both the leaving and entering card can
+            // coexist for one frame. Compare only in that rare duplicate case,
+            // otherwise this collector performs no per-card style reads.
+            if (mooncakeWarehouseGetDuplicateInventoryNodeScore(node) >
+                mooncakeWarehouseGetDuplicateInventoryNodeScore(entries[previousIndex].node)) {
+                entries[previousIndex] = entry;
+            }
         }
         return entries;
     }
@@ -22184,6 +23904,12 @@
             [${MOONCAKE_WAREHOUSE_PANEL_ATTR}] *, [${MOONCAKE_WAREHOUSE_UI_ATTR}] * { box-sizing: border-box; }
             [${MOONCAKE_WAREHOUSE_PANEL_ATTR}] button, [${MOONCAKE_WAREHOUSE_UI_ATTR}] button, [${MOONCAKE_WAREHOUSE_UI_ATTR}] input { font: inherit; }
             [${MOONCAKE_WAREHOUSE_PINNED_ATTR}] { box-sizing: border-box; }
+            [${MOONCAKE_WAREHOUSE_ROLE_ATTR}="current-equipment"] {
+                display: block !important; visibility: visible !important; opacity: 1 !important; transform: none !important;
+            }
+            [${MOONCAKE_WAREHOUSE_ROLE_ATTR}="current-equipment"] [class*="Item_item__"] {
+                display: grid !important; visibility: visible !important; opacity: 1 !important; transform: none !important;
+            }
 
             .mooncake-warehouse-button {
                 appearance: none; border: 1px solid #5872a0; border-radius: 4px; min-height: 25px; padding: 3px 8px;
@@ -22532,9 +24258,24 @@
             nextPinnedNodes.add(node);
         }
 
+        const currentEquipmentTarget = targets.find(target =>
+            target.role === 'current-equipment' && !target.hidden
+        ) || null;
+        const keepExistingCurrentShell = !currentEquipmentTarget &&
+            projection.queue.actionCount > 0 &&
+            model.state.sectionCollapsed[MOONCAKE_WAREHOUSE_SECTION_QUEUE] !== true;
+        mooncakeWarehouseObserveCurrentEquipment(
+            currentEquipmentTarget?.node || null,
+            root,
+            keepExistingCurrentShell
+        );
+        const currentEquipmentNeedsRepair = mooncakeWarehouseCurrentEquipmentIntegrityDirty ||
+            mooncakeWarehouseCurrentEquipmentNeedsRepair(currentEquipmentTarget, root, false);
+
         if (presentationUnchanged &&
             nextPinnedNodes.size === mooncakeWarehousePinnedNodes.size &&
-            [...nextPinnedNodes].every(node => mooncakeWarehousePinnedNodes.has(node))) {
+            [...nextPinnedNodes].every(node => mooncakeWarehousePinnedNodes.has(node)) &&
+            !currentEquipmentNeedsRepair) {
             return;
         }
 
@@ -22557,6 +24298,20 @@
             mooncakeWarehouseSetInlineStyle(node, 'margin', '0px');
             mooncakeWarehouseSetInlineStyle(node, 'z-index', '5');
             mooncakeWarehouseSetInlineStyle(node, 'transition', 'none');
+            if (target.role === 'current-equipment') {
+                // React briefly applies its native leave state while an
+                // enhancement result replaces the active item. The queue owns
+                // this one card, so keep it drawable until the projection moves
+                // to the next real inventory node.
+                mooncakeWarehouseRefreshInlineStyleSnapshot(node, ['display', 'opacity', 'transform']);
+                mooncakeWarehouseSetInlineStyle(node, 'display', 'block');
+                mooncakeWarehouseSetInlineStyle(node, 'opacity', '1');
+                mooncakeWarehouseSetInlineStyle(node, 'transform', 'none');
+            } else {
+                mooncakeWarehouseRestoreOwnedInlineStyle(node, 'display');
+                mooncakeWarehouseRestoreOwnedInlineStyle(node, 'opacity');
+                mooncakeWarehouseRestoreOwnedInlineStyle(node, 'transform');
+            }
         }
 
         const rootRect = root.getBoundingClientRect();
@@ -22584,6 +24339,7 @@
             }
         }
         mooncakeWarehousePinnedNodes = nextPinnedNodes;
+        mooncakeWarehouseCurrentEquipmentIntegrityDirty = false;
     }
 
     function mooncakeWarehouseRenderPresentation(root, projection, metrics) {
@@ -26579,6 +28335,12 @@
         return true;
     }
 
+    function mooncakePositionAndRevealMobileJumpBar(bar, currentItem) {
+        const positioned = mooncakePositionMobileJumpBar(bar, currentItem);
+        bar.style.visibility = positioned ? 'visible' : 'hidden';
+        return positioned;
+    }
+
     function mooncakeCreateMobileMarketHistoryControls() {
         const { section, body } = mooncakeCreateMobileMenuSection(isZH ? '市场工具' : 'Market tools');
         const enabled = mooncakeIsMarketHistoryCardEnabled();
@@ -26825,7 +28587,7 @@
         const sig = `${itemHrid}|${hasLevels ? 'levels' : 'no-levels'}|${jumpModel.sig}`;
         let bar = document.getElementById(MOONCAKE_MOBILE_BAR_ID);
         if (bar?.dataset.sig === sig) {
-            mooncakePositionMobileJumpBar(bar, currentItem);
+            mooncakePositionAndRevealMobileJumpBar(bar, currentItem);
             return;
         }
         if (bar) bar.remove();
@@ -26835,7 +28597,14 @@
         bar = document.createElement('div');
         bar.id = MOONCAKE_MOBILE_BAR_ID;
         bar.dataset.sig = sig;
-        Object.assign(bar.style, { pointerEvents: 'auto' });
+        Object.assign(bar.style, {
+            position: 'fixed',
+            left: '-9999px',
+            top: '-9999px',
+            zIndex: MOONCAKE_MOBILE_MARKET_HELPER_Z_INDEX,
+            visibility: 'hidden',
+            pointerEvents: 'auto'
+        });
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.textContent = isZH ? '辅' : 'Go';
@@ -26863,7 +28632,7 @@
         });
         bar.appendChild(btn);
         document.body.appendChild(bar);
-        mooncakePositionMobileJumpBar(bar, currentItem);
+        mooncakePositionAndRevealMobileJumpBar(bar, currentItem);
     }
 
     function ensureMooncakeMarketRecipeJumpBar(currentItem) {
@@ -27066,6 +28835,7 @@
     }
 
     function removeMooncakeMarketJumpBars() {
+        mooncakeRemoveMarketPersonalTradeHistoryDisplay();
         mooncakeRemoveMarketJumpNavigation();
         mooncakeRemoveMarketHistoryCards({ includeFloating: true });
         document.getElementById(MOONCAKE_ORDER_BOOK_ARCHIVE_FLOAT_ID)?.remove();
@@ -27074,6 +28844,7 @@
     function ensureMooncakeMarketJumpHelpers() {
         const currentItem = mooncakeFindCurrentMarketItemNode();
         if (!mooncakeShouldShowMarketJumpHelpers(currentItem)) {
+            mooncakeRemoveMarketPersonalTradeHistoryDisplay();
             mooncakeRemoveMarketItemJumpNavigation();
             mooncakeRemoveMarketHistoryCards({ includeFloating: true });
             document.getElementById(MOONCAKE_ORDER_BOOK_ARCHIVE_FLOAT_ID)?.remove();
@@ -27086,6 +28857,7 @@
         }
         const itemHrid = mooncakeParseItemHridFromPanel(currentItem);
         if (!itemHrid) {
+            mooncakeRemoveMarketPersonalTradeHistoryDisplay();
             mooncakeRemoveMarketItemJumpNavigation();
             mooncakeRemoveMarketHistoryCards({ includeFloating: true });
             document.getElementById(MOONCAKE_ORDER_BOOK_ARCHIVE_FLOAT_ID)?.remove();
@@ -27096,6 +28868,8 @@
             }
             return;
         }
+        const enhancementLevel = mooncakeGetCurrentMarketEnhanceLevel(0);
+        mooncakeEnsureMarketPersonalTradeHistoryDisplay(currentItem, itemHrid, enhancementLevel);
         document.getElementById(MOONCAKE_ORDER_BOOK_ARCHIVE_FLOAT_ID)?.remove();
         if (!mooncakeIsMarketJumpHelpersEnabled()) {
             mooncakeRemoveMarketJumpNavigation();
@@ -27105,7 +28879,7 @@
         mooncakeEnsureRecentMarketNavigation(
             currentItem,
             itemHrid,
-            mooncakeGetCurrentMarketEnhanceLevel(0)
+            enhancementLevel
         );
         if (mooncakeIsPhoneMarketUi()) {
             currentItem.querySelectorAll(`#${MOONCAKE_LEVEL_BAR_ID}, #${MOONCAKE_STOCK_NAV_BAR_ID}, #${MOONCAKE_RECIPE_BAR_ID}`).forEach(el => el.remove());
@@ -36180,6 +37954,8 @@
     const MOONCAKE_MY_LISTINGS_TARGET_HIDDEN_ATTR = 'data-mooncake-my-listings-target-hidden';
     const MOONCAKE_MY_LISTINGS_LAYOUT_ATTR = 'data-mooncake-my-listings-layout';
     const MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR = 'data-mooncake-my-listings-control-host';
+    const MOONCAKE_MY_LISTINGS_MARKET_UPDATE_ATTR = 'data-mooncake-my-listings-market-update';
+    const MOONCAKE_MY_LISTINGS_MARKET_UPDATE_STYLE_ID = 'MooncakeMyListingsMarketUpdateStyle';
     const MOONCAKE_MY_LISTINGS_TABLE_ATTR = 'data-mooncake-my-listings-mobile-table';
     const MOONCAKE_MY_LISTINGS_CELL_ROLE_ATTR = 'data-mooncake-my-listings-mobile-role';
     const MOONCAKE_MY_LISTINGS_CELL_LABEL_ATTR = 'data-mooncake-my-listings-mobile-label';
@@ -36291,6 +38067,107 @@
         return root?.querySelector?.(`[${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"]`) || null;
     }
 
+    function mooncakeFormatMyListingsMarketUpdateTime(timestamp, format = 'clock') {
+        const normalized = mooncakeNormalizeMarketDataUpdateTimestamp(timestamp);
+        if (!normalized) return '';
+        const date = new Date(normalized * 1000);
+        if (Number.isNaN(date.getTime())) return '';
+        const pad = value => String(value).padStart(2, '0');
+        const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+        const monthDay = `${pad(date.getMonth() + 1)}/${pad(date.getDate())}`;
+        if (format === 'full') return `${date.getFullYear()}/${monthDay} ${clock}:${pad(date.getSeconds())}`;
+        if (format === 'date') return `${monthDay} ${clock}`;
+        return clock;
+    }
+
+    function mooncakeGetMarketDataUpdateSourceLabel(source = mooncakeMarketDataUpdateSource) {
+        if (source === MOONCAKE_MARKET_DATA_UPDATE_SOURCE_Q7) return 'Q7';
+        if (source === MOONCAKE_MARKET_DATA_UPDATE_SOURCE_PUBLIC) {
+            return isZH ? '游戏公开行情接口' : 'Public market API';
+        }
+        if (source === MOONCAKE_MARKET_DATA_UPDATE_SOURCE_MWI_TOOLS) return 'MWITools';
+        return isZH ? '行情接口' : 'Market API';
+    }
+
+    function mooncakeEnsureMyListingsMarketUpdateStyle() {
+        if (document.getElementById(MOONCAKE_MY_LISTINGS_MARKET_UPDATE_STYLE_ID)) return;
+        const style = document.createElement('style');
+        style.id = MOONCAKE_MY_LISTINGS_MARKET_UPDATE_STYLE_ID;
+        style.textContent = `
+            [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] {
+                display:inline-flex; align-items:center; flex-wrap:wrap; gap:4px; min-width:0;
+                max-width:100%; margin:0 0 0 8px; padding:0; box-sizing:border-box;
+            }
+            [${MOONCAKE_MY_LISTINGS_MARKET_UPDATE_ATTR}="1"] {
+                display:inline-flex; align-items:center; min-height:26px; box-sizing:border-box;
+                padding:0 7px 0 3px; border-right:1px solid rgba(137,164,238,.24);
+                color:rgba(205,216,243,.72); font-size:11px; font-weight:700; line-height:1;
+                letter-spacing:0; white-space:nowrap; font-variant-numeric:tabular-nums;
+            }
+            @media (max-width:680px) {
+                [${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"] {
+                    display:grid !important; grid-template-columns:minmax(0,1fr) !important;
+                    align-items:start !important; gap:6px !important;
+                    width:100% !important; min-width:0 !important; max-width:100% !important;
+                    margin:0 0 8px !important; padding:0 !important; box-sizing:border-box !important;
+                }
+                [${MOONCAKE_MY_LISTINGS_MARKET_UPDATE_ATTR}="1"] {
+                    grid-column:1 / -1; justify-self:start; min-height:18px;
+                    padding:0 2px; border-right:0; font-size:10.5px;
+                }
+            }
+        `;
+        document.head?.appendChild(style);
+    }
+
+    function mooncakeSyncMyListingsMarketUpdateTime(host = null) {
+        const hosts = host
+            ? [host]
+            : Array.from(document.querySelectorAll(`[${MOONCAKE_MY_LISTINGS_CONTROL_HOST_ATTR}="1"]`));
+        const shortTime = mooncakeFormatMyListingsMarketUpdateTime(mooncakeMarketDataUpdateTimestamp, 'date');
+        const fullTime = mooncakeFormatMyListingsMarketUpdateTime(mooncakeMarketDataUpdateTimestamp, 'full');
+        const sourceLabel = mooncakeGetMarketDataUpdateSourceLabel();
+        const textContent = shortTime
+            ? (isZH ? `数据更新 ${shortTime}` : `Updated ${shortTime}`)
+            : (isZH ? '数据更新 --' : 'Updated --');
+        hosts.forEach(controlHost => {
+            if (!controlHost?.isConnected) return;
+            let time = controlHost.querySelector(`[${MOONCAKE_MY_LISTINGS_MARKET_UPDATE_ATTR}="1"]`);
+            if (!time) {
+                time = document.createElement('time');
+                time.setAttribute(MOONCAKE_MY_LISTINGS_MARKET_UPDATE_ATTR, '1');
+                controlHost.prepend(time);
+            } else if (controlHost.firstElementChild !== time) {
+                controlHost.prepend(time);
+            }
+            if (time.textContent !== textContent) time.textContent = textContent;
+            if (fullTime) {
+                const dateTime = new Date(mooncakeMarketDataUpdateTimestamp * 1000).toISOString();
+                const title = isZH
+                    ? `行情接口更新时间：${fullTime}（${sourceLabel}）`
+                    : `Market data updated: ${fullTime} (${sourceLabel})`;
+                if (time.dateTime !== dateTime) time.dateTime = dateTime;
+                if (time.title !== title) time.title = title;
+            } else {
+                time.removeAttribute('datetime');
+                const title = isZH
+                    ? `${sourceLabel}尚未提供行情源更新时间`
+                    : `${sourceLabel} has not provided a source update time`;
+                if (time.title !== title) time.title = title;
+            }
+            if (time.getAttribute('aria-label') !== time.title) time.setAttribute('aria-label', time.title);
+        });
+    }
+
+    function mooncakeEnsureMyListingsMarketUpdateTime(table, root = mooncakeGetMyListingsRoot(table)) {
+        if (!table || !root) return null;
+        const host = mooncakeEnsureMyListingsControlHost(table, root);
+        if (!host) return null;
+        mooncakeEnsureMyListingsMarketUpdateStyle();
+        mooncakeSyncMyListingsMarketUpdateTime(host);
+        return host.querySelector(`[${MOONCAKE_MY_LISTINGS_MARKET_UPDATE_ATTR}="1"]`);
+    }
+
     // Keep MoonCake's controls in their own host.  Styling the game's count
     // row was enough to make some narrow layouts reflow the native table too.
     function mooncakeEnsureMyListingsControlHost(table, root) {
@@ -36332,6 +38209,7 @@
 
         const controlHost = mooncakeEnsureMyListingsControlHost(table, root);
         if (!controlHost) return;
+        mooncakeEnsureMyListingsMarketUpdateTime(table, root);
         [
             root.querySelector(`[${MOONCAKE_MY_LISTINGS_TARGET_FILTER_ATTR}="1"]`),
             root.querySelector('[data-mooncake-my-listings-management="1"]')
@@ -37358,7 +39236,10 @@
     function mooncakeIsMyListingsTargetFilterInternalNode(node) {
         const element = node instanceof Element ? node : node?.parentElement;
         if (!element) return false;
-        const selector = `[${MOONCAKE_MY_LISTINGS_TARGET_FILTER_ATTR}="1"]`;
+        const selector = [
+            `[${MOONCAKE_MY_LISTINGS_TARGET_FILTER_ATTR}="1"]`,
+            `[${MOONCAKE_MY_LISTINGS_MARKET_UPDATE_ATTR}="1"]`
+        ].join(',');
         return element.matches?.(selector) || !!element.closest?.(selector);
     }
 
@@ -37387,6 +39268,9 @@
     function mooncakeRefreshMyListingsTargetFilterForTableLifecycle() {
         const table = mooncakeGetVisibleMyListingsTable();
         if (!table) return;
+        const root = mooncakeGetMyListingsRoot(table);
+        mooncakeEnsureMyListingsMarketUpdateTime(table, root);
+        if (!mooncakeIsMyListingsTargetFilterEnabled()) return;
         const hasControl = !!mooncakeGetMyListingsTargetFilterControl(table);
         if (table === mooncakeMyListingsTargetFilterBoundTable && hasControl) return;
         mooncakeEnsureMyListingsTargetFilter(table);
@@ -37412,6 +39296,7 @@
                 }
             }
         });
+        mooncakeRefreshMyListingsTargetFilterForTableLifecycle();
         mooncakeScheduleMyListingsTargetFilter(0);
     }
 
@@ -37963,7 +39848,10 @@
     function mooncakeIsMyListingsManagementInternalNode(node) {
         const element = node instanceof Element ? node : node?.parentElement;
         if (!element) return false;
-        const selector = `[${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"]`;
+        const selector = [
+            `[${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"]`,
+            `[${MOONCAKE_MY_LISTINGS_MARKET_UPDATE_ATTR}="1"]`
+        ].join(',');
         return element.matches?.(selector) || !!element.closest?.(selector);
     }
 
@@ -38176,6 +40064,10 @@
                     if (mutation.type === 'childList') {
                         for (const node of mutation.addedNodes) {
                             if (!(node instanceof Element)) continue;
+                            if (node.id === MOONCAKE_MOOKET_OVERLAY_ID) {
+                                needMarketJumpHelpers = true;
+                                continue;
+                            }
                             if (node.matches?.(MOONCAKE_MARKET_INJECTED_SELECTOR)) continue;
                             if (!_isRelevantMarketNode(node)) {
                                 if (_touchesMarketNavigation(node)) needMarketJumpHelpers = true;
@@ -38211,6 +40103,10 @@
 
                         for (const node of mutation.removedNodes) {
                             if (!(node instanceof Element)) continue;
+                            if (node.id === MOONCAKE_MOOKET_OVERLAY_ID) {
+                                needMarketJumpHelpers = true;
+                                continue;
+                            }
                             const isEnhancementTabNode =
                                 node.getAttribute?.(MOONCAKE_ENHANCEMENT_TAB_BUTTON_ATTR) === '1' ||
                                 node.getAttribute?.(MOONCAKE_ENHANCEMENT_TAB_PANEL_ATTR) === '1';
@@ -38763,6 +40659,98 @@
             nativeCells[fallbackIndex] || null;
     }
 
+    function mooncakeCreateMarketplaceSummaryHourlyWageCell(side) {
+        const cell = document.createElement('td');
+        cell.className = side === 'buy' ? 'buy-hourly-wage-cell' : 'sell-hourly-wage-cell';
+        cell.setAttribute('data-mooncake-summary-hourly-cell', side === 'buy' ? 'buy' : 'sell');
+        cell.style.cssText = 'padding: 8px; text-align: center; font-size: 12px; cursor: pointer; font-variant-numeric: tabular-nums;';
+        return cell;
+    }
+
+    function mooncakeEnsureMarketplaceSummaryHourlyWageHeaders(headerRow, askHeader, bidHeader) {
+        if (!headerRow || !askHeader || !bidHeader) return false;
+        headerRow.querySelectorAll('.sell-hourly-wage-header, .buy-hourly-wage-header, [data-mooncake-summary-hourly-cell]')
+            .forEach(cell => cell.remove());
+
+        const createHeader = side => {
+            const header = document.createElement('th');
+            header.className = side === 'buy' ? 'buy-hourly-wage-header' : 'sell-hourly-wage-header';
+            header.setAttribute('data-mooncake-summary-hourly-cell', side);
+            header.title = side === 'buy'
+                ? (isZH
+                    ? '+1 及以上显示工时费；+0 显示购买节省（最低取得成本 - 当前报价）'
+                    : '+1 and above: hourly wage; +0 shows purchase savings (lowest acquisition cost - current quote)')
+                : (isZH
+                    ? '+1 及以上显示工时费；+0 显示购买节省（自制成本 - 当前报价），制造利润见提示'
+                    : '+1 and above: hourly wage; +0 shows purchase savings (craft cost - current quote), with manufacturing profit in the tooltip');
+            header.textContent = isZH ? '工时费' : 'Hourly Wage';
+            header.style.cssText = 'padding: 8px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums;';
+            return header;
+        };
+
+        const sellHeader = createHeader('sell');
+        const buyHeader = createHeader('buy');
+        headerRow.insertBefore(sellHeader, askHeader.nextElementSibling);
+        headerRow.insertBefore(buyHeader, bidHeader.nextElementSibling);
+        return true;
+    }
+
+    // Worker prewarming can take several seconds on a cold mobile browser.
+    // Keep the table structure visible during that work, rather than making
+    // the hourly columns appear only after the asynchronous calculation ends.
+    function mooncakeRenderMarketplaceSummaryHourlyWagePlaceholders(rows, askColIndex, bidColIndex) {
+        Array.from(rows || []).forEach(row => {
+            if (!row?.isConnected) return;
+            Array.from(row.children)
+                .filter(cell => cell.matches?.('.sell-hourly-wage-cell, .buy-hourly-wage-cell, [data-mooncake-summary-hourly-cell]'))
+                .forEach(cell => cell.remove());
+
+            const bestAskCell = mooncakeGetMarketplaceSummaryNativeCell(row, 'ask', askColIndex);
+            const bestBidCell = mooncakeGetMarketplaceSummaryNativeCell(row, 'bid', bidColIndex);
+            if (!bestAskCell || !bestBidCell) return;
+
+            const sellCell = mooncakeCreateMarketplaceSummaryHourlyWageCell('sell');
+            const buyCell = mooncakeCreateMarketplaceSummaryHourlyWageCell('buy');
+            const bestAsk = parsePriceText(mooncakeGetMarketplaceNativePriceText(bestAskCell));
+            const bestBid = parsePriceText(mooncakeGetMarketplaceNativePriceText(bestBidCell));
+            sellCell.textContent = bestAsk > 0 ? '…' : '-';
+            buyCell.textContent = bestBid > 0 ? '…' : '-';
+            sellCell.style.color = 'var(--color-disabled)';
+            buyCell.style.color = 'var(--color-disabled)';
+            if (bestAsk > 0) sellCell.title = isZH ? '正在计算工时费' : 'Calculating hourly wage';
+            if (bestBid > 0) buyCell.title = isZH ? '正在计算工时费' : 'Calculating hourly wage';
+            row.insertBefore(sellCell, bestAskCell.nextElementSibling);
+            row.insertBefore(buyCell, bestBidCell.nextElementSibling);
+        });
+    }
+
+    function mooncakeClearMarketplaceSummaryHourlyWageDataRetry(itemSummaryTable) {
+        const state = mooncakeSummaryHourlyDataRetryStates.get(itemSummaryTable);
+        if (!state) return;
+        if (state.timer) clearTimeout(state.timer);
+        mooncakeSummaryHourlyDataRetryStates.delete(itemSummaryTable);
+    }
+
+    function mooncakeScheduleMarketplaceSummaryHourlyWageDataRetry(itemSummaryTable, itemHrid) {
+        if (!itemSummaryTable || !itemHrid) return;
+        let state = mooncakeSummaryHourlyDataRetryStates.get(itemSummaryTable);
+        if (!state || state.itemHrid !== itemHrid) {
+            if (state?.timer) clearTimeout(state.timer);
+            state = { itemHrid, attempt: 0, timer: 0 };
+            mooncakeSummaryHourlyDataRetryStates.set(itemSummaryTable, state);
+        }
+        if (state.timer || state.attempt >= MOONCAKE_SUMMARY_HOURLY_DATA_RETRY_DELAYS.length) return;
+        const delay = MOONCAKE_SUMMARY_HOURLY_DATA_RETRY_DELAYS[state.attempt++];
+        state.timer = setTimeout(() => {
+            state.timer = 0;
+            if (!itemSummaryTable.isConnected || !mooncakeIsVisibleElement(itemSummaryTable)) return;
+            const currentItem = mooncakeFindCurrentMarketItemNode();
+            const currentItemHrid = currentItem ? extractItemHridFromElement(currentItem) : null;
+            if (currentItemHrid !== itemHrid) return;
+            scheduleMarketplaceSummaryHourlyWageRefresh({ force: true });
+        }, delay);
+    }
+
     function clearMarketplaceHourlyWageColumns() {
         document.querySelectorAll('[class*="MarketplacePanel_orderBooksContainer"] table')
             .forEach(clearOrderBookHourlyWageColumns);
@@ -39200,7 +41188,16 @@
         ))
             .catch(() => false)
             .then(() => {
-                if (renderGeneration === _summaryRenderGeneration) processSummaryBatch();
+                if (!table.isConnected) return;
+                if (renderGeneration === _summaryRenderGeneration) {
+                    processSummaryBatch();
+                    return;
+                }
+                const currentItem = mooncakeFindCurrentMarketItemNode();
+                const currentItemHrid = currentItem ? extractItemHridFromElement(currentItem) : null;
+                if (currentItemHrid === itemHrid && mooncakeIsVisibleElement(table)) {
+                    scheduleMarketplaceSummaryHourlyWageRefresh({ force: true });
+                }
             });
     }
 
@@ -39218,6 +41215,14 @@
         const itemNode = mooncakeFindCurrentMarketItemNode();
         const itemHrid = itemNode ? extractItemHridFromElement(itemNode) : null;
         if (!itemNode || !itemHrid || !mooncakeIsEnhanceableItem(itemHrid)) {
+            // React can mount the summary rows one paint before the current
+            // item preview. Keep one bounded retry for an enhanceable summary
+            // rather than treating that transient state as a user-disabled
+            // hourly column.
+            const summaryItemHrid = extractItemHridFromElement(itemSummaryTable);
+            if (summaryItemHrid && mooncakeIsEnhanceableItem(summaryItemHrid)) {
+                mooncakeScheduleMarketplaceSummaryHourlyWageDataRetry(itemSummaryTable, summaryItemHrid);
+            }
             clearMarketplaceSummaryHourlyWageColumns(itemSummaryTable);
             mooncakeApplyMarketplaceResponsiveTableLayout({ itemSummaryTable });
             return;
@@ -39248,12 +41253,14 @@
         }
 
         const marketData = getMarketData();
-        if (!marketData) {
-            mooncakeRemoveMarketplaceInlineHourlyWages(table);
-            return;
-        }
 
         if (mooncakeShouldUseMobileMarketTableLayout()) {
+            if (!marketData) {
+                mooncakeRemoveMarketplaceInlineHourlyWages(table);
+                mooncakeScheduleMarketplaceSummaryHourlyWageDataRetry(table, itemHrid);
+                return;
+            }
+            mooncakeClearMarketplaceSummaryHourlyWageDataRetry(table);
             return mooncakeAddInlineHourlyWageToMarketplaceSummary(
                 table,
                 itemHrid,
@@ -39295,33 +41302,19 @@
         const bidColIndex = headerCells.indexOf(bidHeader);
         if (!askHeader || !bidHeader || askColIndex < 0 || bidColIndex < 0) return;
 
-        // 添加出售工时费表头（在最佳出售价后面）
-        const sellHourlyWageHeader = document.createElement('th');
-        sellHourlyWageHeader.className = 'sell-hourly-wage-header';
-        sellHourlyWageHeader.title = isZH
-            ? '+1 及以上显示工时费；+0 显示购买节省（自制成本 - 当前报价），制造利润见提示'
-            : '+1 and above: hourly wage; +0 shows purchase savings (craft cost - current quote), with manufacturing profit in the tooltip';
-        sellHourlyWageHeader.textContent = isZH ? '工时费' : 'Hourly Wage';
-        sellHourlyWageHeader.style.cssText = 'padding: 8px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums;';
+        if (!mooncakeEnsureMarketplaceSummaryHourlyWageHeaders(headerRow, askHeader, bidHeader)) return;
 
-        // 添加收购工时费表头（在最佳收购价后面）
-        const buyHourlyWageHeader = document.createElement('th');
-        buyHourlyWageHeader.className = 'buy-hourly-wage-header';
-        buyHourlyWageHeader.title = isZH
-            ? '+1 及以上显示工时费；+0 显示购买节省（最低取得成本 - 当前报价）'
-            : '+1 and above: hourly wage; +0 shows purchase savings (lowest acquisition cost - current quote)';
-        buyHourlyWageHeader.textContent = isZH ? '工时费' : 'Hourly Wage';
-        buyHourlyWageHeader.style.cssText = 'padding: 8px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums;';
+        // Render the column shell before the worker has prewarmed every route.
+        // This pass deliberately does no enhancement math, so market redraws
+        // cannot leave the summary table looking as if the feature is off.
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+        mooncakeRenderMarketplaceSummaryHourlyWagePlaceholders(rows, askColIndex, bidColIndex);
 
-        sellHourlyWageHeader.setAttribute('data-mooncake-summary-hourly-cell', 'sell');
-        buyHourlyWageHeader.setAttribute('data-mooncake-summary-hourly-cell', 'buy');
-        // Keep the visible order tied to the native price headers, not to a
-        // position calculated before React or another plugin updates the row.
-        headerRow.insertBefore(sellHourlyWageHeader, askHeader.nextElementSibling);
-        headerRow.insertBefore(buyHourlyWageHeader, bidHeader.nextElementSibling);
-
-        // 获取表格行
-        const rows = tbody.querySelectorAll('tr');
+        if (!marketData) {
+            mooncakeScheduleMarketplaceSummaryHourlyWageDataRetry(table, itemHrid);
+            return;
+        }
+        mooncakeClearMarketplaceSummaryHourlyWageDataRetry(table);
 
         const processSummaryRow = (row) => {
             try {
@@ -39348,16 +41341,8 @@
                 const bestAskText = bestAskCell.textContent.trim();
                 const bestBidText = bestBidCell.textContent.trim();
 
-                // 添加工时费单元格
-                const sellHourlyWageCell = document.createElement('td');
-                sellHourlyWageCell.className = 'sell-hourly-wage-cell';
-                sellHourlyWageCell.setAttribute('data-mooncake-summary-hourly-cell', 'sell');
-                sellHourlyWageCell.style.cssText = 'padding: 8px; text-align: center; font-size: 12px; cursor: pointer; font-variant-numeric: tabular-nums;';
-
-                const buyHourlyWageCell = document.createElement('td');
-                buyHourlyWageCell.className = 'buy-hourly-wage-cell';
-                buyHourlyWageCell.setAttribute('data-mooncake-summary-hourly-cell', 'buy');
-                buyHourlyWageCell.style.cssText = 'padding: 8px; text-align: center; font-size: 12px; cursor: pointer; font-variant-numeric: tabular-nums;';
+                const sellHourlyWageCell = mooncakeCreateMarketplaceSummaryHourlyWageCell('sell');
+                const buyHourlyWageCell = mooncakeCreateMarketplaceSummaryHourlyWageCell('buy');
 
                 // 对于强化等级为0的行，显示价格与制作成本之间的差额
                 if (enhancementLevel === 0) {
@@ -39447,7 +41432,21 @@
         ))
             .catch(() => false)
             .then(() => {
-                if (renderGeneration === _summaryRenderGeneration) processSummaryBatch();
+                if (!itemSummaryTable.isConnected) return;
+                if (renderGeneration === _summaryRenderGeneration) {
+                    processSummaryBatch();
+                    return;
+                }
+
+                // A live quote update can supersede this render while the
+                // worker is busy. Its finished cache is still valuable: wake
+                // the latest pass for the same item instead of silently
+                // abandoning it and leaving placeholders forever.
+                const currentItem = mooncakeFindCurrentMarketItemNode();
+                const currentItemHrid = currentItem ? extractItemHridFromElement(currentItem) : null;
+                if (currentItemHrid === itemHrid && mooncakeIsVisibleElement(itemSummaryTable)) {
+                    scheduleMarketplaceSummaryHourlyWageRefresh({ force: true });
+                }
         });
     }
 
@@ -39624,9 +41623,12 @@
     async function init() {
         mooncakeStartCharacterDataRecovery();
         cleanupLegacyMarketCaches();
-        if (!getMarketData()) {
-            await fetchMarketApi();
-        }
+        const cachedMarketData = getMarketData();
+        // Cached prices keep first paint fast, but every page load still asks
+        // the no-store public endpoint for its current snapshot. Without this,
+        // any non-empty MWITools cache could remain authoritative indefinitely.
+        const marketRefresh = fetchMarketApi();
+        if (!cachedMarketData) await marketRefresh;
         // The standalone Q7 script may have refreshed before MoonCake initialized.
         mooncakeApplyQ7MarketCacheUpdate();
 
@@ -39742,6 +41744,7 @@
         switch (key) {
             case 'fab-visible': return mooncakeIsVirtualConfigFabVisible();
             case 'market-history': return mooncakeIsMarketHistoryCardEnabled();
+            case 'market-personal-trade-history': return mooncakeIsMarketPersonalTradeHistoryEnabled();
             case 'market-hourly': return isMarketplaceHourlyWageEnabled();
             case 'market-listing-age': return mooncakeIsMarketListingAgeEnabled();
             case 'market-listing-age-upload': return mooncakeIsMarketListingAgeUploadEnabled();
@@ -39770,6 +41773,7 @@
         switch (key) {
             case 'fab-visible': mooncakeSetVirtualConfigFabVisible(enabled); break;
             case 'market-history': mooncakeSetMarketHistoryCardEnabled(enabled); break;
+            case 'market-personal-trade-history': mooncakeSetMarketPersonalTradeHistoryEnabled(enabled); break;
             case 'market-hourly': setMarketplaceHourlyWageEnabled(enabled); break;
             case 'market-listing-age': mooncakeSetMarketListingAgeEnabled(enabled); break;
             case 'market-listing-age-upload': mooncakeSetMarketListingAgeUploadEnabled(enabled); break;
@@ -40987,17 +42991,42 @@
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-donation-thanks-item] { color:rgba(232,238,252,.80); font-size:12px; line-height:1.55; overflow-wrap:anywhere; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-debug] [data-mooncake-enhance-debug] { margin-top:0; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-debug], #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-virtual-grid] { max-width:100%; }
-            #better-loot-tracker-config-panel [data-mooncake-order-archive-page] { width:100%; height:100%; min-width:0; min-height:0; display:grid; grid-template-rows:auto minmax(0,1fr); overflow:hidden; }
+            #better-loot-tracker-config-panel [data-mooncake-order-archive-page] { width:100%; height:100%; min-width:0; min-height:0; display:grid; grid-template-rows:auto minmax(0,1fr); overflow:hidden; isolation:isolate; background:#253149; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="archive"] { padding:0; overflow:hidden; }
-            #better-loot-tracker-config-panel [data-mooncake-order-archive-page-header] { display:flex; align-items:center; flex-wrap:wrap; gap:7px 10px; min-height:42px; padding:8px 12px; box-sizing:border-box; border-bottom:1px solid rgba(125,151,219,.22); background:rgba(31,38,59,.76); }
+            #better-loot-tracker-config-panel [data-mooncake-order-archive-page-header] { display:flex; align-items:center; flex-wrap:wrap; gap:7px 10px; min-height:42px; padding:8px 12px; box-sizing:border-box; border-bottom:1px solid rgba(125,151,219,.22); background:#1f263b; }
             #better-loot-tracker-config-panel [data-mooncake-order-archive-title] { flex:1 1 250px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#edf2ff; font-size:13px; line-height:1.35; }
+            #better-loot-tracker-config-panel [data-mooncake-order-archive-view-tabs] { display:inline-flex; align-items:center; gap:3px; padding:3px; border:1px solid rgba(125,151,219,.26); border-radius:5px; background:rgba(12,17,28,.48); }
+            #better-loot-tracker-config-panel [data-mooncake-order-archive-view-tab] { appearance:none; min-height:26px; padding:3px 8px; border:1px solid transparent; border-radius:3px; background:transparent; color:rgba(220,228,248,.62); font:inherit; font-size:11px; font-weight:800; line-height:1.2; cursor:pointer; white-space:nowrap; }
+            #better-loot-tracker-config-panel [data-mooncake-order-archive-view-tab][aria-selected="true"] { border-color:rgba(119,157,228,.56); background:rgba(67,94,155,.70); color:#edf3ff; }
+            #better-loot-tracker-config-panel [data-mooncake-order-archive-view-tab]:hover { color:#edf3ff; background:rgba(88,112,170,.32); }
             #better-loot-tracker-config-panel [data-mooncake-order-archive-stats], #better-loot-tracker-config-panel [data-mooncake-order-archive-bytes] { color:rgba(222,231,255,.58); font-size:10px; white-space:nowrap; }
             #better-loot-tracker-config-panel [data-mooncake-order-archive-limit-label] { display:inline-flex; align-items:center; gap:5px; color:rgba(222,231,255,.64); font-size:10px; white-space:nowrap; }
             #better-loot-tracker-config-panel [data-mooncake-order-archive-limit] { width:66px; height:27px; box-sizing:border-box; border:1px solid rgba(144,166,235,.34); border-radius:4px; background:rgba(13,18,30,.72); color:#e5edff; padding:2px 4px; text-align:center; font-size:10px; font-weight:700; }
             #better-loot-tracker-config-panel [data-mooncake-order-archive-page-body] { min-width:0; min-height:0; display:grid; grid-template-columns:170px minmax(0,1fr); overflow:hidden; }
+            #better-loot-tracker-config-panel [data-mooncake-order-archive-page-body][data-mooncake-market-trade-log-page] { display:grid; grid-template-columns:1fr; grid-template-rows:auto minmax(0,1fr); }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-toolbar] { display:flex; align-items:center; flex-wrap:wrap; gap:7px 9px; min-height:42px; padding:7px 12px; box-sizing:border-box; border-bottom:1px solid rgba(125,151,219,.18); background:#182033; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-toolbar] strong { color:rgba(232,239,255,.88); font-size:12px; white-space:nowrap; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-stats] { margin-left:auto; color:rgba(222,231,255,.58); font-size:11px; white-space:nowrap; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter] { display:inline-flex; align-items:center; gap:4px; min-width:0; color:rgba(221,230,250,.70); font-size:11px; font-weight:750; white-space:nowrap; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter] > span { color:rgba(221,230,250,.62); }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-search], #better-loot-tracker-config-panel [data-mooncake-market-trade-log-side], #better-loot-tracker-config-panel [data-mooncake-market-trade-log-enhancement], #better-loot-tracker-config-panel [data-mooncake-market-trade-log-item-level], #better-loot-tracker-config-panel [data-mooncake-market-trade-log-start-time], #better-loot-tracker-config-panel [data-mooncake-market-trade-log-end-time] { height:28px; box-sizing:border-box; border:1px solid rgba(144,166,235,.34); border-radius:4px; background:rgba(13,18,30,.72); color:#e5edff; padding:3px 7px; font:inherit; font-size:11px; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-search] { width:min(220px,34vw); }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-side], #better-loot-tracker-config-panel [data-mooncake-market-trade-log-enhancement], #better-loot-tracker-config-panel [data-mooncake-market-trade-log-item-level] { min-width:68px; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-date-range] { display:grid; grid-template-columns:auto minmax(132px,1fr) auto minmax(132px,1fr); align-items:center; gap:5px; min-width:0; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-start-time], #better-loot-tracker-config-panel [data-mooncake-market-trade-log-end-time] { width:148px; min-width:0; color-scheme:dark; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-date-boundary] { color:rgba(221,230,250,.48); font-size:10px; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-results] { min-width:0; min-height:0; overflow:auto; padding:9px 12px; box-sizing:border-box; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-table] { min-width:680px; overflow:hidden; border:1px solid rgba(125,151,219,.24); border-radius:5px; background:rgba(20,25,38,.45); }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-row] { display:grid; grid-template-columns:minmax(130px,1.1fr) 52px minmax(150px,1.45fr) minmax(52px,.6fr) minmax(92px,.85fr) minmax(112px,1fr); align-items:center; gap:8px; min-height:34px; padding:5px 10px; box-sizing:border-box; border-top:1px solid rgba(125,151,219,.13); color:rgba(225,233,249,.82); font-size:12px; line-height:1.3; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-row="header"] { min-height:30px; border-top:0; background:rgba(53,62,91,.58); color:rgba(219,229,253,.68); font-size:10px; font-weight:850; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-cell] { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-variant-numeric:tabular-nums; }
             #better-loot-tracker-config-panel [data-mooncake-order-archive-list] { min-width:0; overflow:auto; padding:7px; border-right:1px solid rgba(125,151,219,.22); }
-            #better-loot-tracker-config-panel [data-mooncake-order-archive-record] { display:block; width:100%; margin:0 0 4px; padding:6px 7px; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; border:1px solid rgba(125,151,219,.18); border-radius:4px; background:rgba(33,39,57,.62); color:#dfe8ff; text-align:left; font-size:10px; line-height:15px; }
+            #better-loot-tracker-config-panel [data-mooncake-order-archive-record] { appearance:none; -webkit-appearance:none; display:block; width:100%; margin:0 0 4px; padding:6px 7px; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; border:1px solid rgba(125,151,219,.18); border-radius:4px; background:rgba(33,39,57,.62); color:#dfe8ff; text-align:left; font-size:10px; line-height:15px; transition:none !important; transform:none !important; filter:none !important; box-shadow:none !important; }
+            #better-loot-tracker-config-panel [data-mooncake-order-archive-record-compact-label] { display:none; }
             #better-loot-tracker-config-panel [data-mooncake-order-archive-record="active"] { border-color:rgba(119,157,228,.48); background:rgba(63,91,142,.62); }
+            #better-loot-tracker-config-panel [data-mooncake-order-archive-record]:hover, #better-loot-tracker-config-panel [data-mooncake-order-archive-record]:active { transform:none !important; filter:none !important; box-shadow:none !important; }
+            #better-loot-tracker-config-panel [data-mooncake-order-archive-record]:not([data-mooncake-order-archive-record="active"]):hover { border-color:rgba(125,151,219,.18) !important; background:rgba(33,39,57,.62) !important; color:#dfe8ff !important; }
+            #better-loot-tracker-config-panel [data-mooncake-order-archive-record="active"]:hover { border-color:rgba(119,157,228,.48) !important; background:rgba(63,91,142,.62) !important; color:#dfe8ff !important; }
             #better-loot-tracker-config-panel [data-mooncake-order-archive-detail] { min-width:0; overflow:auto; padding:10px 12px; box-sizing:border-box; font-size:12px; }
             #better-loot-tracker-config-panel [data-mooncake-order-archive-empty] { padding:24px 9px; color:rgba(220,226,240,.48); text-align:center; font-size:12px; line-height:1.55; }
             @media (max-width:480px) {
@@ -41066,10 +43095,35 @@
             @media (max-width:860px) {
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="settings"] { grid-template-columns:1fr; grid-template-areas:"market" "listings" "chat" "enhance" "quote"; }
             }
-            @media (max-width:680px) { #better-loot-tracker-config-panel { padding:max(8px,env(safe-area-inset-top)) max(8px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left)) !important; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-dialog] { height:100%; max-height:100%; border-radius:6px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-chrome] { padding-left:8px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tablist] { display:flex; overflow-x:auto; overscroll-behavior-x:contain; scrollbar-width:thin; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tab] { flex:0 0 auto; min-width:104px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel] { padding:0 14px 14px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="archive"] { padding:0; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="settings"] { grid-template-columns:1fr; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-section="wide"] { grid-column:auto; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-field-grid], #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-donation-grid] { grid-template-columns:1fr; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-column-grid] { grid-template-columns:repeat(2,minmax(0,1fr)); } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-virtual-grid] { grid-template-columns:1fr !important; } #better-loot-tracker-config-panel [data-mooncake-order-archive-page-body] { grid-template-columns:1fr; grid-template-rows:minmax(96px,28%) minmax(0,1fr); } #better-loot-tracker-config-panel [data-mooncake-order-archive-list] { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(136px,42vw); align-content:start; overflow-x:auto; overflow-y:hidden; padding:7px; border-right:0; border-bottom:1px solid rgba(125,151,219,.22); } #better-loot-tracker-config-panel [data-mooncake-order-archive-record] { margin:0 4px 0 0; } }
+            @media (max-width:680px) { #better-loot-tracker-config-panel { padding:max(8px,env(safe-area-inset-top)) max(8px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left)) !important; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-dialog] { height:100%; max-height:100%; border-radius:6px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-chrome] { padding-left:8px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tablist] { display:flex; overflow-x:auto; overscroll-behavior-x:contain; scrollbar-width:thin; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tab] { flex:0 0 auto; min-width:104px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel] { padding:0 14px 14px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="archive"] { padding:0; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="settings"] { grid-template-columns:1fr; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-section="wide"] { grid-column:auto; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-field-grid], #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-donation-grid] { grid-template-columns:1fr; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-column-grid] { grid-template-columns:repeat(2,minmax(0,1fr)); } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-virtual-grid] { grid-template-columns:1fr !important; } #better-loot-tracker-config-panel [data-mooncake-order-archive-page-body] { grid-template-columns:1fr; grid-template-rows:minmax(96px,28%) minmax(0,1fr); } #better-loot-tracker-config-panel [data-mooncake-order-archive-page-body][data-mooncake-market-trade-log-page] { grid-template-rows:auto minmax(0,1fr); } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-toolbar] { gap:6px; padding:6px 8px; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-toolbar] strong { display:none; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-stats] { flex:1 1 120px; margin-right:0; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-search] { flex:1 1 150px; width:auto; min-width:0; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-side] { flex:0 0 64px; min-width:64px; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-results] { padding:7px; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-table] { min-width:640px; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-row] { grid-template-columns:112px 48px minmax(130px,1.35fr) 46px 82px 94px; gap:6px; min-height:31px; padding:5px 7px; font-size:11px; } #better-loot-tracker-config-panel [data-mooncake-order-archive-list] { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(136px,42vw); align-content:start; overflow-x:auto; overflow-y:hidden; padding:7px; border-right:0; border-bottom:1px solid rgba(125,151,219,.22); } #better-loot-tracker-config-panel [data-mooncake-order-archive-record] { margin:0 4px 0 0; } }
+            @media (max-width:680px) {
+                #better-loot-tracker-config-panel [data-mooncake-market-trade-log-toolbar] { align-items:stretch; }
+                #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter="name"] { flex:1 1 100%; }
+                #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter="name"] [data-mooncake-market-trade-log-search] { flex:1 1 auto; width:auto; min-width:0; }
+                #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter="date-range"] { flex:1 1 100%; }
+                #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter="date-range"] [data-mooncake-market-trade-log-date-range] { flex:1 1 auto; grid-template-columns:auto minmax(0,1fr) auto minmax(0,1fr); }
+                #better-loot-tracker-config-panel [data-mooncake-market-trade-log-start-time], #better-loot-tracker-config-panel [data-mooncake-market-trade-log-end-time] { width:100%; }
+                #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter="enhancement"], #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter="item-level"], #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter="side"] { flex:1 1 118px; }
+                #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter="enhancement"] select, #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter="item-level"] select, #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter="side"] select { flex:1 1 auto; width:0; min-width:0; }
+                #better-loot-tracker-config-panel [data-mooncake-market-trade-log-stats] { flex:1 0 100%; order:2; margin-left:0; }
+                #better-loot-tracker-config-panel [data-mooncake-order-archive-page-body] { grid-template-rows:64px minmax(0,1fr); }
+                #better-loot-tracker-config-panel [data-mooncake-order-archive-list] { grid-auto-columns:minmax(88px,calc((100vw - 24px) / 3)); align-content:stretch; padding:6px; gap:4px; }
+                #better-loot-tracker-config-panel [data-mooncake-order-archive-record] { display:grid; place-items:center; min-height:40px; margin:0; padding:4px 5px; text-align:center; font-size:10px; line-height:13px; }
+                #better-loot-tracker-config-panel [data-mooncake-order-archive-record-full-label] { display:none; }
+                #better-loot-tracker-config-panel [data-mooncake-order-archive-record-compact-label] { display:block; }
+                #better-loot-tracker-config-panel [data-mooncake-order-archive-detail] { padding:7px 8px; }
+                #better-loot-tracker-config-panel [data-mooncake-order-archive-detail-meta] { gap:6px !important; margin-bottom:6px !important; font-size:10px !important; }
+                #better-loot-tracker-config-panel [data-mooncake-order-archive-sides] { grid-template-columns:repeat(2,minmax(0,1fr)) !important; gap:6px !important; }
+                #better-loot-tracker-config-panel [data-mooncake-order-archive-side] { font-size:10px !important; }
+                #better-loot-tracker-config-panel [data-mooncake-order-archive-side-title] { margin-bottom:0 !important; font-size:10px !important; line-height:15px !important; }
+                #better-loot-tracker-config-panel [data-mooncake-order-archive-side-header], #better-loot-tracker-config-panel [data-mooncake-order-archive-side-row] { grid-template-columns:minmax(28px,.64fr) minmax(46px,1fr) minmax(45px,1.02fr) !important; gap:3px !important; min-height:18px !important; padding:2px 0 !important; font-size:10px !important; line-height:14px !important; }
+            }
             @media (max-width:520px) { #better-loot-tracker-config-panel [data-mooncake-hourly-wage-color-profile-popover] { right:auto; left:0; width:min(292px,calc(100vw - 42px)); } }
             @media (max-width:480px) {
                 #better-loot-tracker-config-panel { padding:max(4px,env(safe-area-inset-top)) max(4px,env(safe-area-inset-right)) max(4px,env(safe-area-inset-bottom)) max(4px,env(safe-area-inset-left)) !important; }
+                #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter="date-range"] { flex-direction:column; align-items:stretch; }
+                #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter="date-range"] [data-mooncake-market-trade-log-date-range] { grid-template-columns:auto minmax(0,1fr); gap:4px 6px; }
+                #better-loot-tracker-config-panel [data-mooncake-market-trade-log-start-time], #better-loot-tracker-config-panel [data-mooncake-market-trade-log-end-time] { height:34px; font-size:16px; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-dialog] { height:100%; max-height:100%; border-radius:4px; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel] { padding:0 10px 12px; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="archive"] { padding:0; }
@@ -41090,7 +43144,7 @@
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-toggle-state] { display:none; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-debug] { overflow-x:auto; overscroll-behavior-x:contain; }
                 #better-loot-tracker-config-panel [data-mooncake-order-archive-title] { flex-basis:100%; }
-                #better-loot-tracker-config-panel [data-mooncake-order-archive-sides] { grid-template-columns:1fr !important; gap:12px !important; }
+                #better-loot-tracker-config-panel [data-mooncake-order-archive-sides] { grid-template-columns:repeat(2,minmax(0,1fr)) !important; gap:5px !important; }
             }
             @media (max-height:520px) and (orientation:landscape) {
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tab] { min-height:38px; padding-top:5px; padding-bottom:5px; }
@@ -41303,6 +43357,15 @@
         marketHistoryResetButton.textContent = isZH ? '归位' : 'Reset';
         marketHistoryResetButton.title = isZH ? '恢复交易卡片默认跟随位置' : 'Restore the trading card to its default anchored position';
         marketHistoryControl?.appendChild(marketHistoryResetButton);
+        const marketPersonalTradeHistoryRow = mooncakeCreateEnhancementSettingsToggle(
+            'market-personal-trade-history',
+            isZH ? '最近成交价' : 'Recent trade prices',
+            isZH
+                ? '显示最近买/卖成交价'
+                : 'Show recent buy/sell trade prices.',
+            '',
+            'div'
+        );
         const marketHourlyRow = mooncakeCreateEnhancementSettingsToggle(
             'market-hourly',
             isZH ? '市场工时' : 'Market hourly',
@@ -41324,6 +43387,7 @@
         baseItemCostPricePolicyRow.setAttribute('data-mooncake-settings-enhance-row', 'base-cost');
         market.rows.append(
             marketHistoryRow,
+            marketPersonalTradeHistoryRow,
             columnBlock,
             marketHourlyRow,
             fabVisibilityRow,
@@ -41337,7 +43401,7 @@
         listings.rows.append(
             mooncakeCreateEnhancementSettingsToggle('my-listings-management', isZH ? '挂单管理' : 'Listing management', isZH ? '搜索并筛选我的挂单。' : 'Search and filter your listings.'),
             mooncakeCreateEnhancementSettingsToggle('market-listing-age-upload', isZH ? '挂单时间众筹' : 'Share listing times', isZH ? '共享挂单 id、估算创建时间，并显示挂单资金汇总。' : 'Share listing IDs, estimate creation times, and show listing fund totals.'),
-            mooncakeCreateEnhancementSettingsToggle('order-archive', isZH ? '挂单记录' : 'Order archive', isZH ? '保存挂单快照。' : 'Save listing snapshots.'),
+            mooncakeCreateEnhancementSettingsToggle('order-archive', isZH ? '挂单记录' : 'Order archive', isZH ? '保存挂单快照和我的成交记录。' : 'Save listing snapshots and my trade records.'),
             orderTargetHourlyRow,
             mooncakeCreateEnhancementSettingsToggle('my-listings-target-filter', isZH ? '扣扣出击' : 'Undercut', isZH ? '筛选可继续压价的出售单。' : 'Find sale listings that can be undercut.'),
             mooncakeCreateEnhancementSettingsToggle('my-listings-target-hourly-independent', isZH ? '独立目标' : 'Independent target', isZH ? '扣扣使用单独目标。' : 'Use a separate target for Undercut.'),
@@ -41807,6 +43871,19 @@
                     tab.getAttribute('data-mooncake-enhancement-settings-tab'),
                     { focus: true, refreshDebug: true }
                 );
+                return;
+            }
+            const archiveViewTab = event.target.closest?.('button[data-mooncake-order-archive-view-tab]');
+            if (archiveViewTab) {
+                const host = configPanel.querySelector('[data-mooncake-order-archive-page]');
+                if (host) {
+                    host.dataset.mooncakeOrderArchiveView = archiveViewTab.getAttribute('data-mooncake-order-archive-view-tab') === 'trades'
+                        ? 'trades'
+                        : 'snapshots';
+                    mooncakeRenderOrderBookArchivePage(host).catch(error => console.warn('[MoonCake] 市场记录读取失败:', error));
+                }
+                event.preventDefault();
+                event.stopPropagation();
                 return;
             }
             const donationRefresh = event.target.closest?.('[data-mooncake-enhancement-settings-donation-refresh]');
