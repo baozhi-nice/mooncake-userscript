@@ -128,9 +128,8 @@
     const MOONCAKE_VIRTUAL_RIVAL_MAX_COUNT = 8;
     const MOONCAKE_VIRTUAL_PROFILE_NAME_MAX_LENGTH = 28;
     const MOONCAKE_VIRTUAL_PROFILE_UNSAFE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
-    // This is intentionally profile-only: virtual values remain separate from
-    // the user-facing global feature toggle, while a profile can still restore
-    // the complete community-buff choice it was saved with.
+    // Profiles retain their own buff choice. Applying one aligns the live
+    // feature toggle, while leaving virtual mode always turns that toggle off.
     const MOONCAKE_VIRTUAL_PROFILE_COMMUNITY_BUFF_ENABLED_KEY = 'enhancing_community_buff_enabled';
     const MOONCAKE_VIRTUAL_PROFILE_CONTROL_IDS = Object.freeze({
         enabled: 'better-loot-tracker-virtual-config-enabled',
@@ -541,8 +540,9 @@
     // The former single threshold maps to purchase listings. Sale listings use
     // an independent threshold because low hourly value is the useful signal.
     if (!Number.isFinite(Number(storedConfig.features?.chatLaborBuyExpectedHourlyM))) {
-        config.features.chatLaborBuyExpectedHourlyM = Number.isFinite(Number(config.features.chatLaborExpectedHourlyM))
-            ? Number(config.features.chatLaborExpectedHourlyM)
+        const legacyChatLaborExpectedHourlyM = Number(config.features.chatLaborExpectedHourlyM);
+        config.features.chatLaborBuyExpectedHourlyM = Number.isFinite(legacyChatLaborExpectedHourlyM)
+            ? Math.max(0, Math.min(1000000, legacyChatLaborExpectedHourlyM))
             : 15;
     }
 
@@ -1903,6 +1903,32 @@
     const MOONCAKE_ORDER_TARGET_HOURLY_MIN_M = 0;
     const MOONCAKE_ORDER_TARGET_HOURLY_MAX_M = 1000000;
 
+    function mooncakeBindNonNegativeHourlyInput(input) {
+        if (!(input instanceof HTMLInputElement)) return input;
+        const minimumText = String(input.min ?? '').trim();
+        const minimum = Number(minimumText);
+        if (!minimumText || !Number.isFinite(minimum) || minimum < MOONCAKE_ORDER_TARGET_HOURLY_MIN_M) {
+            input.min = String(MOONCAKE_ORDER_TARGET_HOURLY_MIN_M);
+        }
+        if (input.dataset.mooncakeNonNegativeHourlyBound === '1') return input;
+        input.dataset.mooncakeNonNegativeHourlyBound = '1';
+
+        const normalize = () => {
+            const text = String(input.value ?? '').trim();
+            const numeric = Number(text);
+            if (text.startsWith('-') || (Number.isFinite(numeric) && numeric < MOONCAKE_ORDER_TARGET_HOURLY_MIN_M)) {
+                input.value = String(MOONCAKE_ORDER_TARGET_HOURLY_MIN_M);
+            }
+        };
+        input.addEventListener('keydown', event => {
+            if (event.key === '-' || event.key === 'Subtract') event.preventDefault();
+        }, true);
+        // Capture so per-surface input handlers only ever receive a valid value.
+        input.addEventListener('input', normalize, true);
+        normalize();
+        return input;
+    }
+
     function mooncakeGetOrderTargetHourlyM() {
         const value = Number(config.preferences?.marketOrderTargetHourlyM);
         if (!Number.isFinite(value)) return 15;
@@ -2095,12 +2121,16 @@
 
     function getChatLaborSellExpectedHourlyWage() {
         const expectedM = Number(config.features?.chatLaborSellExpectedHourlyM);
-        return Number.isFinite(expectedM) ? expectedM * 1e6 : 0;
+        return Number.isFinite(expectedM)
+            ? Math.min(MOONCAKE_ORDER_TARGET_HOURLY_MAX_M, Math.max(MOONCAKE_ORDER_TARGET_HOURLY_MIN_M, expectedM)) * 1e6
+            : 0;
     }
 
     function getChatLaborBuyExpectedHourlyWage() {
         const expectedM = Number(config.features?.chatLaborBuyExpectedHourlyM);
-        return Number.isFinite(expectedM) ? expectedM * 1e6 : 15e6;
+        return Number.isFinite(expectedM)
+            ? Math.min(MOONCAKE_ORDER_TARGET_HOURLY_MAX_M, Math.max(MOONCAKE_ORDER_TARGET_HOURLY_MIN_M, expectedM)) * 1e6
+            : 15e6;
     }
 
     function getChatLaborSellExpectedHourlyM() {
@@ -2168,10 +2198,13 @@
     }
 
     function setChatLaborExpectedHourlyM(side, value) {
-        const numeric = Number(value);
-        if (!Number.isFinite(numeric)) return false;
+        const text = String(value ?? '').trim();
+        if (!text) return false;
+        const numeric = Number(text);
+        if (!Number.isFinite(numeric) || numeric < MOONCAKE_ORDER_TARGET_HOURLY_MIN_M || numeric > MOONCAKE_ORDER_TARGET_HOURLY_MAX_M) return false;
+        if (side !== 'sell' && side !== 'buy') return false;
         if (!config.features) config.features = {};
-        const normalized = Math.max(-1000000, Math.min(1000000, numeric));
+        const normalized = Math.round(numeric * 1000) / 1000;
         if (side === 'sell') config.features.chatLaborSellExpectedHourlyM = normalized;
         else config.features.chatLaborBuyExpectedHourlyM = normalized;
         saveConfig();
@@ -17300,8 +17333,8 @@
     const MOONCAKE_BARGAIN_MIN_WIDTH = '1120px';
     // The combined report keeps the actionable current-market figures at the
     // left and the historic trading figures at the right.
-    const MOONCAKE_KOUKOU_GRID_COLUMNS = 'minmax(230px,1.5fr) minmax(106px,.72fr) minmax(116px,.82fr) minmax(122px,.88fr) minmax(122px,.88fr) repeat(3,72px 128px 86px)';
-    const MOONCAKE_KOUKOU_MIN_WIDTH = '1560px';
+    const MOONCAKE_KOUKOU_GRID_COLUMNS = 'minmax(205px,1.35fr) minmax(83px,.56fr) minmax(100px,.67fr) minmax(83px,.56fr) minmax(100px,.67fr) minmax(106px,.72fr) minmax(106px,.72fr) repeat(3,64px 116px 78px)';
+    const MOONCAKE_KOUKOU_MIN_WIDTH = '1640px';
     let mooncakeMarketHistorySeq = 0;
     let mooncakeMarketHistoryRankingSort = 'turnover7';
     let mooncakeMarketHistoryRankingSeq = 0;
@@ -20871,7 +20904,7 @@
             const minVolume = Number(parsed.minVolume);
             const targetHourlyM = Number(parsed.targetHourlyM);
             const validSort = [
-                'name', 'koukouHourly', 'undercutHourly', 'undercutProfit',
+                'name', 'koukouHourly', 'bidHourly', 'undercutHourly', 'undercutProfit',
                 'volume1', 'avg1', 'avgHourly1', 'turnover1',
                 'volume3', 'avg3', 'avgHourly3', 'turnover3',
                 'volume7', 'avg7', 'avgHourly7', 'turnover7'
@@ -21919,6 +21952,11 @@
                         mooncakeFormatKouKouHourly(row.hourlyWage, row.evaluation?.combinedColor || '#7DFFB3')
                     )}
                     ${mooncakeBuildKouKouMobileMetricPair(
+                        '当前右一 / 工时',
+                        mooncakeFormatBargainPrice(row.bid, '#9CDCF5'),
+                        mooncakeFormatKouKouHourly(row.bidHourlyWage, row.bidEvaluation?.combinedColor || '#7DFFB3')
+                    )}
+                    ${mooncakeBuildKouKouMobileMetricPair(
                         '扣一档工时 / 利润',
                         mooncakeFormatKouKouHourly(row.undercutHourlyWage, row.undercutEvaluation?.combinedColor || '#7DFFB3'),
                         mooncakeFormatKouKouProfit(row.undercutProfit)
@@ -21939,23 +21977,25 @@
         `;
         return `<div style="display:grid;grid-template-columns:${columns};min-width:${MOONCAKE_KOUKOU_MIN_WIDTH};gap:5px;position:sticky;top:0;z-index:1;background:rgba(18,22,34,.98);padding:8px 0 7px;border-bottom:1px solid rgba(255,255,255,.08);color:rgba(230,238,255,.72);font-size:11px;font-weight:900;text-align:center;">
             <button type="button" data-mooncake-history-sort="name" style="grid-column:1;grid-row:1 / span 2;align-self:center;cursor:pointer;text-align:left;border:0;background:transparent;color:${activeSort === 'name' ? '#FFD27A' : 'rgba(230,238,255,.72)'};font-size:11px;font-weight:900;padding:0;">装备</button>
-            <div style="grid-column:2 / span 4;${groupStyle}${divider}">扣扣小子</div>
-            <div style="grid-column:6 / span 3;${groupStyle}${divider}">1d</div>
-            <div style="grid-column:9 / span 3;${groupStyle}${divider}">3d</div>
-            <div style="grid-column:12 / span 3;${groupStyle}${divider}">7d</div>
+            <div style="grid-column:2 / span 6;${groupStyle}${divider}">扣扣小子</div>
+            <div style="grid-column:8 / span 3;${groupStyle}${divider}">1d</div>
+            <div style="grid-column:11 / span 3;${groupStyle}${divider}">3d</div>
+            <div style="grid-column:14 / span 3;${groupStyle}${divider}">7d</div>
             <div style="grid-column:2;grid-row:2;${divider}">当前左一</div>
             ${sortButton('koukouHourly', '当前工时', 3, '#B9E6A3')}
-            ${sortButton('undercutHourly', '扣一档工时', 4, '#8DE7F2')}
-            ${sortButton('undercutProfit', '扣一档利润', 5, '#6DF6CB')}
-            ${sortButton('volume1', '数量', 6, '#87CEEB', divider)}
-            ${sortButton('avg1', '均价/工时', 7, '#B9E6A3')}
-            ${sortButton('turnover1', '总额', 8, '#FFD27A')}
-            ${sortButton('volume3', '数量', 9, '#87CEEB', divider)}
-            ${sortButton('avg3', '均价/工时', 10, '#B9E6A3')}
-            ${sortButton('turnover3', '总额', 11, '#FFD27A')}
-            ${sortButton('volume7', '数量', 12, '#87CEEB', divider)}
-            ${sortButton('avg7', '均价/工时', 13, '#B9E6A3')}
-            ${sortButton('turnover7', '总额', 14, '#FFD27A')}
+            <div style="grid-column:4;grid-row:2;">当前右一</div>
+            ${sortButton('bidHourly', '右一工时', 5, '#9CDCF5')}
+            ${sortButton('undercutHourly', '扣一档工时', 6, '#8DE7F2')}
+            ${sortButton('undercutProfit', '扣一档利润', 7, '#6DF6CB')}
+            ${sortButton('volume1', '数量', 8, '#87CEEB', divider)}
+            ${sortButton('avg1', '均价/工时', 9, '#B9E6A3')}
+            ${sortButton('turnover1', '总额', 10, '#FFD27A')}
+            ${sortButton('volume3', '数量', 11, '#87CEEB', divider)}
+            ${sortButton('avg3', '均价/工时', 12, '#B9E6A3')}
+            ${sortButton('turnover3', '总额', 13, '#FFD27A')}
+            ${sortButton('volume7', '数量', 14, '#87CEEB', divider)}
+            ${sortButton('avg7', '均价/工时', 15, '#B9E6A3')}
+            ${sortButton('turnover7', '总额', 16, '#FFD27A')}
         </div>`;
     }
 
@@ -21981,6 +22021,8 @@
                     <div style="display:flex;align-items:center;gap:6px;min-width:0;"><span data-icon="${mooncakeEscapeHtml(row.itemHrid)}"></span><button type="button" data-mooncake-koukou-jump="1" data-hrid="${mooncakeEscapeHtml(row.itemHrid)}" data-level="${row.level}" title="${mooncakeEscapeHtml(`${displayName}${itemLevel ? ` · ${itemLevel}` : ''}`)}" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:0;background:transparent;color:#eef6ff;font:inherit;font-weight:800;padding:0;cursor:pointer;text-align:left;">${mooncakeEscapeHtml(displayName)}</button></div>
                     <div style="text-align:center;border-left:1px solid rgba(255,255,255,.08);padding-left:8px;">${mooncakeFormatBargainPrice(row.ask, '#B9E6A3')}</div>
                     <div style="text-align:center;">${mooncakeFormatKouKouHourly(row.hourlyWage, hourlyColor)}</div>
+                    <div style="text-align:center;">${mooncakeFormatBargainPrice(row.bid, '#9CDCF5')}</div>
+                    <div style="text-align:center;">${mooncakeFormatKouKouHourly(row.bidHourlyWage, row.bidEvaluation?.combinedColor || '#7DFFB3')}</div>
                     <div style="text-align:center;" title="${mooncakeEscapeHtml(undercutTitle)}">${mooncakeFormatKouKouHourly(row.undercutHourlyWage, row.undercutEvaluation?.combinedColor || '#7DFFB3')}</div>
                     <div style="text-align:center;" title="${mooncakeEscapeHtml(`${undercutTitle}；出售扣除 ${MOONCAKE_MARKET_SELL_TAX_PERCENT}% 市场税后计算`)}">${mooncakeFormatKouKouProfit(row.undercutProfit)}</div>
                     <div style="text-align:center;color:#87CEEB;font-weight:700;border-left:1px solid rgba(255,255,255,.08);padding-left:8px;">${mooncakeFormatCompactNumber(row.volume1)}</div>
@@ -22140,9 +22182,10 @@
                     <span data-mooncake-koukou-status style="color:rgba(230,238,255,.58);font-size:11px;"></span>
                 </div>
             </div>
-            <div data-mooncake-koukou-description style="padding:6px 12px;color:rgba(220,251,255,.65);font-size:11px;border-bottom:1px solid rgba(255,255,255,.06);">左侧按当前左一报价计算扣一档工时与利润，右侧保留 1/3/7 日交易统计。勾选“扣扣小子”后，只保留当前工时达到目标的装备；扣一档利润已扣市场税。</div>
+            <div data-mooncake-koukou-description style="padding:6px 12px;color:rgba(220,251,255,.65);font-size:11px;border-bottom:1px solid rgba(255,255,255,.06);">左侧显示当前左一、右一及扣一档的对应工时，右侧保留 1/3/7 日交易统计。勾选“扣扣小子”后，只保留当前左一工时达到目标的装备；扣一档利润已扣市场税。</div>
             <div data-mooncake-koukou-body style="overflow:auto;overscroll-behavior:contain;padding:0 12px 16px;"></div>
         `;
+        mooncakeBindNonNegativeHourlyInput(panel.querySelector('[data-mooncake-koukou-target-hourly]'));
         mooncakeApplyKouKouMobileLayout(panel);
         mooncakeRunMarketKouKou();
     }
@@ -22201,7 +22244,7 @@
         // statistics panel. The status text makes truncation visible.
         const hrids = allHrids.slice(0, 120);
         const targetHourly = targetHourlyM * 1e6;
-        if (body) body.innerHTML = '<div style="padding:18px;text-align:center;color:rgba(230,238,255,.62);">准备计算当前左一工时...</div>';
+        if (body) body.innerHTML = '<div style="padding:18px;text-align:center;color:rgba(230,238,255,.62);">准备计算当前左右一工时...</div>';
 
         try {
             const candidates = [];
@@ -22211,9 +22254,12 @@
                 if (runSeq !== mooncakeMarketKouKouSeq || !panel.isConnected || abortController.signal.aborted) return;
                 const itemHrid = hrids[index];
                 const ask = Number(marketData.marketData?.[itemHrid]?.[String(enhancementLevel)]?.a);
+                const bid = Number(marketData.marketData?.[itemHrid]?.[String(enhancementLevel)]?.b);
                 const detail = itemDetailMap?.[itemHrid] || getInitClientData()?.itemDetailMap?.[itemHrid];
                 let hourlyWage = null;
                 let evaluation = null;
+                let bidHourlyWage = null;
+                let bidEvaluation = null;
                 let undercutPrice = 0;
                 let undercutHourlyWage = null;
                 let undercutProfit = null;
@@ -22237,9 +22283,25 @@
                         }
                     }
                 }
-
                 const isKouKouMatch = Number.isFinite(hourlyWage) && hourlyWage >= targetHourly;
                 if (isKouKouMatch) qualifiedCount += 1;
+                // In the default filtered view, rows below the target are not
+                // rendered at all. Avoid a third route calculation for them.
+                if (bid > 0 && (!onlyKouKou || isKouKouMatch)) {
+                    const bidResult = calcHourlyWageAndMetrics(
+                        itemHrid,
+                        enhancementLevel,
+                        marketData,
+                        bid,
+                        { includeRoutePair: false }
+                    );
+                    const calculatedBidHourly = Number(bidResult?.hourlyWage);
+                    if (Number.isFinite(calculatedBidHourly)) {
+                        bidHourlyWage = calculatedBidHourly;
+                        bidEvaluation = bidResult?.evaluation || null;
+                    }
+                }
+
                 if (!onlyKouKou || isKouKouMatch) {
                     candidates.push({
                         itemHrid,
@@ -22248,6 +22310,9 @@
                         ask,
                         hourlyWage,
                         evaluation,
+                        bid,
+                        bidHourlyWage,
+                        bidEvaluation,
                         undercutPrice,
                         undercutHourlyWage,
                         undercutProfit,
@@ -26054,6 +26119,7 @@
             input.inputMode = 'decimal';
             input.value = String(mooncakeGetOrderTargetHourlyM());
             input.setAttribute(MOONCAKE_ORDER_TARGET_HOURLY_INPUT_ATTR, '1');
+            mooncakeBindNonNegativeHourlyInput(input);
             Object.assign(input.style, {
                 width: '62px',
                 minWidth: '0',
@@ -29566,6 +29632,7 @@
                 : (isZH ? '请先开启聊天工时费' : 'Enable chat hourly wage first');
         });
         document.querySelectorAll('[data-mooncake-chat-labor-expected]').forEach(input => {
+            mooncakeBindNonNegativeHourlyInput(input);
             const side = input.getAttribute('data-mooncake-chat-labor-expected');
             input.value = String(side === 'sell'
                 ? getChatLaborSellExpectedHourlyM()
@@ -35951,6 +36018,7 @@
         targetInput.value = String(mooncakeGetOrderTargetHourlyM());
         targetInput.setAttribute(MOONCAKE_ORDER_TARGET_HOURLY_INPUT_ATTR, '1');
         targetInput.setAttribute('data-mooncake-enh-market-plan-target-input', '1');
+        mooncakeBindNonNegativeHourlyInput(targetInput);
         targetInput.title = isZH
             ? '与市场挂单页面共用；低于该值的工时费会以暗色显示。'
             : 'Shared with marketplace listings; lower hourly wages are muted.';
@@ -37166,12 +37234,12 @@
                         <div style="position:absolute;z-index:20;right:0;top:calc(100% + 5px);display:grid;gap:8px;min-width:226px;max-width:calc(100vw - 32px);padding:10px;border:1px solid rgba(176,160,235,.45);border-radius:6px;background:rgba(20,24,37,.98);box-shadow:0 8px 20px rgba(0,0,0,.38);color:rgba(240,235,255,.95);font-weight:700;">
                             <label title="${isZH ? '出售工时费低于此值时高亮，单位 M/h' : 'Highlight sale hourly wage below this M/h threshold'}" style="display:grid;grid-template-columns:72px minmax(0,1fr) 26px;align-items:center;gap:7px;white-space:nowrap;">
                                 <span style="opacity:.8;">${isZH ? '出售单低于' : 'Sell below'}</span>
-                                <input type="text" inputmode="decimal" autocomplete="off" spellcheck="false" data-mooncake-chat-labor-expected="sell" aria-label="${isZH ? '出售期望工时费，单位 M/h' : 'Expected sale hourly wage in M/h'}" value="${chatLaborSellExpectedHourlyM}" ${chatLaborEnabled ? '' : 'disabled'} style="width:62px;min-width:0;box-sizing:border-box;border:1px solid rgba(176,160,235,.34);border-radius:4px;background:rgba(10,30,31,.82);color:inherit;padding:3px 5px;text-align:right;font-size:12px;font-weight:800;font-variant-numeric:tabular-nums;opacity:${chatLaborEnabled ? '1' : '.52'};">
+                                <input type="number" min="${MOONCAKE_ORDER_TARGET_HOURLY_MIN_M}" max="${MOONCAKE_ORDER_TARGET_HOURLY_MAX_M}" step="0.001" inputmode="decimal" autocomplete="off" spellcheck="false" data-mooncake-chat-labor-expected="sell" aria-label="${isZH ? '出售期望工时费，单位 M/h' : 'Expected sale hourly wage in M/h'}" value="${chatLaborSellExpectedHourlyM}" ${chatLaborEnabled ? '' : 'disabled'} style="width:62px;min-width:0;box-sizing:border-box;border:1px solid rgba(176,160,235,.34);border-radius:4px;background:rgba(10,30,31,.82);color:inherit;padding:3px 5px;text-align:right;font-size:12px;font-weight:800;font-variant-numeric:tabular-nums;opacity:${chatLaborEnabled ? '1' : '.52'};">
                                 <span style="opacity:.62;font-size:11px;">M/h</span>
                             </label>
                             <label title="${isZH ? '购买工时费高于此值时高亮，单位 M/h' : 'Highlight purchase hourly wage above this M/h threshold'}" style="display:grid;grid-template-columns:72px minmax(0,1fr) 26px;align-items:center;gap:7px;white-space:nowrap;">
                                 <span style="opacity:.8;">${isZH ? '收购单高于' : 'Buy above'}</span>
-                                <input type="text" inputmode="decimal" autocomplete="off" spellcheck="false" data-mooncake-chat-labor-expected="buy" aria-label="${isZH ? '购买期望工时费，单位 M/h' : 'Expected purchase hourly wage in M/h'}" value="${chatLaborBuyExpectedHourlyM}" ${chatLaborEnabled ? '' : 'disabled'} style="width:62px;min-width:0;box-sizing:border-box;border:1px solid rgba(176,160,235,.34);border-radius:4px;background:rgba(10,30,31,.82);color:inherit;padding:3px 5px;text-align:right;font-size:12px;font-weight:800;font-variant-numeric:tabular-nums;opacity:${chatLaborEnabled ? '1' : '.52'};">
+                                <input type="number" min="${MOONCAKE_ORDER_TARGET_HOURLY_MIN_M}" max="${MOONCAKE_ORDER_TARGET_HOURLY_MAX_M}" step="0.001" inputmode="decimal" autocomplete="off" spellcheck="false" data-mooncake-chat-labor-expected="buy" aria-label="${isZH ? '购买期望工时费，单位 M/h' : 'Expected purchase hourly wage in M/h'}" value="${chatLaborBuyExpectedHourlyM}" ${chatLaborEnabled ? '' : 'disabled'} style="width:62px;min-width:0;box-sizing:border-box;border:1px solid rgba(176,160,235,.34);border-radius:4px;background:rgba(10,30,31,.82);color:inherit;padding:3px 5px;text-align:right;font-size:12px;font-weight:800;font-variant-numeric:tabular-nums;opacity:${chatLaborEnabled ? '1' : '.52'};">
                                 <span style="opacity:.62;font-size:11px;">M/h</span>
                             </label>
                             <label title="${isZH ? '聊天挂单旁显示的内容' : 'Content shown beside chat listings'}" style="display:grid;grid-template-columns:72px minmax(0,1fr);align-items:center;gap:7px;white-space:nowrap;">
@@ -38975,6 +39043,7 @@
         const orderValue = String(mooncakeGetOrderTargetHourlyM());
         document.querySelectorAll(`[${MOONCAKE_ORDER_TARGET_HOURLY_INPUT_ATTR}="1"]`)
             .forEach(input => {
+                mooncakeBindNonNegativeHourlyInput(input);
                 if (input instanceof HTMLInputElement && input !== exclude && document.activeElement !== input) {
                     input.value = orderValue;
                 }
@@ -38982,6 +39051,7 @@
         const myListingsValue = String(mooncakeGetMyListingsTargetHourlyM());
         document.querySelectorAll(`[${MOONCAKE_MY_LISTINGS_TARGET_INPUT_ATTR}="1"], [${MOONCAKE_MY_LISTINGS_TARGET_SETTINGS_INPUT_ATTR}="1"]`)
             .forEach(input => {
+                mooncakeBindNonNegativeHourlyInput(input);
                 if (input instanceof HTMLInputElement && input !== exclude && document.activeElement !== input) {
                     input.value = myListingsValue;
                 }
@@ -39023,6 +39093,7 @@
         input.inputMode = 'decimal';
         input.value = String(mooncakeGetMyListingsTargetHourlyM());
         input.setAttribute(MOONCAKE_MY_LISTINGS_TARGET_INPUT_ATTR, '1');
+        mooncakeBindNonNegativeHourlyInput(input);
         input.setAttribute('aria-label', isZH ? '目标工时费，单位 M/h' : 'Target hourly wage in M/h');
         Object.assign(input.style, {
             width: '58px', minWidth: '0', height: '27px', boxSizing: 'border-box', border: '1px solid rgba(137,164,238,.52)',
@@ -42200,6 +42271,7 @@
         root.querySelectorAll('[data-mooncake-hourly-wage-color-profile-threshold]').forEach(input => {
             const index = Number(input.getAttribute('data-mooncake-hourly-wage-color-profile-threshold'));
             if (!Number.isInteger(index) || index < 0 || index >= profile.thresholdsM.length) return;
+            mooncakeBindNonNegativeHourlyInput(input);
             input.value = mooncakeFormatHourlyWageColorProfileM(profile.thresholdsM[index]);
             input.min = String(index === 0 ? 0 : profile.thresholdsM[index - 1]);
             input.max = String(index === profile.thresholdsM.length - 1
@@ -42269,6 +42341,7 @@
                 threshold.setAttribute('data-mooncake-hourly-wage-color-profile-threshold', String(thresholdIndex));
                 threshold.setAttribute('aria-label', `${mooncakeGetHourlyWageColorProfileTierLabel(key)} ${isZH ? '上限，单位 M/h' : 'upper breakpoint in M/h'}`);
                 threshold.title = threshold.getAttribute('aria-label');
+                mooncakeBindNonNegativeHourlyInput(threshold);
                 threshold.addEventListener('change', commit);
                 threshold.addEventListener('keydown', event => {
                     if (event.key !== 'Enter') return;
@@ -43208,6 +43281,7 @@
         orderTargetHourlyInput.value = String(mooncakeGetOrderTargetHourlyM());
         orderTargetHourlyInput.setAttribute(MOONCAKE_ORDER_TARGET_HOURLY_INPUT_ATTR, '1');
         orderTargetHourlyInput.setAttribute('aria-label', isZH ? '挂单目标工时费，单位 M/h' : 'Listing target hourly wage in M/h');
+        mooncakeBindNonNegativeHourlyInput(orderTargetHourlyInput);
         const commitOrderTargetHourly = () => {
             if (!mooncakeSetOrderTargetHourlyM(orderTargetHourlyInput.value)) {
                 orderTargetHourlyInput.value = String(mooncakeGetOrderTargetHourlyM());
@@ -43233,6 +43307,7 @@
         myListingsTargetHourlyInput.value = String(mooncakeGetMyListingsTargetHourlyM());
         myListingsTargetHourlyInput.setAttribute(MOONCAKE_MY_LISTINGS_TARGET_SETTINGS_INPUT_ATTR, '1');
         myListingsTargetHourlyInput.setAttribute('aria-label', isZH ? '扣扣目标工时费，单位 M/h' : 'Undercut target hourly wage in M/h');
+        mooncakeBindNonNegativeHourlyInput(myListingsTargetHourlyInput);
         const commitMyListingsTargetHourly = () => {
             if (!mooncakeSetMyListingsTargetHourlyM(myListingsTargetHourlyInput.value)) {
                 myListingsTargetHourlyInput.value = String(mooncakeGetMyListingsTargetHourlyM());
@@ -43423,12 +43498,16 @@
             const labelText = document.createElement('span');
             labelText.textContent = label;
             const input = document.createElement('input');
-            input.type = 'text';
+            input.type = 'number';
+            input.min = String(MOONCAKE_ORDER_TARGET_HOURLY_MIN_M);
+            input.max = String(MOONCAKE_ORDER_TARGET_HOURLY_MAX_M);
+            input.step = '0.001';
             input.inputMode = 'decimal';
             input.value = String(value);
             input.setAttribute('data-mooncake-chat-labor-expected', side);
             input.setAttribute('data-mooncake-settings-chat-dependent', '1');
             input.setAttribute('data-mooncake-enhancement-settings-field', '1');
+            mooncakeBindNonNegativeHourlyInput(input);
             const unit = document.createElement('span');
             unit.setAttribute('data-mooncake-enhancement-settings-chat-threshold-unit', '1');
             unit.textContent = 'M/h';
@@ -44309,7 +44388,13 @@
                 champion_achievement: championAchievement,
                 community_enhancing_speed_level: communityEnhancingSpeedLevel
             };
-            if (profileCommunityBuffEnabled !== null) {
+            // Virtual configuration is a temporary calculator state. Once it
+            // is cancelled, stop the corresponding live buff as well instead
+            // of leaving a profile-selected switch enabled in settings.
+            if (previousVirtualEnabled && !enabled) {
+                if (!config.features) config.features = {};
+                config.features.enhancingCommunityBuff = false;
+            } else if (profileCommunityBuffEnabled !== null) {
                 if (!config.features) config.features = {};
                 config.features.enhancingCommunityBuff = profileCommunityBuffEnabled;
             }
