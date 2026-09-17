@@ -14,7 +14,8 @@
     "test:warehouse-queue": "node scripts/test-inventory-warehouse-queue.mjs",
     "test:virtual-community-buff": "node scripts/test-virtual-community-buff.mjs",
     "test:koukou-right-bid": "node scripts/test-koukou-right-bid.mjs",
-    "test:nonnegative-hourly": "node scripts/test-nonnegative-hourly-inputs.mjs"
+    "test:nonnegative-hourly": "node scripts/test-nonnegative-hourly-inputs.mjs",
+    "test:standard-hourly": "node scripts/test-standard-hourly-route.mjs"
   },
   "devDependencies": {
     "terser": "5.50.0"

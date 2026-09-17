@@ -45,4 +45,10 @@ assert.match(source, /\[data-mooncake-market-trade-log-date-range\] \{ grid-temp
 assert.match(source, /data-mooncake-market-trade-log-date-boundary/, 'the stacked datetime inputs must keep visible start and end labels');
 assert.match(source, /\[data-mooncake-market-trade-log-start-time\], #better-loot-tracker-config-panel \[data-mooncake-market-trade-log-end-time\] \{ height:34px; font-size:16px; \}/, 'mobile datetime inputs must avoid iOS focus zoom');
 
+const levelJumpBar = extractFunction('ensureMooncakeMarketEnhLevelJumpBar');
+assert.match(source, /const MOONCAKE_MARKET_LEVEL_BUTTONS_PER_ROW = 10;/, 'desktop level navigation must keep its established multi-row capacity');
+assert.match(levelJumpBar, /alignItems: 'flex-start'/, 'the category control must remain aligned to the first level row');
+assert.match(levelJumpBar, /stockControls\.style\.alignSelf = 'flex-start'/, 'the category control must not become vertically centered when more levels wrap');
+assert.match(levelJumpBar, /gridAutoRows: '26px'/, 'extra desktop level jumps must remain visible in additional rows');
+
 console.log('Mobile market layout checks passed.');

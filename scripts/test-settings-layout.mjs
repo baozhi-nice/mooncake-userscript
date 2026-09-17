@@ -18,8 +18,8 @@ assert.match(
 );
 assert.match(
     source,
-    /grid-template-areas:"lazy inventory queue-next" "route protection buff" "anti-suicide-enhancement anti-suicide-alchemy style" "reminder reminder-level base-cost"/,
-    'enhancement settings must use the compact three-column grid'
+    /grid-template-areas:"lazy inventory base-cost" "route protection base-cost" "standard-hourly anti-suicide-enhancement queue-next" "style anti-suicide-alchemy buff" "reminder reminder-level \."/,
+    'enhancement settings must keep base cost in the upper-right and standard hourly below the route selector'
 );
 assert.match(source, /isZH \? '棒棒糖按钮🍭' : 'Lollipop button'/, 'lollipop visibility should use the merged setting title');
 assert.match(source, /isZH \? '包子页签或按Ctrl\+Alt\+D隐藏\/显示'/, 'lollipop visibility should explain both restore paths');

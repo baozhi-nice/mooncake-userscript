@@ -33,6 +33,12 @@ function extractFunction(name) {
 }
 
 const normalizeQuantity = extractFunction('mooncakeNormalizeMarketTradeLogQuantity');
+const normalizeInstantRequest = extractFunction('mooncakeNormalizeInstantMarketTradeRequest');
+const inventoryQuantity = extractFunction('mooncakeGetMarketTradeLogInventoryQuantity');
+const instantInventoryConfirm = extractFunction('mooncakeDoesInstantMarketTradeInventoryConfirm');
+const buildInstantEntry = extractFunction('mooncakeBuildInstantMarketTradeLogEntry');
+const instantListingCover = extractFunction('mooncakeDoesListingCoverInstantMarketTrade');
+const instantTradeRecordCover = extractFunction('mooncakeDoesMarketTradeLogEntryCoverInstantTrade');
 const normalizeListing = extractFunction('mooncakeNormalizeMarketTradeLogListing');
 const planFill = extractFunction('mooncakePlanMarketTradeLogFill');
 const buildEntry = extractFunction('mooncakeBuildMarketTradeLogEntry');
@@ -45,6 +51,7 @@ const getDefaultDateRange = extractFunction('mooncakeGetDefaultMarketTradeLogDat
 const tradeLogEnhancementLevel = extractFunction('mooncakeGetMarketTradeLogEnhancementLevel');
 const tradeLogItemLevel = extractFunction('mooncakeGetMarketTradeLogItemLevel');
 const matchesFilter = extractFunction('mooncakeMarketTradeLogMatchesFilter');
+const createSummaryAccumulator = extractFunction('mooncakeCreateMarketTradeLogSummaryAccumulator');
 const schedulePageRefresh = extractFunction('mooncakeScheduleMarketTradeLogPageRefresh');
 const invalidateArchivePage = extractFunction('mooncakeInvalidateOrderBookArchivePage');
 const renderTradeLogPage = extractFunction('mooncakeRenderMarketTradeLogPage');
@@ -67,7 +74,19 @@ vm.runInNewContext(`
             '/items/test_herb': 0
         }[itemHrid] || 0;
     }
+    function mooncakeCollectionValues(value) {
+        if (Array.isArray(value)) return value.filter(Boolean);
+        if (value && typeof value === 'object') return Object.values(value).filter(Boolean);
+        return [];
+    }
+    const MOONCAKE_INSTANT_MARKET_TRADE_DEDUPE_WINDOW_MS = 10000;
     ${normalizeQuantity}
+    ${normalizeInstantRequest}
+    ${inventoryQuantity}
+    ${instantInventoryConfirm}
+    ${buildInstantEntry}
+    ${instantListingCover}
+    ${instantTradeRecordCover}
     ${normalizeListing}
     ${planFill}
     ${buildEntry}
@@ -80,16 +99,120 @@ vm.runInNewContext(`
     ${tradeLogEnhancementLevel}
     ${tradeLogItemLevel}
     ${matchesFilter}
+    ${createSummaryAccumulator}
     globalThis.testApi = {
+        normalizeInstantRequest: mooncakeNormalizeInstantMarketTradeRequest,
+        inventoryQuantity: mooncakeGetMarketTradeLogInventoryQuantity,
+        instantInventoryConfirm: mooncakeDoesInstantMarketTradeInventoryConfirm,
+        buildInstantEntry: mooncakeBuildInstantMarketTradeLogEntry,
+        instantListingCover: mooncakeDoesListingCoverInstantMarketTrade,
+        instantTradeRecordCover: mooncakeDoesMarketTradeLogEntryCoverInstantTrade,
         normalizeListing: mooncakeNormalizeMarketTradeLogListing,
         planFill: mooncakePlanMarketTradeLogFill,
         buildEntry: mooncakeBuildMarketTradeLogEntry,
         parseDateTimeInput: mooncakeParseMarketTradeLogDateTimeInput,
         formatDateTimeInput: mooncakeFormatMarketTradeLogDateTimeInput,
         getDefaultDateRange: mooncakeGetDefaultMarketTradeLogDateRange,
-        matchesFilter: mooncakeMarketTradeLogMatchesFilter
+        matchesFilter: mooncakeMarketTradeLogMatchesFilter,
+        createSummaryAccumulator: mooncakeCreateMarketTradeLogSummaryAccumulator
     };
 `, sandbox);
+
+const instantRequest = sandbox.testApi.normalizeInstantRequest({
+    type: 'post_market_order',
+    postMarketOrderData: {
+        isSell: true,
+        itemHrid: '/items/test_herb',
+        enhancementLevel: 0,
+        quantity: 12,
+        price: 321,
+        isInstantOrder: true
+    }
+});
+assert.deepEqual(JSON.parse(JSON.stringify(instantRequest)), {
+    isSell: true,
+    itemHrid: '/items/test_herb',
+    enhancementLevel: 0,
+    quantity: 12,
+    unitPrice: 321
+}, 'an instant sell request must retain its final market details');
+assert.equal(sandbox.testApi.normalizeInstantRequest({
+    type: 'post_market_order',
+    postMarketOrderData: { ...instantRequest, isInstantOrder: false }
+}), null, 'a regular listing must not enter the instant-trade fallback path');
+assert.equal(sandbox.testApi.inventoryQuantity([{
+    itemLocationHrid: '/item_locations/inventory',
+    itemHrid: '/items/test_herb',
+    enhancementLevel: 0,
+    count: 0
+}], '/items/test_herb', 0, true), 0,
+'an inventory update that clears the final material stack must remain observable');
+assert.equal(sandbox.testApi.inventoryQuantity([{
+    itemLocationHrid: '/item_locations/inventory',
+    itemHrid: '/items/test_sword',
+    enhancementLevel: 12,
+    count: 1
+}], '/items/test_herb', 0, true), null,
+'unrelated inventory updates must not confirm an instant material trade');
+assert.equal(sandbox.testApi.instantInventoryConfirm({
+    isSell: true, quantity: 2, inventoryBefore: 9
+}, 7), true, 'a confirmed instant sale must reduce inventory by the requested quantity');
+assert.equal(sandbox.testApi.instantInventoryConfirm({
+    isSell: false, quantity: 2, inventoryBefore: 9
+}, 11), true, 'a confirmed instant buy must increase inventory by the requested quantity');
+assert.equal(sandbox.testApi.instantInventoryConfirm({
+    isSell: true, quantity: 2, inventoryBefore: 9
+}, 8), false, 'a partial or unrelated inventory update must not become a completed trade');
+const instantEntry = sandbox.testApi.buildInstantEntry({
+    ...instantRequest,
+    characterId: '77',
+    inventoryBefore: 12,
+    sentAt: 1_000,
+    sequence: 4
+}, 2_000);
+assert.deepEqual(JSON.parse(JSON.stringify(instantEntry)), {
+    id: 'instant:77:1000:4',
+    characterId: '77',
+    listingId: 'instant-1000-4',
+    side: 'sell',
+    itemHrid: '/items/test_herb',
+    itemLevel: '/items/test_herb#0',
+    enhancementLevel: 0,
+    quantity: 12,
+    unitPrice: 321,
+    grossAmount: 3852,
+    fromFilledQuantity: 0,
+    toFilledQuantity: 12,
+    orderQuantity: 12,
+    status: '/market_listing_status/filled',
+    timestamp: 2_000,
+    source: 'instant'
+}, 'a confirmed instant trade must have an idempotent local record');
+assert.equal(sandbox.testApi.instantListingCover({
+    characterId: '77', itemHrid: '/items/test_herb', enhancementLevel: 0,
+    isSell: true, unitPrice: 999, filledQuantity: 12
+}, {
+    ...instantRequest, characterId: '77'
+}), true, 'a matching terminal listing must suppress the fallback even when the native price field differs');
+assert.equal(sandbox.testApi.instantListingCover({
+    characterId: '77', itemHrid: '/items/test_herb', enhancementLevel: 0,
+    isSell: false, filledQuantity: 12
+}, {
+    ...instantRequest, characterId: '77'
+}), false, 'the fallback must not confuse opposite market sides');
+assert.equal(sandbox.testApi.instantTradeRecordCover({
+    ...instantEntry,
+    id: '77:901:0:12',
+    source: 'live',
+    unitPrice: 999,
+    timestamp: 8_000
+}, instantEntry), true, 'an ordinary record must replace the less-authoritative instant fallback');
+assert.equal(sandbox.testApi.instantTradeRecordCover({
+    ...instantEntry,
+    id: '77:901:0:12',
+    source: 'live',
+    timestamp: 13_001
+}, instantEntry), false, 'records outside the short confirmation window must remain independent trades');
 
 const listing = sandbox.testApi.normalizeListing({
     id: 901,
@@ -163,6 +286,25 @@ assert.equal(sandbox.testApi.matchesFilter({
 }, { itemLevel: '0', enhancementLevel: '0', query: 'herb', side: 'buy' }), true,
 'the non-equipment and legacy name-query filters must remain supported');
 
+const summaryAccumulator = sandbox.testApi.createSummaryAccumulator();
+[
+    { itemHrid: '/items/test_sword', enhancementLevel: 12, side: 'sell', quantity: 3, unitPrice: 200, grossAmount: 600 },
+    { itemHrid: '/items/test_sword', enhancementLevel: 12, side: 'sell', quantity: 2, unitPrice: 100, grossAmount: 200 },
+    { itemHrid: '/items/test_sword', enhancementLevel: 12, side: 'buy', quantity: 4, unitPrice: 50, grossAmount: 200 }
+].forEach(row => summaryAccumulator.add(row));
+const itemSummary = summaryAccumulator.getSummary();
+assert.equal(itemSummary.sellQuantity, 5, 'the summary must aggregate sell quantities');
+assert.equal(itemSummary.sellAveragePrice, 160, 'the sell average must be weighted by completed quantity');
+assert.equal(itemSummary.buyQuantity, 4, 'the summary must aggregate buy quantities');
+assert.equal(itemSummary.buyAveragePrice, 50, 'the buy average must be weighted by completed quantity');
+assert.equal(itemSummary.totalQuantity, 9, 'the summary must combine buy and sell quantities');
+assert.ok(Math.abs(itemSummary.totalAveragePrice - (1000 / 9)) < 1e-9, 'the total average must be quantity-weighted');
+
+const mixedItemAccumulator = sandbox.testApi.createSummaryAccumulator();
+mixedItemAccumulator.add({ itemHrid: '/items/test_sword', enhancementLevel: 12, side: 'buy', quantity: 1, unitPrice: 100 });
+mixedItemAccumulator.add({ itemHrid: '/items/test_sword', enhancementLevel: 13, side: 'buy', quantity: 1, unitPrice: 100 });
+assert.equal(mixedItemAccumulator.getSummary(), null, 'different enhancement levels must not share a single-item summary');
+
 const defaultRangeNow = new Date(2026, 8, 10, 12, 34, 45).getTime();
 const defaultDateRange = sandbox.testApi.getDefaultDateRange(defaultRangeNow);
 assert.equal(
@@ -186,6 +328,12 @@ assert.match(source, /MOONCAKE_MARKET_TRADE_LOG_STORE = 'trades'/, 'completed tr
 assert.match(source, /MOONCAKE_MARKET_TRADE_LOG_STATE_STORE = 'tradeListingState'/, 'listing fill checkpoints must persist separately from immutable trade rows');
 assert.match(source, /mooncakeScheduleMarketTradeLogCapture\(\[obj\.myMarketListings\], 'snapshot'\)/, 'initial listings must create a non-duplicating baseline');
 assert.match(source, /mooncakeScheduleMarketTradeLogCapture\(\[obj\.marketListings, obj\.endMarketListings\], 'incremental'\)/, 'market updates must capture completed trade deltas');
+assert.match(source, /mooncakeTrackInstantMarketTradeRequest\(payload\)/, 'outbound instant market orders must enter the confirmation queue');
+assert.match(source, /mooncakeResolvePendingInstantMarketTrades\(obj\.endCharacterItems, obj\.endMarketListings\)/, 'market updates must confirm instant orders from their inventory change');
+assert.match(source, /MOONCAKE_INSTANT_MARKET_TRADE_FALLBACK_DELAY_MS = 900/, 'the instant fallback must wait for the standard listing capture');
+assert.match(source, /mooncakeFilterUnrecordedInstantMarketTradeLogEntries/, 'the instant fallback must query for a standard record before writing');
+assert.match(source, /mooncakeRemoveInstantMarketTradeLogDuplicates/, 'late standard records must remove an earlier instant fallback duplicate');
+assert.match(source, /WebSocket\.prototype\.send = hookedSend/, 'the trade log must observe the game post-order request without touching its result');
 assert.match(source, /if \(!listing \|\| listing\.characterId !== currentCharacterId\) return;/, 'the trade log must only retain the current character\'s listings');
 assert.match(source, /data-mooncake-order-archive-view-tab/, 'the archive page must contain sub-tabs for snapshots and trade records');
 assert.match(source, /data-mooncake-market-trade-log-enhancement/, 'the trade log must expose an enhancement-level filter');
@@ -197,10 +345,13 @@ assert.match(source, /endMinuteTimestamp \+ 60 \* 1000 - 1/, 'the selected end m
 assert.match(source, /\[normalizedCharacterId, lowerTimestamp\]/, 'the trade log query must start at the chosen IndexedDB timestamp boundary');
 assert.match(source, /\[normalizedCharacterId, upperTimestamp\]/, 'the trade log query must stop at the chosen IndexedDB timestamp boundary');
 assert.match(source, /data-mooncake-market-trade-log-filter/, 'the trade log filters must have visible labels');
+assert.match(source, /data-mooncake-market-trade-log-summary/, 'single-item trade results must expose a summary row');
+assert.match(source, /summaryAccumulator\.add\(cursor\.value\)/, 'the summary must include every matched IndexedDB row, not only the visible page');
 assert.match(schedulePageRefresh, /_mooncakeRefreshMarketTradeLogResults/, 'background trade captures must refresh only the visible trade rows');
 assert.doesNotMatch(schedulePageRefresh, /mooncakeRenderOrderBookArchivePage\(host\)/, 'background trade captures must not rebuild filter controls');
 assert.match(invalidateArchivePage, /_mooncakeRefreshMarketTradeLogResults = null/, 'stale trade-row refresh callbacks must be invalidated with the archive page');
 assert.match(renderTradeLogPage, /_mooncakeRefreshMarketTradeLogResults = refresh/, 'the rendered trade log must expose a rows-only refresher');
+assert.match(renderTradeLogPage, /const \[\{ rows, hasMore, summary \}, total\]/, 'the result renderer must receive the full-filter summary with its page rows');
 assert.match(renderTradeLogPage, /requestSequence !== refreshSequence/, 'out-of-order background reads must not overwrite a newer filter result');
 assert.match(renderTradeLogPage, /rollingDateRange = dateRangeFollowsNow[\s\S]*?mooncakeGetDefaultMarketTradeLogDateRange\(\)/, 'the default latest-1d range must advance during background row refreshes');
 assert.match(renderTradeLogPage, /startDateTime\.addEventListener\('input', freezeRollingDateRange\)/, 'editing the start time must protect an in-progress mobile picker value from background refresh');

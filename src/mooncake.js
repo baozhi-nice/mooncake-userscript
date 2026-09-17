@@ -436,6 +436,7 @@
     const DEFAULT_PREFERENCES = {
         preferenceLevels: '',
         enhancementRouteObjective: 'hourly',
+        enhancementStandardHourlyM: 15,
         superEnhanceMinLevel: 5,
         alchemyPriceMode: 'ask_bid',
         materialEquipmentJumpLevel: 0,
@@ -706,12 +707,17 @@
         mooncakeRefreshEnhancingCommunityBuffCalculations();
     }
 
-    const MOONCAKE_ENHANCEMENT_ROUTE_OBJECTIVES = new Set(['hourly', 'profit', 'balanced']);
+    const MOONCAKE_ENHANCEMENT_ROUTE_OBJECTIVES = new Set(['hourly', 'profit', 'standard']);
+    const MOONCAKE_ENHANCEMENT_STANDARD_HOURLY_DEFAULT_M = 15;
+    const MOONCAKE_ENHANCEMENT_STANDARD_HOURLY_MAX_M = 1000000;
 
     function mooncakeNormalizeEnhancementRouteObjective(value) {
         if (value === 'hourly' || value === 'maxHourly') return 'hourly';
         if (value === 'profit' || value === 'minCost') return 'profit';
-        if (value === 'balanced' || value === 'combined' || value === 'comprehensive') return 'balanced';
+        // Keep saved selections from the former "综合策略" working, but give
+        // them the new price-independent standard-hourly behavior.
+        if (value === 'standard' || value === 'standardHourly' ||
+            value === 'balanced' || value === 'combined' || value === 'comprehensive') return 'standard';
         return null;
     }
 
@@ -728,9 +734,48 @@
         });
     }
 
+    function mooncakeGetEnhancementStandardHourlyM() {
+        const value = Number(config.preferences?.enhancementStandardHourlyM);
+        if (!Number.isFinite(value)) return MOONCAKE_ENHANCEMENT_STANDARD_HOURLY_DEFAULT_M;
+        return Math.min(
+            MOONCAKE_ENHANCEMENT_STANDARD_HOURLY_MAX_M,
+            Math.max(0, value)
+        );
+    }
+
+    function mooncakeGetEnhancementStandardHourlyWage() {
+        return mooncakeGetEnhancementStandardHourlyM() * 1e6;
+    }
+
+    function mooncakeUpdateEnhancementStandardHourlyControls() {
+        const value = String(mooncakeGetEnhancementStandardHourlyM());
+        document.querySelectorAll('[data-mooncake-enhancement-standard-hourly]').forEach(control => {
+            if (control instanceof HTMLInputElement && control.value !== value) {
+                control.value = value;
+            }
+        });
+    }
+
+    function mooncakeSetEnhancementStandardHourlyM(value) {
+        const text = String(value ?? '').trim();
+        if (!text) return false;
+        const parsed = Number(text);
+        if (!Number.isFinite(parsed) || parsed < 0 || parsed > MOONCAKE_ENHANCEMENT_STANDARD_HOURLY_MAX_M) {
+            return false;
+        }
+        if (!config.preferences) config.preferences = {};
+        const normalized = Math.round(parsed * 1000) / 1000;
+        if (Number(config.preferences.enhancementStandardHourlyM) === normalized) return true;
+        config.preferences.enhancementStandardHourlyM = normalized;
+        saveConfig();
+        try { mooncakeUpdateEnhancementStandardHourlyControls(); } catch (_) {}
+        mooncakeRefreshEnhancementRouteObjectiveSurfaces();
+        return true;
+    }
+
     function mooncakeGetEnhancementRouteSelectionMode(value = null) {
         const objective = mooncakeNormalizeEnhancementRouteObjective(value) || getEnhancementRouteObjective();
-        if (objective === 'balanced') return 'balanced';
+        if (objective === 'standard') return 'standard';
         return objective === 'profit' ? 'minCost' : 'maxHourly';
     }
 
@@ -3166,6 +3211,11 @@
     const MOONCAKE_MARKET_TRADE_LOG_LIMIT = 20000;
     const MOONCAKE_MARKET_TRADE_LOG_PAGE_LIMIT = 250;
     const MOONCAKE_MARKET_TRADE_LOG_CAPTURE_DELAY_MS = 80;
+    const MOONCAKE_INSTANT_MARKET_TRADE_PENDING_TTL_MS = 30000;
+    const MOONCAKE_INSTANT_MARKET_TRADE_PENDING_LIMIT = 12;
+    const MOONCAKE_INSTANT_MARKET_TRADE_DEDUPE_WINDOW_MS = 10000;
+    const MOONCAKE_INSTANT_MARKET_TRADE_FALLBACK_DELAY_MS = 900;
+    const MOONCAKE_INSTANT_MARKET_TRADE_DEDUPE_KEY = 'Mooncake_marketTradeLog_instantDedupe_v1';
     const MOONCAKE_ORDER_BOOK_ARCHIVE_DEFAULT_LIMIT = 3000;
     const MOONCAKE_ORDER_BOOK_ARCHIVE_MIN_LIMIT = 100;
     const MOONCAKE_ORDER_BOOK_ARCHIVE_MAX_LIMIT = 100000;
@@ -3184,6 +3234,10 @@
     let mooncakeMarketTradeLogWriteChain = Promise.resolve();
     let mooncakeMarketTradeLogTrimAt = 0;
     let mooncakeMarketTradeLogPageRefreshTimer = 0;
+    let mooncakePendingInstantMarketTrades = [];
+    let mooncakeInstantMarketTradeSequence = 0;
+    let mooncakeInstantMarketTradeDedupePromise = null;
+    const mooncakeInstantMarketTradeFallbackTimers = new Set();
 
     function mooncakeIsOrderBookArchiveEnabled() {
         try { return localStorage.getItem(MOONCAKE_ORDER_BOOK_ARCHIVE_ENABLED_KEY) !== '0'; }
@@ -3243,6 +3297,9 @@
             mooncakeMarketTradeLogCaptureTimer = 0;
         }
         mooncakeMarketTradeLogPendingBatches = [];
+        mooncakePendingInstantMarketTrades = [];
+        mooncakeInstantMarketTradeFallbackTimers.forEach(timer => clearTimeout(timer));
+        mooncakeInstantMarketTradeFallbackTimers.clear();
     }
 
     function mooncakeScheduleOrderBookArchiveCapture(marketItemOrderBooks) {
@@ -3329,6 +3386,92 @@
     function mooncakeNormalizeMarketTradeLogQuantity(value) {
         const quantity = Number(value);
         return Number.isFinite(quantity) && quantity > 0 ? Math.floor(quantity) : 0;
+    }
+
+    function mooncakeNormalizeInstantMarketTradeRequest(message) {
+        if (!message || typeof message !== 'object' || message.type !== 'post_market_order') return null;
+        const data = message.postMarketOrderData;
+        if (!data || typeof data !== 'object') return null;
+        const rawInstantOrder = data.isInstantOrder;
+        const isInstantOrder = rawInstantOrder === true || rawInstantOrder === 1 ||
+            rawInstantOrder === '1' || rawInstantOrder === 'true';
+        if (!isInstantOrder) return null;
+        const rawIsSell = data.isSell;
+        let isSell = null;
+        if (rawIsSell === true || rawIsSell === 1 || rawIsSell === '1' || rawIsSell === 'true') {
+            isSell = true;
+        } else if (rawIsSell === false || rawIsSell === 0 || rawIsSell === '0' || rawIsSell === 'false') {
+            isSell = false;
+        }
+        const itemHrid = String(data.itemHrid ?? data.itemHRID ?? '').trim();
+        const quantity = mooncakeNormalizeMarketTradeLogQuantity(data.quantity);
+        const unitPrice = Math.floor(Number(data.price ?? data.unitPrice));
+        if (isSell === null || !itemHrid.startsWith('/items/') || !quantity || !Number.isFinite(unitPrice) || unitPrice <= 0) {
+            return null;
+        }
+        return {
+            isSell,
+            itemHrid,
+            enhancementLevel: Math.max(0, Math.min(20, Math.floor(Number(data.enhancementLevel) || 0))),
+            quantity,
+            unitPrice
+        };
+    }
+
+    function mooncakeGetMarketTradeLogInventoryQuantity(collection, itemHrid, enhancementLevel, requireMatch = false) {
+        if (collection == null) return null;
+        const normalizedItemHrid = String(itemHrid || '').trim();
+        const normalizedLevel = Math.max(0, Math.floor(Number(enhancementLevel) || 0));
+        let matched = false;
+        let quantity = 0;
+        mooncakeCollectionValues(collection).forEach(item => {
+            if (!item || item.itemLocationHrid !== '/item_locations/inventory' ||
+                String(item.itemHrid || '').trim() !== normalizedItemHrid ||
+                Math.max(0, Math.floor(Number(item.enhancementLevel) || 0)) !== normalizedLevel) return;
+            const count = Number(item.count);
+            if (!Number.isFinite(count) || count < 0) return;
+            matched = true;
+            quantity += Math.floor(count);
+        });
+        return requireMatch && !matched ? null : quantity;
+    }
+
+    function mooncakeDoesInstantMarketTradeInventoryConfirm(pending, inventoryAfter) {
+        const before = Number(pending?.inventoryBefore);
+        const after = Number(inventoryAfter);
+        const quantity = mooncakeNormalizeMarketTradeLogQuantity(pending?.quantity);
+        if (!Number.isFinite(before) || before < 0 || !Number.isFinite(after) || after < 0 || !quantity) return false;
+        return pending.isSell === true
+            ? after <= before - quantity
+            : pending.isSell === false && after >= before + quantity;
+    }
+
+    function mooncakeBuildInstantMarketTradeLogEntry(pending, observedAt = Date.now()) {
+        if (!pending?.characterId || !pending?.itemHrid || !mooncakeNormalizeMarketTradeLogQuantity(pending.quantity)) return null;
+        const quantity = mooncakeNormalizeMarketTradeLogQuantity(pending.quantity);
+        const unitPrice = Math.floor(Number(pending.unitPrice));
+        if (!Number.isFinite(unitPrice) || unitPrice <= 0) return null;
+        const timestamp = Math.max(0, Math.floor(Number(observedAt) || Date.now()));
+        const sequence = Math.max(1, Math.floor(Number(pending.sequence) || 0));
+        const itemLevel = `${pending.itemHrid}#${Math.max(0, Math.floor(Number(pending.enhancementLevel) || 0))}`;
+        return {
+            id: `instant:${pending.characterId}:${pending.sentAt}:${sequence}`,
+            characterId: String(pending.characterId),
+            listingId: `instant-${pending.sentAt}-${sequence}`,
+            side: pending.isSell ? 'sell' : 'buy',
+            itemHrid: pending.itemHrid,
+            itemLevel,
+            enhancementLevel: Math.max(0, Math.floor(Number(pending.enhancementLevel) || 0)),
+            quantity,
+            unitPrice,
+            grossAmount: quantity * unitPrice,
+            fromFilledQuantity: 0,
+            toFilledQuantity: quantity,
+            orderQuantity: quantity,
+            status: '/market_listing_status/filled',
+            timestamp,
+            source: 'instant'
+        };
     }
 
     function mooncakeNormalizeMarketTradeLogListing(listing, fallbackCharacterId = '') {
@@ -3443,17 +3586,222 @@
         return [...listings.values()];
     }
 
-    async function mooncakeStoreMarketTradeLogListings(listings, mode, observedAt) {
-        if (!listings.length) return 0;
-        const db = await mooncakeOpenOrderBookArchiveDb();
+    function mooncakePrunePendingInstantMarketTrades(now = Date.now()) {
+        const expiresBefore = Math.max(0, Number(now) || Date.now()) - MOONCAKE_INSTANT_MARKET_TRADE_PENDING_TTL_MS;
+        mooncakePendingInstantMarketTrades = mooncakePendingInstantMarketTrades.filter(pending =>
+            pending && Number(pending.sentAt) >= expiresBefore
+        );
+    }
+
+    function mooncakeTrackInstantMarketTradeRequest(message) {
+        if (!mooncakeIsOrderBookArchiveEnabled()) return false;
+        const request = mooncakeNormalizeInstantMarketTradeRequest(message);
+        try { mooncakeSyncCharacterDataFromGameState(); } catch (_) {}
+        const characterId = String(mooncakeCharacterId ?? '').trim();
+        if (!request || !characterId) return false;
+        const inventoryBefore = mooncakeGetMarketTradeLogInventoryQuantity(
+            characterInventoryItems,
+            request.itemHrid,
+            request.enhancementLevel
+        );
+        if (!Number.isFinite(inventoryBefore) || inventoryBefore < 0) return false;
+        const now = Date.now();
+        mooncakePrunePendingInstantMarketTrades(now);
+        mooncakePendingInstantMarketTrades.push({
+            ...request,
+            characterId,
+            inventoryBefore,
+            sentAt: now,
+            sequence: ++mooncakeInstantMarketTradeSequence
+        });
+        if (mooncakePendingInstantMarketTrades.length > MOONCAKE_INSTANT_MARKET_TRADE_PENDING_LIMIT) {
+            mooncakePendingInstantMarketTrades.splice(
+                0,
+                mooncakePendingInstantMarketTrades.length - MOONCAKE_INSTANT_MARKET_TRADE_PENDING_LIMIT
+            );
+        }
+        return true;
+    }
+
+    function mooncakeDoesListingCoverInstantMarketTrade(listing, pending) {
+        return !!listing && !!pending &&
+            listing.characterId === pending.characterId &&
+            listing.itemHrid === pending.itemHrid &&
+            listing.enhancementLevel === pending.enhancementLevel &&
+            listing.isSell === pending.isSell &&
+            listing.filledQuantity >= pending.quantity;
+    }
+
+    function mooncakeDoesMarketTradeLogEntryCoverInstantTrade(entry, instantEntry) {
+        if (!entry || !instantEntry || entry.source === 'instant') return false;
+        const entryTimestamp = Number(entry.timestamp);
+        const instantTimestamp = Number(instantEntry.timestamp);
+        const entryQuantity = mooncakeNormalizeMarketTradeLogQuantity(entry.quantity);
+        const instantQuantity = mooncakeNormalizeMarketTradeLogQuantity(instantEntry.quantity);
+        return String(entry.characterId || '') === String(instantEntry.characterId || '') &&
+            String(entry.side || '') === String(instantEntry.side || '') &&
+            String(entry.itemHrid || '') === String(instantEntry.itemHrid || '') &&
+            Math.max(0, Math.floor(Number(entry.enhancementLevel) || 0)) ===
+                Math.max(0, Math.floor(Number(instantEntry.enhancementLevel) || 0)) &&
+            entryQuantity >= instantQuantity && instantQuantity > 0 &&
+            Number.isFinite(entryTimestamp) && Number.isFinite(instantTimestamp) &&
+            Math.abs(entryTimestamp - instantTimestamp) <= MOONCAKE_INSTANT_MARKET_TRADE_DEDUPE_WINDOW_MS;
+    }
+
+    function mooncakeHasTerminalListingForInstantMarketTrade(collection, pending) {
+        return mooncakeCollectionEntries(collection).some(([, value]) => {
+            const listing = mooncakeNormalizeMarketTradeLogListing(value, pending.characterId);
+            return mooncakeDoesListingCoverInstantMarketTrade(listing, pending);
+        });
+    }
+
+    async function mooncakeFilterUnrecordedInstantMarketTradeLogEntries(entries, db) {
+        if (!entries.length || !db) return entries;
+        return new Promise(resolve => {
+            const coveredIds = new Set();
+            let settled = false;
+            const finish = value => {
+                if (settled) return;
+                settled = true;
+                resolve(value);
+            };
+            let tx;
+            try {
+                tx = db.transaction(MOONCAKE_MARKET_TRADE_LOG_STORE, 'readonly');
+            } catch (_) {
+                finish(entries);
+                return;
+            }
+            const index = tx.objectStore(MOONCAKE_MARKET_TRADE_LOG_STORE).index('characterTimestamp');
+            entries.forEach(entry => {
+                const timestamp = Math.max(0, Math.floor(Number(entry?.timestamp) || 0));
+                const characterId = String(entry?.characterId || '').trim();
+                if (!timestamp || !characterId) return;
+                const range = IDBKeyRange.bound(
+                    [characterId, Math.max(0, timestamp - MOONCAKE_INSTANT_MARKET_TRADE_DEDUPE_WINDOW_MS)],
+                    [characterId, timestamp + MOONCAKE_INSTANT_MARKET_TRADE_DEDUPE_WINDOW_MS]
+                );
+                const request = index.openCursor(range);
+                request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (!cursor) return;
+                    if (mooncakeDoesMarketTradeLogEntryCoverInstantTrade(cursor.value, entry)) {
+                        coveredIds.add(entry.id);
+                        return;
+                    }
+                    cursor.continue();
+                };
+                request.onerror = () => {
+                    // Prefer a one-time fallback record over losing a material trade
+                    // when a browser aborts a read-only cursor unexpectedly.
+                    coveredIds.delete(entry.id);
+                };
+            });
+            tx.oncomplete = () => finish(entries.filter(entry => !coveredIds.has(entry.id)));
+            tx.onerror = () => finish(entries);
+            tx.onabort = () => finish(entries);
+        });
+    }
+
+    async function mooncakeStoreInstantMarketTradeLogEntries(entries, existingDb = null) {
+        if (!entries.length) return 0;
+        const db = existingDb || await mooncakeOpenOrderBookArchiveDb();
         if (!db) return 0;
         return new Promise(resolve => {
-            let createdCount = 0;
+            let addedCount = 0;
             let settled = false;
             const finish = count => {
                 if (settled) return;
                 settled = true;
                 resolve(count);
+            };
+            const tx = db.transaction(MOONCAKE_MARKET_TRADE_LOG_STORE, 'readwrite');
+            const trades = tx.objectStore(MOONCAKE_MARKET_TRADE_LOG_STORE);
+            entries.forEach(entry => {
+                const request = trades.get(entry.id);
+                request.onsuccess = () => {
+                    if (request.result) return;
+                    trades.put(entry);
+                    addedCount++;
+                };
+                request.onerror = () => {
+                    try { tx.abort(); } catch (_) {}
+                };
+            });
+            tx.oncomplete = () => finish(addedCount);
+            tx.onerror = () => finish(0);
+            tx.onabort = () => finish(0);
+        });
+    }
+
+    function mooncakeQueueInstantMarketTradeLogEntries(entries) {
+        if (!entries.length) return;
+        const pendingEntries = entries.slice();
+        const timer = setTimeout(() => {
+            mooncakeInstantMarketTradeFallbackTimers.delete(timer);
+            if (!mooncakeIsOrderBookArchiveEnabled()) return;
+            mooncakeMarketTradeLogWriteChain = mooncakeMarketTradeLogWriteChain
+                .then(async () => {
+                    const db = await mooncakeOpenOrderBookArchiveDb();
+                    if (!db) return;
+                    const unrecordedEntries = await mooncakeFilterUnrecordedInstantMarketTradeLogEntries(pendingEntries, db);
+                    const addedCount = await mooncakeStoreInstantMarketTradeLogEntries(unrecordedEntries, db);
+                    if (!addedCount) return;
+                    const now = Date.now();
+                    if (now - mooncakeMarketTradeLogTrimAt > 60000) {
+                        mooncakeMarketTradeLogTrimAt = now;
+                        mooncakeTrimMarketTradeLog(db).catch(() => {});
+                    }
+                    mooncakeScheduleMarketTradeLogPageRefresh();
+                })
+                .catch(error => console.warn('[MoonCake] 即时交易记录保存失败:', error));
+        }, MOONCAKE_INSTANT_MARKET_TRADE_FALLBACK_DELAY_MS);
+        mooncakeInstantMarketTradeFallbackTimers.add(timer);
+    }
+
+    function mooncakeResolvePendingInstantMarketTrades(itemUpdates, terminalListings, observedAt = Date.now()) {
+        if (!mooncakePendingInstantMarketTrades.length) return 0;
+        const timestamp = Math.max(0, Math.floor(Number(observedAt) || Date.now()));
+        mooncakePrunePendingInstantMarketTrades(timestamp);
+        if (!mooncakePendingInstantMarketTrades.length) return 0;
+        const completed = [];
+        const remaining = [];
+        mooncakePendingInstantMarketTrades.forEach(pending => {
+            if (mooncakeHasTerminalListingForInstantMarketTrade(terminalListings, pending)) {
+                // A normal terminal listing already carries this completion and
+                // is persisted by the cumulative-fill recorder below.
+                return;
+            }
+            const inventoryAfter = mooncakeGetMarketTradeLogInventoryQuantity(
+                itemUpdates,
+                pending.itemHrid,
+                pending.enhancementLevel,
+                true
+            );
+            if (!mooncakeDoesInstantMarketTradeInventoryConfirm(pending, inventoryAfter)) {
+                remaining.push(pending);
+                return;
+            }
+            const entry = mooncakeBuildInstantMarketTradeLogEntry(pending, timestamp);
+            if (entry) completed.push(entry);
+        });
+        mooncakePendingInstantMarketTrades = remaining;
+        mooncakeQueueInstantMarketTradeLogEntries(completed);
+        return completed.length;
+    }
+
+    async function mooncakeStoreMarketTradeLogListings(listings, mode, observedAt) {
+        if (!listings.length) return { createdCount: 0, createdTrades: [] };
+        const db = await mooncakeOpenOrderBookArchiveDb();
+        if (!db) return { createdCount: 0, createdTrades: [] };
+        return new Promise(resolve => {
+            let createdCount = 0;
+            const createdTrades = [];
+            let settled = false;
+            const finish = count => {
+                if (settled) return;
+                settled = true;
+                resolve({ createdCount: count, createdTrades: count > 0 ? createdTrades : [] });
             };
             const tx = db.transaction([MOONCAKE_MARKET_TRADE_LOG_STORE, MOONCAKE_MARKET_TRADE_LOG_STATE_STORE], 'readwrite');
             const trades = tx.objectStore(MOONCAKE_MARKET_TRADE_LOG_STORE);
@@ -3466,6 +3814,7 @@
                     states.put(entry.state);
                     if (entry.trade) {
                         trades.put(entry.trade);
+                        createdTrades.push(entry.trade);
                         createdCount++;
                     }
                 };
@@ -3477,6 +3826,107 @@
             tx.onerror = () => finish(0);
             tx.onabort = () => finish(0);
         });
+    }
+
+    async function mooncakeRemoveInstantMarketTradeLogDuplicates(db, standardEntries) {
+        const entries = (Array.isArray(standardEntries) ? standardEntries : [])
+            .filter(entry => entry && entry.source !== 'instant');
+        if (!db || !entries.length) return 0;
+        return new Promise(resolve => {
+            let removedCount = 0;
+            let settled = false;
+            const finish = count => {
+                if (settled) return;
+                settled = true;
+                resolve(count);
+            };
+            let tx;
+            try {
+                tx = db.transaction(MOONCAKE_MARKET_TRADE_LOG_STORE, 'readwrite');
+            } catch (_) {
+                finish(0);
+                return;
+            }
+            const trades = tx.objectStore(MOONCAKE_MARKET_TRADE_LOG_STORE);
+            const index = trades.index('characterTimestamp');
+            entries.forEach(entry => {
+                const timestamp = Math.max(0, Math.floor(Number(entry.timestamp) || 0));
+                const characterId = String(entry.characterId || '').trim();
+                if (!timestamp || !characterId) return;
+                const range = IDBKeyRange.bound(
+                    [characterId, Math.max(0, timestamp - MOONCAKE_INSTANT_MARKET_TRADE_DEDUPE_WINDOW_MS)],
+                    [characterId, timestamp + MOONCAKE_INSTANT_MARKET_TRADE_DEDUPE_WINDOW_MS]
+                );
+                const request = index.openCursor(range);
+                request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (!cursor) return;
+                    if (cursor.value?.source === 'instant' &&
+                        mooncakeDoesMarketTradeLogEntryCoverInstantTrade(entry, cursor.value)) {
+                        cursor.delete();
+                        removedCount++;
+                    }
+                    cursor.continue();
+                };
+                request.onerror = () => {
+                    try { tx.abort(); } catch (_) {}
+                };
+            });
+            tx.oncomplete = () => finish(removedCount);
+            tx.onerror = () => finish(0);
+            tx.onabort = () => finish(0);
+        });
+    }
+
+    async function mooncakeDeduplicateInstantMarketTradeLog(db) {
+        if (!db) return 0;
+        try {
+            if (localStorage.getItem(MOONCAKE_INSTANT_MARKET_TRADE_DEDUPE_KEY) === '1') return 0;
+        } catch (_) {}
+        if (mooncakeInstantMarketTradeDedupePromise) return mooncakeInstantMarketTradeDedupePromise;
+        mooncakeInstantMarketTradeDedupePromise = new Promise(resolve => {
+            let removedCount = 0;
+            let settled = false;
+            const finish = (count, committed = false) => {
+                if (settled) return;
+                settled = true;
+                resolve({ count, committed });
+            };
+            let tx;
+            try {
+                tx = db.transaction(MOONCAKE_MARKET_TRADE_LOG_STORE, 'readwrite');
+            } catch (_) {
+                finish(0);
+                return;
+            }
+            const trades = tx.objectStore(MOONCAKE_MARKET_TRADE_LOG_STORE);
+            const request = trades.getAll();
+            request.onsuccess = () => {
+                const rows = Array.isArray(request.result) ? request.result : [];
+                const standardEntries = rows.filter(row => row && row.source !== 'instant');
+                rows.forEach(entry => {
+                    if (!entry || entry.source !== 'instant') return;
+                    if (!standardEntries.some(standard => mooncakeDoesMarketTradeLogEntryCoverInstantTrade(standard, entry))) return;
+                    trades.delete(entry.id);
+                    removedCount++;
+                });
+            };
+            request.onerror = () => {
+                try { tx.abort(); } catch (_) {}
+            };
+            tx.oncomplete = () => finish(removedCount, true);
+            tx.onerror = () => finish(0);
+            tx.onabort = () => finish(0);
+        }).then(result => {
+            if (result.committed) {
+                try { localStorage.setItem(MOONCAKE_INSTANT_MARKET_TRADE_DEDUPE_KEY, '1'); } catch (_) {}
+            }
+            return result.count;
+        }).catch(() => {
+            mooncakeInstantMarketTradeDedupePromise = null;
+            return 0;
+        });
+        return mooncakeInstantMarketTradeDedupePromise;
     }
 
     async function mooncakeTrimMarketTradeLog(db) {
@@ -3534,15 +3984,19 @@
         mooncakeMarketTradeLogWriteChain = mooncakeMarketTradeLogWriteChain
             .then(async () => {
                 let createdCount = 0;
+                const createdTrades = [];
                 for (const batch of batches) {
                     const listings = mooncakeCollectMarketTradeLogListings(batch.collections, batch.characterId);
-                    createdCount += await mooncakeStoreMarketTradeLogListings(listings, batch.mode, batch.timestamp);
+                    const stored = await mooncakeStoreMarketTradeLogListings(listings, batch.mode, batch.timestamp);
+                    createdCount += stored.createdCount;
+                    createdTrades.push(...stored.createdTrades);
                 }
                 if (!createdCount) return;
                 const now = Date.now();
+                const db = await mooncakeOpenOrderBookArchiveDb();
+                await mooncakeRemoveInstantMarketTradeLogDuplicates(db, createdTrades);
                 if (now - mooncakeMarketTradeLogTrimAt > 60000) {
                     mooncakeMarketTradeLogTrimAt = now;
-                    const db = await mooncakeOpenOrderBookArchiveDb();
                     mooncakeTrimMarketTradeLog(db).catch(() => {});
                 }
                 mooncakeScheduleMarketTradeLogPageRefresh();
@@ -5380,19 +5834,83 @@
             .some(value => value.includes(query));
     }
 
+    function mooncakeCreateMarketTradeLogSummaryAccumulator() {
+        const items = new Map();
+        const createSide = () => ({ quantity: 0, grossAmount: 0 });
+        return {
+            add(row) {
+                const side = row?.side === 'sell' ? 'sell' : (row?.side === 'buy' ? 'buy' : '');
+                const itemHrid = String(row?.itemHrid || '').trim();
+                const quantity = mooncakeNormalizeMarketTradeLogQuantity(row?.quantity);
+                const unitPrice = Number(row?.unitPrice);
+                if (!side || !itemHrid || !(quantity > 0) || !(unitPrice > 0)) return;
+                const grossAmount = Number(row?.grossAmount);
+                const amount = Number.isFinite(grossAmount) && grossAmount > 0
+                    ? grossAmount
+                    : quantity * unitPrice;
+                const enhancementLevel = mooncakeGetMarketTradeLogEnhancementLevel(row);
+                const itemKey = `${itemHrid}#${enhancementLevel}`;
+                let item = items.get(itemKey);
+                if (!item) {
+                    item = {
+                        itemHrid,
+                        enhancementLevel,
+                        recordCount: 0,
+                        sell: createSide(),
+                        buy: createSide()
+                    };
+                    items.set(itemKey, item);
+                }
+                const bucket = item[side];
+                bucket.quantity += quantity;
+                bucket.grossAmount += amount;
+                item.recordCount += 1;
+            },
+            getSummary() {
+                if (items.size !== 1) return null;
+                const item = items.values().next().value;
+                const sellQuantity = item.sell.quantity;
+                const buyQuantity = item.buy.quantity;
+                const totalQuantity = sellQuantity + buyQuantity;
+                const sellGrossAmount = item.sell.grossAmount;
+                const buyGrossAmount = item.buy.grossAmount;
+                const totalGrossAmount = sellGrossAmount + buyGrossAmount;
+                return {
+                    itemHrid: item.itemHrid,
+                    enhancementLevel: item.enhancementLevel,
+                    recordCount: item.recordCount,
+                    sellQuantity,
+                    sellGrossAmount,
+                    sellAveragePrice: sellQuantity > 0 ? sellGrossAmount / sellQuantity : null,
+                    buyQuantity,
+                    buyGrossAmount,
+                    buyAveragePrice: buyQuantity > 0 ? buyGrossAmount / buyQuantity : null,
+                    totalQuantity,
+                    totalGrossAmount,
+                    totalAveragePrice: totalQuantity > 0 ? totalGrossAmount / totalQuantity : null
+                };
+            },
+            isSingleItemPossible() {
+                return items.size <= 1;
+            }
+        };
+    }
+
     async function mooncakeReadMarketTradeLog(characterId, filters = {}, limit = MOONCAKE_MARKET_TRADE_LOG_PAGE_LIMIT) {
         const normalizedCharacterId = String(characterId || '').trim();
         const db = await mooncakeOpenOrderBookArchiveDb();
-        if (!db || !normalizedCharacterId) return { rows: [], hasMore: false };
+        if (!db || !normalizedCharacterId) return { rows: [], hasMore: false, summary: null };
+        await mooncakeDeduplicateInstantMarketTradeLog(db);
         const maxRows = Math.max(1, Math.floor(Number(limit) || MOONCAKE_MARKET_TRADE_LOG_PAGE_LIMIT));
         const startTimestamp = mooncakeNormalizeMarketTradeLogFilterTimestamp(filters.startTimestamp);
         const endTimestamp = mooncakeNormalizeMarketTradeLogFilterTimestamp(filters.endTimestamp);
         const lowerTimestamp = startTimestamp ?? 0;
         const upperTimestamp = endTimestamp ?? Number.MAX_SAFE_INTEGER;
-        if (lowerTimestamp > upperTimestamp) return { rows: [], hasMore: false };
+        if (lowerTimestamp > upperTimestamp) return { rows: [], hasMore: false, summary: null };
         return new Promise(resolve => {
             const rows = [];
             let hasMore = false;
+            const summaryAccumulator = mooncakeCreateMarketTradeLogSummaryAccumulator();
             const tx = db.transaction(MOONCAKE_MARKET_TRADE_LOG_STORE, 'readonly');
             const index = tx.objectStore(MOONCAKE_MARKET_TRADE_LOG_STORE).index('characterTimestamp');
             const range = IDBKeyRange.bound(
@@ -5402,17 +5920,22 @@
             const request = index.openCursor(range, 'prev');
             request.onsuccess = () => {
                 const cursor = request.result;
-                if (!cursor) return resolve({ rows, hasMore });
+                if (!cursor) return resolve({ rows, hasMore, summary: summaryAccumulator.getSummary() });
                 if (mooncakeMarketTradeLogMatchesFilter(cursor.value, filters)) {
-                    if (rows.length >= maxRows) {
+                    summaryAccumulator.add(cursor.value);
+                    if (rows.length < maxRows) rows.push(cursor.value);
+                    else {
                         hasMore = true;
-                        return resolve({ rows, hasMore });
+                        // Once the visible page proves this is a multi-item result,
+                        // no aggregate can be shown. Preserve the old fast page cap.
+                        if (!summaryAccumulator.isSingleItemPossible()) {
+                            return resolve({ rows, hasMore, summary: null });
+                        }
                     }
-                    rows.push(cursor.value);
                 }
                 cursor.continue();
             };
-            request.onerror = () => resolve({ rows, hasMore });
+            request.onerror = () => resolve({ rows, hasMore, summary: null });
         });
     }
 
@@ -5420,6 +5943,7 @@
         const normalizedCharacterId = String(characterId || '').trim();
         const db = await mooncakeOpenOrderBookArchiveDb();
         if (!db || !normalizedCharacterId) return 0;
+        await mooncakeDeduplicateInstantMarketTradeLog(db);
         return new Promise(resolve => {
             const request = db.transaction(MOONCAKE_MARKET_TRADE_LOG_STORE, 'readonly')
                 .objectStore(MOONCAKE_MARKET_TRADE_LOG_STORE)
@@ -5449,7 +5973,52 @@
         return cell;
     }
 
-    function mooncakeRenderMarketTradeLogRows(container, rows) {
+    function mooncakeFormatMarketTradeLogAveragePrice(value) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric) || numeric < 0) return '-';
+        return mooncakeFormatArchiveExactNumber(Math.round(numeric * 100) / 100);
+    }
+
+    function mooncakeCreateMarketTradeLogSummary(summary) {
+        if (!summary?.itemHrid || !(Number(summary.totalQuantity) > 0)) return null;
+        const bar = document.createElement('div');
+        bar.setAttribute('data-mooncake-market-trade-log-summary', '1');
+        const identity = document.createElement('div');
+        identity.setAttribute('data-mooncake-market-trade-log-summary-item', 'item');
+        const title = document.createElement('strong');
+        title.textContent = isZH ? '交易汇总' : 'Trade summary';
+        const item = document.createElement('span');
+        item.textContent = mooncakeFormatMarketTradeLogItem(summary);
+        const count = document.createElement('small');
+        count.textContent = isZH
+            ? `当前筛选 ${mooncakeFormatArchiveExactNumber(summary.recordCount)} 笔`
+            : `${mooncakeFormatArchiveExactNumber(summary.recordCount)} matching trades`;
+        identity.append(title, item, count);
+        bar.appendChild(identity);
+
+        const appendMetric = (label, value, color) => {
+            const metric = document.createElement('div');
+            metric.setAttribute('data-mooncake-market-trade-log-summary-item', 'metric');
+            const labelNode = document.createElement('span');
+            labelNode.setAttribute('data-mooncake-market-trade-log-summary-label', '1');
+            labelNode.textContent = label;
+            const valueNode = document.createElement('strong');
+            valueNode.setAttribute('data-mooncake-market-trade-log-summary-value', '1');
+            valueNode.textContent = value;
+            valueNode.style.color = color;
+            metric.append(labelNode, valueNode);
+            bar.appendChild(metric);
+        };
+        appendMetric(isZH ? '卖出数量' : 'Sold qty', mooncakeFormatArchiveExactNumber(summary.sellQuantity), '#9bedad');
+        appendMetric(isZH ? '卖出均价' : 'Sell avg', mooncakeFormatMarketTradeLogAveragePrice(summary.sellAveragePrice), '#9bedad');
+        appendMetric(isZH ? '买入数量' : 'Bought qty', mooncakeFormatArchiveExactNumber(summary.buyQuantity), '#9ddfff');
+        appendMetric(isZH ? '买入均价' : 'Buy avg', mooncakeFormatMarketTradeLogAveragePrice(summary.buyAveragePrice), '#9ddfff');
+        appendMetric(isZH ? '合计数量' : 'Total qty', mooncakeFormatArchiveExactNumber(summary.totalQuantity), '#e8efff');
+        appendMetric(isZH ? '合计均价' : 'Total avg', mooncakeFormatMarketTradeLogAveragePrice(summary.totalAveragePrice), '#ffd66f');
+        return bar;
+    }
+
+    function mooncakeRenderMarketTradeLogRows(container, rows, summary = null) {
         container.replaceChildren();
         if (!rows.length) {
             const empty = document.createElement('div');
@@ -5458,6 +6027,8 @@
             container.appendChild(empty);
             return;
         }
+        const summaryBar = mooncakeCreateMarketTradeLogSummary(summary);
+        if (summaryBar) container.appendChild(summaryBar);
         const table = document.createElement('div');
         table.setAttribute('data-mooncake-market-trade-log-table', '1');
         const header = document.createElement('div');
@@ -5661,7 +6232,7 @@
             };
             result.innerHTML = `<div data-mooncake-order-archive-empty>${isZH ? '读取中...' : 'Loading...'}</div>`;
             const characterId = String(mooncakeCharacterId ?? '').trim();
-            const [{ rows, hasMore }, total] = await Promise.all([
+            const [{ rows, hasMore, summary }, total] = await Promise.all([
                 mooncakeReadMarketTradeLog(characterId, readFilters),
                 mooncakeCountMarketTradeLog(characterId)
             ]);
@@ -5674,7 +6245,7 @@
                     ? `本地 ${total} 条${hasMore ? `，显示前 ${shown} 条` : `，显示 ${shown} 条`}`
                     : `${total} local${hasMore ? `; first ${shown}` : `; showing ${shown}`}`)
                 : (isZH ? '等待角色数据' : 'Waiting for character data');
-            mooncakeRenderMarketTradeLogRows(result, rows);
+            mooncakeRenderMarketTradeLogRows(result, rows, summary);
             if (preserveScroll) {
                 result.scrollTop = scrollTop;
                 result.scrollLeft = scrollLeft;
@@ -7240,83 +7811,68 @@
     function mooncakeGetEnhancementRouteObjectiveLabel(objective) {
         const normalized = mooncakeNormalizeEnhancementRouteObjective(objective) || 'hourly';
         if (normalized === 'profit') return isZH ? '最高利润' : 'Highest profit';
-        if (normalized === 'balanced') return isZH ? '综合策略' : 'Balanced strategy';
+        if (normalized === 'standard') return isZH ? '标准工时' : 'Standard hourly';
         return isZH ? '最高工时' : 'Highest hourly';
     }
 
-    function mooncakeFormatRouteSelectionMetric(value, objective) {
-        if (!Number.isFinite(Number(value))) return '-';
-        const normalizedObjective = mooncakeNormalizeEnhancementRouteObjective(objective) || 'hourly';
-        const formatted = normalizedObjective === 'hourly'
-            ? mooncakeFormatSignedHourlyWage(value)
-            : `${Number(value) >= 0 ? '+' : ''}${formatMoney(Number(value))}`;
-        return normalizedObjective === 'hourly' ? `${formatted}/h` : formatted;
+    function mooncakeFormatEnhancementStandardHourly(value) {
+        const hourlyWage = Number(value);
+        return Number.isFinite(hourlyWage) && hourlyWage >= 0
+            ? `${formatMoney(hourlyWage)}/h`
+            : '-';
     }
 
-    function mooncakeBuildTraditionalProtectionThresholdExplanation(policy) {
-        if (!policy || policy.type !== 'balanced-traditional-protection-threshold') return '';
-        const appliedFewerProtection = policy.appliedFewerProtection === true || policy.appliedLowProtection === true;
-        const fewerProtectAt = Number(policy.fewerProtectionProtectAt ?? policy.lowerProtectAt);
-        const moreProtectAt = Number(policy.moreProtectionProtectAt ?? policy.higherProtectAt);
-        const formatProtectRoute = protectAt => Number.isFinite(protectAt)
-            ? (isZH ? `+${protectAt}保` : `+${protectAt}`)
-            : (isZH ? '该路线' : 'this route');
-        const matchedMetrics = (policy.matchedObjectives || [])
-            .map(objective => objective === 'profit'
-                ? (isZH ? '单件利润' : 'profit/item')
-                : (isZH ? '工时费' : 'hourly'));
-        if (appliedFewerProtection) {
+    function mooncakeFormatStandardHourlyRoute(route, options = {}) {
+        const routeLabel = mooncakeGetEnhancementRouteLabel(route);
+        const expectedProtects = Number(route?.expectedProtects);
+        if (!Number.isFinite(expectedProtects)) return routeLabel;
+        const expectedText = mooncakeFormatExpectedProtectQuantity(expectedProtects);
+        if (options.notUsed) {
             return isZH
-                ? `综合策略：${formatProtectRoute(fewerProtectAt)} 的${matchedMetrics.join('、') || '至少一项'}相对 ${formatProtectRoute(moreProtectAt)} 达到 25% 门槛，采用 ${formatProtectRoute(fewerProtectAt)}。`
-                : `Balanced: ${formatProtectRoute(fewerProtectAt)} met the 25% threshold against ${formatProtectRoute(moreProtectAt)} for ${matchedMetrics.join(', ') || 'one metric'}.`;
-        }
-        if (policy.fallbackReason === 'non-positive-baseline') {
-            return isZH
-                ? `综合策略：${formatProtectRoute(moreProtectAt)} 的比较基准非正，采用 ${formatProtectRoute(moreProtectAt)}。`
-                : `Balanced: ${formatProtectRoute(moreProtectAt)} has a non-positive comparison baseline, so it is used.`;
+                ? `${routeLabel}（预计 ${expectedText} 个，未采用）`
+                : `${routeLabel} (${expectedText}, not used)`;
         }
         return isZH
-            ? `综合策略：${formatProtectRoute(fewerProtectAt)} 未达到相对 ${formatProtectRoute(moreProtectAt)} 的 25% 门槛，采用 ${formatProtectRoute(moreProtectAt)}。`
-            : `Balanced: ${formatProtectRoute(fewerProtectAt)} did not clear the 25% threshold against ${formatProtectRoute(moreProtectAt)}, so ${formatProtectRoute(moreProtectAt)} is used.`;
+            ? `${routeLabel}（预计 ${expectedText} 个）`
+            : `${routeLabel} (${expectedText})`;
+    }
+
+    function mooncakeBuildStandardHourlyExplanation(policy) {
+        if (!policy || policy.type !== 'standard-hourly-equivalent-cost') return '';
+        const standardHourly = mooncakeFormatEnhancementStandardHourly(policy.standardHourlyWage);
+        const selectedRoute = policy.selectedRoute;
+        const alternateRoute = policy.alternateRoute;
+        const selectedLabel = mooncakeGetEnhancementRouteLabel(selectedRoute);
+        const alternateLabel = mooncakeGetEnhancementRouteLabel(alternateRoute);
+        const selectedEquivalentCost = Number(policy.selectedEquivalentCost);
+        const alternateEquivalentCost = Number(policy.alternateEquivalentCost);
+        if (alternateRoute && Number.isFinite(selectedEquivalentCost) && Number.isFinite(alternateEquivalentCost)) {
+            return isZH
+                ? `标准工时：按 ${standardHourly} 将预计耗时计入成本；${selectedLabel} 的等效总成本 ${formatMoney(selectedEquivalentCost)} 低于 ${alternateLabel} 的 ${formatMoney(alternateEquivalentCost)}，采用 ${selectedLabel}。成品卖价仅影响利润和工时费展示。`
+                : `Standard hourly: time is valued at ${standardHourly}; ${selectedLabel} has a lower equivalent cost (${formatMoney(selectedEquivalentCost)}) than ${alternateLabel} (${formatMoney(alternateEquivalentCost)}), so it is used. The final-item price only affects displayed profit and hourly wage.`;
+        }
+        return isZH
+            ? `标准工时：按 ${standardHourly} 将预计耗时计入成本，选择等效总成本最低的路线；成品卖价仅影响利润和工时费展示。`
+            : `Standard hourly: time is valued at ${standardHourly} and the lowest equivalent-cost route is used; the final-item price only affects displayed profit and hourly wage.`;
     }
 
     function mooncakeGetObjectiveRoutePairDisplayLabels(routePair) {
         const selectedObjectiveLabel = mooncakeGetEnhancementRouteObjectiveLabel(routePair?.selectedObjective);
         const alternateObjectiveLabel = mooncakeGetEnhancementRouteObjectiveLabel(routePair?.alternateObjective);
-        const policy = routePair?.protectionThreshold;
-        if (!policy || policy.type !== 'balanced-traditional-protection-threshold') {
+        const policy = routePair?.standardHourlyPolicy;
+        if (!policy || policy.type !== 'standard-hourly-equivalent-cost') {
             return { selectedObjectiveLabel, alternateObjectiveLabel, policyExplanation: '' };
         }
-        const selectedFewerProtection = policy.appliedFewerProtection === true || policy.appliedLowProtection === true;
-        const fewerProtectAt = Number(policy.fewerProtectionProtectAt ?? policy.lowerProtectAt);
-        const moreProtectAt = Number(policy.moreProtectionProtectAt ?? policy.higherProtectAt);
-        const fewerExpectedProtects = Number(
-            policy.fewerProtectionExpectedProtects ?? policy.fewerProtectionRoute?.expectedProtects
-        );
-        const moreExpectedProtects = Number(
-            policy.moreProtectionExpectedProtects ?? policy.moreProtectionRoute?.expectedProtects
-        );
-        const fewerExpectedText = Number.isFinite(fewerExpectedProtects)
-            ? mooncakeFormatExpectedProtectQuantity(fewerExpectedProtects)
-            : '-';
-        const moreExpectedText = Number.isFinite(moreExpectedProtects)
-            ? mooncakeFormatExpectedProtectQuantity(moreExpectedProtects)
-            : '-';
-        const selectedProtectAt = selectedFewerProtection ? fewerProtectAt : moreProtectAt;
-        const selectedExpectedText = selectedFewerProtection ? fewerExpectedText : moreExpectedText;
-        const alternateProtectAt = selectedFewerProtection ? moreProtectAt : fewerProtectAt;
-        const alternateExpectedText = selectedFewerProtection ? moreExpectedText : fewerExpectedText;
-        const formatProtectRoute = protectAt => Number.isFinite(protectAt)
-            ? (isZH ? `+${protectAt}保` : `+${protectAt}`)
-            : (isZH ? '该路线' : 'this route');
+        const standardHourly = mooncakeFormatEnhancementStandardHourly(policy.standardHourlyWage);
         return {
             selectedObjectiveLabel: isZH
-                ? `${selectedObjectiveLabel}（${formatProtectRoute(selectedProtectAt)}，预计 ${selectedExpectedText} 个）`
-                : `${selectedObjectiveLabel} (${formatProtectRoute(selectedProtectAt)}, ${selectedExpectedText})`,
-            alternateObjectiveLabel: selectedFewerProtection
-                ? (isZH ? `${formatProtectRoute(alternateProtectAt)}（预计 ${alternateExpectedText} 个）` : `${formatProtectRoute(alternateProtectAt)} (${alternateExpectedText})`)
-                : (isZH ? `${formatProtectRoute(alternateProtectAt)}（预计 ${alternateExpectedText} 个，未采用）` : `${formatProtectRoute(alternateProtectAt)} (${alternateExpectedText}, not used)`),
-            policyExplanation: mooncakeBuildTraditionalProtectionThresholdExplanation(policy)
+                ? `${selectedObjectiveLabel}（${standardHourly}，${mooncakeFormatStandardHourlyRoute(routePair.selected?.route || routePair.selected)}）`
+                : `${selectedObjectiveLabel} (${standardHourly}, ${mooncakeFormatStandardHourlyRoute(routePair.selected?.route || routePair.selected)})`,
+            alternateObjectiveLabel: mooncakeFormatStandardHourlyRoute(
+                routePair.alternate?.route || routePair.alternate,
+                { notUsed: true }
+            ),
+            policyExplanation: mooncakeBuildStandardHourlyExplanation(policy)
         };
     }
 
@@ -7378,14 +7934,11 @@
     function mooncakeBuildObjectiveRouteTooltipSection(routePair) {
         if (!routePair?.hasAlternative || !routePair.selected || !routePair.alternate) return '';
         const labels = mooncakeGetObjectiveRoutePairDisplayLabels(routePair);
-        const isBalancedProtectionPair = routePair?.protectionThreshold?.type === 'balanced-traditional-protection-threshold';
+        const isStandardHourlyPair = routePair?.standardHourlyPolicy?.type === 'standard-hourly-equivalent-cost';
         return `\n<div style="border-top:1px solid #444;margin:4px 0;"></div>`
             + `<div style="color:#ccc;font-weight:bold;margin-bottom:2px;">${isZH ? '路线选择' : 'Route selection'}</div>`
-            + mooncakeBuildObjectiveRouteTooltipEntry(routePair.selected, routePair.selectedObjective, 'selected', routePair.targetLevel, labels.selectedObjectiveLabel, isBalancedProtectionPair)
-            + mooncakeBuildObjectiveRouteTooltipEntry(routePair.alternate, routePair.alternateObjective, 'alternate', routePair.targetLevel, labels.alternateObjectiveLabel, isBalancedProtectionPair)
-            + (labels.policyExplanation
-                ? `<span class="tt-value" style="color:#f8d35e;">${labels.policyExplanation}</span>\n`
-                : '');
+            + mooncakeBuildObjectiveRouteTooltipEntry(routePair.selected, routePair.selectedObjective, 'selected', routePair.targetLevel, labels.selectedObjectiveLabel, isStandardHourlyPair)
+            + mooncakeBuildObjectiveRouteTooltipEntry(routePair.alternate, routePair.alternateObjective, 'alternate', routePair.targetLevel, labels.alternateObjectiveLabel, isStandardHourlyPair);
     }
 
     function mooncakeGetObjectiveRouteProtectSuffix(routePair, metrics) {
@@ -7531,8 +8084,7 @@
 
         let html = `<div class="tt-header">0→+${enhancementLevel} (${routeLabel})</div>`
             + (options.includeProfitPerItem === false ? '' : buildProfitPerItemTooltipLine(metrics, price))
-            + `<span class="tt-label">挂单价:</span> <span class="tt-value">${formatMoney(price)}</span>\n`
-            + `<span class="tt-label">税后:</span> <span class="tt-value">${formatMoney(afterTax)}</span>\n`
+            + `<span class="tt-label">${isZH ? '挂单价/税后' : 'List/after tax'}:</span> <span class="tt-value">${formatMoney(price)} / ${formatMoney(afterTax)}</span>\n`
             + (isMirrorRoute
                 ? mooncakeBuildMirrorRouteTooltipSection(options.itemHrid, metrics)
                 : `<span class="tt-label">${routeBaseItemCostLabel}:</span> <span class="tt-value">${formatMoney(metrics.baseItemCost ?? metrics.baseItemPrice)}</span>\n`
@@ -7541,8 +8093,7 @@
                     + (isRefinementCarryoverRoute
                         ? `<span class="tt-label">${isZH ? '精炼费用' : 'Refinement cost'}:</span> <span class="tt-value">${formatMoney(refinementRouteCost)}</span>\n`
                         : '')
-                     + `<span class="tt-label">保护成本:</span> <span class="tt-value">${formatMoney(metrics.protectCost)}</span>\n`
-                     + `<span class="tt-label">保护数量:</span> <span class="tt-value">${mooncakeFormatExpectedProtectQuantity(metrics.expectedProtects)}</span>\n`)
+                     + `<span class="tt-label">${isZH ? '保护成本/数量' : 'Protect cost/count'}:</span> <span class="tt-value">${formatMoney(metrics.protectCost)} / ${mooncakeFormatExpectedProtectQuantity(metrics.expectedProtects)}</span>\n`)
             + `<span class="tt-label">总成本:</span> <span class="tt-value">${formatMoney(metrics.totalCost)}</span>\n`
             + mooncakeBuildEnhancementSpendPerHourTooltipLine(metrics)
             + `<span class="tt-label">工时费/h:</span> <span ${hourlyWageValueAttrs}>${mooncakeFormatHourlyWage(hourlyCost)}${tradeOffSuffix}</span>\n`
@@ -11220,7 +11771,9 @@
 
     // Hook WebSocket消息获取数据
     const _BLT_HOOKED = Symbol('_blt_hooked');
+    const _MOONCAKE_MARKET_TRADE_SEND_HOOKED = Symbol('_mooncake_market_trade_send_hooked');
     let mooncakeWebSocketHookInstalled = false;
+    let mooncakeMarketTradeSendHookInstalled = false;
     const BLT_WS_MESSAGE_TYPES = new Set([
         'init_character_data',
         'init_client_data',
@@ -11348,6 +11901,9 @@
             mooncakeCaptureOwnListingAnchors(obj.myMarketListings);
             mooncakeUpdateListingFundsListings(obj.myMarketListings, { replace: true });
             mooncakeScheduleMarketTradeLogCapture([obj.myMarketListings], 'snapshot');
+            mooncakePendingInstantMarketTrades = mooncakePendingInstantMarketTrades.filter(pending =>
+                pending?.characterId === String(mooncakeCharacterId ?? '').trim()
+            );
             mooncakeScheduleCharacterStateSync(120);
             return true;
         }
@@ -11356,6 +11912,8 @@
             mooncakeUpdateListingFundsListings(obj.endMarketListings);
             mooncakeRecordMarketPersonalTradeHistory(obj.marketListings, obj.endMarketListings);
             mooncakeScheduleMarketTradeLogCapture([obj.marketListings, obj.endMarketListings], 'incremental');
+            // Let the ordinary cumulative-fill recorder claim a terminal order first.
+            mooncakeResolvePendingInstantMarketTrades(obj.endCharacterItems, obj.endMarketListings);
             return true;
         }
         if (obj.type === 'actions_updated' && Array.isArray(obj.endCharacterActions)) {
@@ -11374,6 +11932,7 @@
             const itemUpdates = mooncakeCollectionValues(obj.endCharacterItems)
                 .filter(item => item?.itemLocationHrid);
             if (!itemUpdates.length) return false;
+            mooncakeResolvePendingInstantMarketTrades(obj.endCharacterItems, null);
             mooncakeApplyCharacterData({
                 characterItems: mooncakeMergeCharacterItems(itemUpdates)
             }, 'websocket-update');
@@ -11430,7 +11989,40 @@
         return false;
     }
 
+    function mooncakeObserveOutgoingMarketTradeMessage(message) {
+        if (typeof message !== 'string' || !message.includes('post_market_order')) return;
+        try {
+            const payload = JSON.parse(message);
+            mooncakeTrackInstantMarketTradeRequest(payload);
+        } catch (_) {
+            // Sending a game request must never be delayed or blocked by the
+            // optional local trade recorder.
+        }
+    }
+
+    function mooncakeInstallMarketTradeSendHook() {
+        if (mooncakeMarketTradeSendHookInstalled || typeof WebSocket === 'undefined') return;
+        try {
+            const originalSend = WebSocket.prototype.send;
+            if (typeof originalSend !== 'function') return;
+            if (originalSend[_MOONCAKE_MARKET_TRADE_SEND_HOOKED]) {
+                mooncakeMarketTradeSendHookInstalled = true;
+                return;
+            }
+            function hookedSend(message) {
+                mooncakeObserveOutgoingMarketTradeMessage(message);
+                return originalSend.apply(this, arguments);
+            }
+            Object.defineProperty(hookedSend, _MOONCAKE_MARKET_TRADE_SEND_HOOKED, { value: true });
+            WebSocket.prototype.send = hookedSend;
+            mooncakeMarketTradeSendHookInstalled = true;
+        } catch (error) {
+            console.warn('[MoonCake] 无法监听即时市场成交:', error);
+        }
+    }
+
     function hookWebSocket() {
+        mooncakeInstallMarketTradeSendHook();
         if (mooncakeWebSocketHookInstalled) return;
 
         try {
@@ -13196,9 +13788,6 @@
         return { itemHrid, targetLevel: target, selectedPrice, highestHourly, adjacent, comparison };
     }
 
-    // A larger protectAt starts protection later, so it consumes fewer
-    // protections and carries more downgrade/reset risk.
-    const MOONCAKE_LOW_PROTECTION_ADVANTAGE_RATIO = 0.25;
     const MOONCAKE_ROUTE_SELECTION_EPSILON = 1e-8;
 
     function mooncakeIsTraditionalProtectionRoute(route) {
@@ -13206,21 +13795,39 @@
             Number.isInteger(Number(route?.protectAt));
     }
 
-    function mooncakeGetRouteSelectionProfit(route, price) {
+    function mooncakeGetRouteEquivalentCost(route, standardHourlyWage = null) {
         const totalCost = Number(route?.totalCost);
-        const netRevenue = Number(price) * MOONCAKE_MARKET_SELL_NET_FACTOR;
-        return Number.isFinite(totalCost) && Number.isFinite(netRevenue)
-            ? netRevenue - totalCost
-            : null;
+        const totalTimeHours = Number(route?.totalTimeHours);
+        const configuredHourlyWage = Number.isFinite(Number(standardHourlyWage))
+            ? Number(standardHourlyWage)
+            : mooncakeGetEnhancementStandardHourlyWage();
+        if (!Number.isFinite(totalCost) || !Number.isFinite(totalTimeHours) || totalTimeHours < 0) return null;
+        return totalCost + Math.max(0, configuredHourlyWage) * totalTimeHours;
     }
 
-    function mooncakeGetRouteSelectionMetric(route, objective, price) {
-        const normalizedObjective = mooncakeNormalizeEnhancementRouteObjective(objective) || 'hourly';
-        const profit = mooncakeGetRouteSelectionProfit(route, price);
-        if (!Number.isFinite(profit)) return null;
-        if (normalizedObjective === 'profit') return profit;
-        const totalTimeHours = Number(route?.totalTimeHours);
-        return totalTimeHours > 0 ? profit / totalTimeHours : null;
+    function mooncakeCompareStandardHourlyRoutes(left, right, standardHourlyWage) {
+        const leftEquivalentCost = mooncakeGetRouteEquivalentCost(left, standardHourlyWage);
+        const rightEquivalentCost = mooncakeGetRouteEquivalentCost(right, standardHourlyWage);
+        if (leftEquivalentCost < rightEquivalentCost - MOONCAKE_ROUTE_SELECTION_EPSILON) return -1;
+        if (leftEquivalentCost > rightEquivalentCost + MOONCAKE_ROUTE_SELECTION_EPSILON) return 1;
+
+        // When time-adjusted costs are equal, prefer the route that starts
+        // protection earlier. That keeps a numerical tie from adding risk.
+        const leftProtectAt = Number(left?.protectAt);
+        const rightProtectAt = Number(right?.protectAt);
+        if (Number.isInteger(leftProtectAt) && Number.isInteger(rightProtectAt) && leftProtectAt !== rightProtectAt) {
+            return leftProtectAt - rightProtectAt;
+        }
+
+        const leftCost = Number(left?.totalCost);
+        const rightCost = Number(right?.totalCost);
+        if (leftCost < rightCost - MOONCAKE_ROUTE_SELECTION_EPSILON) return -1;
+        if (leftCost > rightCost + MOONCAKE_ROUTE_SELECTION_EPSILON) return 1;
+        const leftTime = Number(left?.totalTimeHours);
+        const rightTime = Number(right?.totalTimeHours);
+        if (leftTime < rightTime - MOONCAKE_ROUTE_SELECTION_EPSILON) return -1;
+        if (leftTime > rightTime + MOONCAKE_ROUTE_SELECTION_EPSILON) return 1;
+        return 0;
     }
 
     function mooncakePickLowestCostTraditionalRoute(candidates) {
@@ -13257,131 +13864,38 @@
         }, null);
     }
 
-    function mooncakeMeetsLowProtectionAdvantageThreshold(fewerProtectionMetric, moreProtectionMetric) {
-        // A percentage uplift is meaningful only from a positive
-        // more-protection baseline. Zero/negative baselines keep the safer
-        // route instead of treating an undefined ratio as an automatic win.
-        if (!(Number(moreProtectionMetric) > 0) || !Number.isFinite(Number(fewerProtectionMetric))) return false;
-        const requiredMetric = Number(moreProtectionMetric) * (1 + MOONCAKE_LOW_PROTECTION_ADVANTAGE_RATIO);
-        const tolerance = Math.max(
-            MOONCAKE_ROUTE_SELECTION_EPSILON,
-            Math.abs(requiredMetric) * 1e-10
-        );
-        return Number(fewerProtectionMetric) + tolerance >= requiredMetric;
-    }
+    function mooncakeSelectStandardHourlyRoute(candidates, options = {}) {
+        const standardHourlyWage = Number.isFinite(Number(options.standardHourlyWage))
+            ? Math.max(0, Number(options.standardHourlyWage))
+            : mooncakeGetEnhancementStandardHourlyWage();
+        const ranked = (candidates || [])
+            .filter(route => Number.isFinite(Number(route?.totalCost)) &&
+                Number.isFinite(Number(route?.totalTimeHours)) && Number(route.totalTimeHours) >= 0)
+            .map(route => ({
+                route,
+                equivalentCost: mooncakeGetRouteEquivalentCost(route, standardHourlyWage)
+            }))
+            .filter(entry => Number.isFinite(entry.equivalentCost))
+            .sort((left, right) => mooncakeCompareStandardHourlyRoutes(
+                left.route,
+                right.route,
+                standardHourlyWage
+            ));
+        if (!ranked.length) return null;
 
-    function mooncakeBuildBalancedProtectionMetricComparison(fewerProtectionRoute, moreProtectionRoute, objective, price) {
-        const normalizedObjective = objective === 'profit' ? 'profit' : 'hourly';
-        const fewerProtectionMetric = mooncakeGetRouteSelectionMetric(
-            fewerProtectionRoute,
-            normalizedObjective,
-            price
-        );
-        const moreProtectionMetric = mooncakeGetRouteSelectionMetric(
-            moreProtectionRoute,
-            normalizedObjective,
-            price
-        );
-        const moreProtectionBaselinePositive = Number(moreProtectionMetric) > 0;
+        const selected = ranked[0];
+        const alternate = ranked.find(entry => entry.route !== selected.route) || null;
         return {
-            objective: normalizedObjective,
-            fewerProtectionMetric,
-            moreProtectionMetric,
-            requiredMetric: moreProtectionBaselinePositive
-                ? Number(moreProtectionMetric) * (1 + MOONCAKE_LOW_PROTECTION_ADVANTAGE_RATIO)
-                : null,
-            meetsThreshold: mooncakeMeetsLowProtectionAdvantageThreshold(
-                fewerProtectionMetric,
-                moreProtectionMetric
-            )
-        };
-    }
-
-    // "综合策略" is intentionally a third strategy. The two public winners
-    // remain pure: highest hourly and highest profit are never rewritten by a
-    // protection preference. Only this helper compares those two winners.
-    function mooncakeSelectBalancedTraditionalRoute(highestHourly, highestProfit, price) {
-        const fallbackRoute = highestHourly || highestProfit || null;
-        if (!mooncakeIsTraditionalProtectionRoute(highestHourly) ||
-            !mooncakeIsTraditionalProtectionRoute(highestProfit)) {
-            return fallbackRoute;
-        }
-
-        const hourlyProtectAt = Number(highestHourly.protectAt);
-        const profitProtectAt = Number(highestProfit.protectAt);
-        if (hourlyProtectAt === profitProtectAt || !(Number(price) > 0)) return fallbackRoute;
-
-        // A larger protectAt begins protection later: it consumes fewer
-        // protections, but accepts more downgrade/reset risk. Compare the two
-        // routes in both user-visible metrics. Fewer protections is adopted
-        // when *either* profit/item or hourly wage clears the 25% uplift.
-        const fewerProtectionIsHourlyWinner = hourlyProtectAt > profitProtectAt;
-        const fewerProtectionRoute = fewerProtectionIsHourlyWinner ? highestHourly : highestProfit;
-        const moreProtectionRoute = fewerProtectionIsHourlyWinner ? highestProfit : highestHourly;
-        const fewerProtectionObjective = fewerProtectionIsHourlyWinner ? 'hourly' : 'profit';
-        const moreProtectionObjective = fewerProtectionIsHourlyWinner ? 'profit' : 'hourly';
-        const metricComparisons = {
-            profit: mooncakeBuildBalancedProtectionMetricComparison(
-                fewerProtectionRoute,
-                moreProtectionRoute,
-                'profit',
-                price
-            ),
-            hourly: mooncakeBuildBalancedProtectionMetricComparison(
-                fewerProtectionRoute,
-                moreProtectionRoute,
-                'hourly',
-                price
-            )
-        };
-        const matchedObjectives = Object.values(metricComparisons)
-            .filter(comparison => comparison.meetsThreshold)
-            .map(comparison => comparison.objective);
-        const useFewerProtection = matchedObjectives.length > 0;
-        const hasPositiveBaseline = Object.values(metricComparisons)
-            .some(comparison => Number(comparison.moreProtectionMetric) > 0);
-        const selectedRoute = useFewerProtection ? fewerProtectionRoute : moreProtectionRoute;
-        const rejectedRoute = useFewerProtection ? moreProtectionRoute : fewerProtectionRoute;
-        const selectedObjective = useFewerProtection
-            ? fewerProtectionObjective
-            : moreProtectionObjective;
-        const alternateObjective = useFewerProtection
-            ? moreProtectionObjective
-            : fewerProtectionObjective;
-
-        return {
-            ...selectedRoute,
+            ...selected.route,
             routeSelectionPolicy: {
-                type: 'balanced-traditional-protection-threshold',
-                requestedObjective: 'balanced',
-                selectedObjective,
-                alternateObjective,
-                appliedFewerProtection: useFewerProtection,
-                // Retained for consumers that cached the older policy shape.
-                appliedLowProtection: useFewerProtection,
-                fallbackReason: useFewerProtection
-                    ? null
-                    : (hasPositiveBaseline ? 'below-threshold' : 'non-positive-baseline'),
-                thresholdRatio: MOONCAKE_LOW_PROTECTION_ADVANTAGE_RATIO,
-                fewerProtectionProtectAt: Number(fewerProtectionRoute.protectAt),
-                moreProtectionProtectAt: Number(moreProtectionRoute.protectAt),
-                fewerProtectionExpectedProtects: Number(fewerProtectionRoute.expectedProtects),
-                moreProtectionExpectedProtects: Number(moreProtectionRoute.expectedProtects),
-                fewerProtectionObjective,
-                moreProtectionObjective,
-                metricComparisons,
-                matchedObjectives,
-                fewerProtectionRoute,
-                moreProtectionRoute,
-                // Compatibility aliases for any in-memory route objects from
-                // the previous policy shape. New UI uses the explicit names.
-                lowerProtectAt: Number(fewerProtectionRoute.protectAt),
-                higherProtectAt: Number(moreProtectionRoute.protectAt),
-                lowerProtectionObjective: fewerProtectionObjective,
-                higherProtectionObjective: moreProtectionObjective,
-                lowerProtectionRoute: fewerProtectionRoute,
-                higherProtectionRoute: moreProtectionRoute,
-                rejectedRoute
+                type: 'standard-hourly-equivalent-cost',
+                requestedObjective: 'standard',
+                standardHourlyWage,
+                standardHourlyM: standardHourlyWage / 1e6,
+                selectedEquivalentCost: selected.equivalentCost,
+                alternateEquivalentCost: alternate?.equivalentCost ?? null,
+                selectedRoute: selected.route,
+                alternateRoute: alternate?.route || null
             }
         };
     }
@@ -13394,6 +13908,9 @@
         if (!valid.length) return null;
 
         const selectionMode = mooncakeGetEnhancementRouteSelectionMode(objective);
+        if (selectionMode === 'standard') {
+            return mooncakeSelectStandardHourlyRoute(valid, options);
+        }
         const highestProfit = mooncakePickLowestCostTraditionalRoute(valid);
         if (selectionMode === 'minCost' || !hasHourlySignal) return highestProfit;
 
@@ -13402,10 +13919,7 @@
             ? mooncakePickHighestHourlyTraditionalRoute(hourlyCandidates)
             : null;
         if (!highestHourly) return highestProfit;
-        if (selectionMode !== 'balanced' || options?.applyProtectionThreshold === false) {
-            return highestHourly;
-        }
-        return mooncakeSelectBalancedTraditionalRoute(highestHourly, highestProfit, options?.price);
+        return highestHourly;
     }
 
     // 找到最佳保护等级
@@ -13497,6 +14011,7 @@
             Number(targetLeftPrice) > 0,
             {
                 price: targetLeftPrice,
+                standardHourlyWage: options?.standardHourlyWage,
                 applyProtectionThreshold: options?.applyProtectionThreshold !== false
             }
         );
@@ -14015,7 +14530,16 @@
         return route;
     }
 
-    function mooncakeBuildMirrorRouteForObjective(template, price, objective) {
+    function mooncakeBuildMirrorRouteForObjective(template, price, objective, options = {}) {
+        if (objective === 'standard') {
+            const standardHourlyWage = Number.isFinite(Number(options.standardHourlyWage))
+                ? Math.max(0, Number(options.standardHourlyWage))
+                : mooncakeGetEnhancementStandardHourlyWage();
+            return mooncakeAggregateMirrorRoute(
+                template,
+                mooncakePickMirrorComponentPlans(template, standardHourlyWage)
+            );
+        }
         if (objective === 'minCost' || !(price > 0)) {
             return mooncakeAggregateMirrorRoute(template, mooncakePickMirrorComponentPlans(template, 0));
         }
@@ -14094,6 +14618,7 @@
         const selectionMode = mooncakeGetEnhancementRouteSelectionMode(objective);
         let minCostRoute = null;
         let highestHourlyRoute = null;
+        let standardHourlyRoute = null;
 
         const selectMinCost = () => {
             if (minCostRoute) return minCostRoute;
@@ -14125,19 +14650,30 @@
             return highestHourlyRoute;
         };
 
+        const selectStandardHourly = () => {
+            if (standardHourlyRoute) return standardHourlyRoute;
+            const standardHourlyWage = Number.isFinite(Number(options.standardHourlyWage))
+                ? Math.max(0, Number(options.standardHourlyWage))
+                : mooncakeGetEnhancementStandardHourlyWage();
+            const standardRoutes = [...candidates.traditionalRoutes];
+            for (const template of candidates.mirrorTemplates || []) {
+                const route = mooncakeBuildMirrorRouteForObjective(template, price, 'standard', {
+                    standardHourlyWage
+                });
+                if (route) standardRoutes.push(route);
+            }
+            standardHourlyRoute = mooncakeSelectStandardHourlyRoute(standardRoutes, {
+                standardHourlyWage
+            });
+            return standardHourlyRoute;
+        };
+
+        if (selectionMode === 'standard') return selectStandardHourly() || selectMinCost();
         const highestProfit = selectMinCost();
         const highestHourly = selectHighestHourly() || highestProfit;
-        // Highest profit and highest hourly are deliberately pure objectives.
-        // Do not apply the low-protection rule to either of them.
+        // Highest profit and highest hourly remain pure objectives.
         if (selectionMode === 'minCost') return highestProfit;
-        if (selectionMode !== 'balanced' || options?.applyProtectionThreshold === false) {
-            return highestHourly;
-        }
-
-        // Generic candidates may include mirror/refinement flows. A protectAt
-        // comparison is only meaningful when both raw winners are direct
-        // traditional routes; otherwise balanced falls back to highest hourly.
-        return mooncakeSelectBalancedTraditionalRoute(highestHourly, highestProfit, price);
+        return highestHourly;
     }
 
     function mooncakeBuildLegacyTraditionalRoute(itemHrid, targetLevel, marketData, price, options = {}) {
@@ -14199,8 +14735,9 @@
 
     function mooncakeGetEnhancementRoute(itemHrid, targetLevel, marketData, price, objective = null, options = {}) {
         const target = Number(targetLevel);
-        if (!Number.isInteger(target) || target <= 0 || !(Number(price) > 0)) return null;
+        if (!Number.isInteger(target) || target <= 0) return null;
         const selectionMode = mooncakeGetEnhancementRouteSelectionMode(objective);
+        if (!(Number(price) > 0) && selectionMode !== 'standard') return null;
         const routeOptions = options && typeof options === 'object' ? options : {};
         // 普通装备低于 +13 使用传统路线；精炼装备仍需比较“先强化后精炼”的配方。
         if (target < MOONCAKE_MIRROR_OUTPUT_MIN_LEVEL && !String(itemHrid || '').endsWith('_refined')) {
@@ -14318,27 +14855,27 @@
         const sourceMarketData = marketData || getMarketData();
         const characterKey = `${mooncakeCharacterCalcSignature || 'live'}:${JSON.stringify(getPlayerEnhanceParams())}`;
         const canUseCache = sourceMarketData?.marketData === marketDataCache;
-        const cacheKey = `${mooncakeMarketPricingRevision}|${characterKey}|${itemHrid}|${target}|${selectedPrice}`;
+        const standardHourlyWage = mooncakeGetEnhancementStandardHourlyWage();
+        const cacheKey = `${mooncakeMarketPricingRevision}|${characterKey}|${itemHrid}|${target}|${selectedPrice}|${standardHourlyWage}`;
         let routes = canUseCache ? mooncakeEnhancementRoutePairCache.get(cacheKey) : null;
 
         if (!routes) {
-            // Keep the unguarded objective winners here. The displayed route
-            // may later fall back to the safer route under the 25% rule, but
-            // the comparison still needs the actual rejected proposal.
             const highestHourly = mooncakeBuildEnhancementRouteObjectiveEntry(
-                mooncakeGetEnhancementRoute(itemHrid, target, sourceMarketData, selectedPrice, 'hourly', {
-                    applyProtectionThreshold: false
-                }),
+                mooncakeGetEnhancementRoute(itemHrid, target, sourceMarketData, selectedPrice, 'hourly'),
                 selectedPrice
             );
             const highestProfit = mooncakeBuildEnhancementRouteObjectiveEntry(
-                mooncakeGetEnhancementRoute(itemHrid, target, sourceMarketData, selectedPrice, 'profit', {
-                    applyProtectionThreshold: false
+                mooncakeGetEnhancementRoute(itemHrid, target, sourceMarketData, selectedPrice, 'profit'),
+                selectedPrice
+            );
+            const standardHourly = mooncakeBuildEnhancementRouteObjectiveEntry(
+                mooncakeGetEnhancementRoute(itemHrid, target, sourceMarketData, selectedPrice, 'standard', {
+                    standardHourlyWage
                 }),
                 selectedPrice
             );
-            if (!highestHourly && !highestProfit) return null;
-            routes = { highestHourly, highestProfit };
+            if (!highestHourly && !highestProfit && !standardHourly) return null;
+            routes = { highestHourly, highestProfit, standardHourly };
             if (canUseCache) {
                 mooncakeSetBoundedMapEntry(
                     mooncakeEnhancementRoutePairCache,
@@ -14352,40 +14889,38 @@
             mooncakeEnhancementRoutePairCache.set(cacheKey, routes);
         }
 
-        // The cached entries are always the two unmodified public winners.
-        // Balanced starts from highest hourly and may carry its own policy
-        // below; it never mutates either cached pure objective.
-        const rawSelected = selectedObjective === 'profit' ? routes.highestProfit : routes.highestHourly;
-        const selected = mooncakeBuildEnhancementRouteObjectiveEntry(selectedRoute, selectedPrice) ||
+        const rawSelected = selectedObjective === 'profit'
+            ? routes.highestProfit
+            : (selectedObjective === 'standard' ? routes.standardHourly : routes.highestHourly);
+        let selected = mooncakeBuildEnhancementRouteObjectiveEntry(selectedRoute, selectedPrice) ||
             mooncakeBuildEnhancementRouteObjectiveEntry(
                 mooncakeGetEnhancementRoute(itemHrid, target, sourceMarketData, selectedPrice, selectedObjective),
                 selectedPrice
             ) || rawSelected;
         let alternateObjective = selectedObjective === 'profit' ? 'hourly' : 'profit';
         let expectedAlternate = selectedObjective === 'profit' ? routes.highestHourly : routes.highestProfit;
-        const protectionThreshold = selected?.routeSelectionPolicy?.type === 'balanced-traditional-protection-threshold'
+        const standardHourlyPolicy = selected?.routeSelectionPolicy?.type === 'standard-hourly-equivalent-cost'
             ? selected.routeSelectionPolicy
             : null;
-        if (protectionThreshold) {
-            const fewerProtectionEntry = mooncakeBuildEnhancementRouteObjectiveEntry(
-                protectionThreshold.fewerProtectionRoute || protectionThreshold.lowerProtectionRoute,
-                selectedPrice
+        if (standardHourlyPolicy) {
+            const policyHourlyWage = Number.isFinite(Number(standardHourlyPolicy.standardHourlyWage))
+                ? Number(standardHourlyPolicy.standardHourlyWage)
+                : standardHourlyWage;
+            const withEquivalentCost = entry => entry
+                ? {
+                    ...entry,
+                    standardHourlyWage: policyHourlyWage,
+                    equivalentCost: mooncakeGetRouteEquivalentCost(entry, policyHourlyWage)
+                }
+                : null;
+            selected = withEquivalentCost(selected);
+            expectedAlternate = withEquivalentCost(
+                mooncakeBuildEnhancementRouteObjectiveEntry(
+                    standardHourlyPolicy.alternateRoute,
+                    selectedPrice
+                )
             );
-            const moreProtectionEntry = mooncakeBuildEnhancementRouteObjectiveEntry(
-                protectionThreshold.moreProtectionRoute || protectionThreshold.higherProtectionRoute,
-                selectedPrice
-            );
-            const selectedFewerProtection = protectionThreshold.appliedFewerProtection === true ||
-                protectionThreshold.appliedLowProtection === true;
-            const policyAlternate = selectedFewerProtection
-                ? moreProtectionEntry
-                : fewerProtectionEntry;
-            if (policyAlternate) {
-                expectedAlternate = policyAlternate;
-                alternateObjective = selectedFewerProtection
-                    ? (protectionThreshold.moreProtectionObjective || protectionThreshold.higherProtectionObjective || 'hourly')
-                    : (protectionThreshold.fewerProtectionObjective || protectionThreshold.lowerProtectionObjective || 'profit');
-            }
+            alternateObjective = 'standard';
         }
         const selectedSignature = mooncakeGetEnhancementRouteSignature(selected);
         const alternateSignature = mooncakeGetEnhancementRouteSignature(expectedAlternate);
@@ -14397,9 +14932,10 @@
             alternateObjective,
             selected,
             alternate: hasAlternative ? expectedAlternate : null,
-            protectionThreshold,
+            standardHourlyPolicy,
             highestHourly: routes.highestHourly,
             highestProfit: routes.highestProfit,
+            standardHourly: routes.standardHourly,
             hasAlternative
         };
     }
@@ -14490,9 +15026,8 @@
     }
 
     // The recommendation resolver is shared by the route notice and the
-    // high-value normal-enhancement guard. If a target has no live quote, use
-    // the minimum-cost route only as a conservative fallback instead of
-    // pretending that no recommendation exists.
+    // high-value normal-enhancement guard. Standard hourly can still select a
+    // route without a target-item quote because that quote is display-only.
     function mooncakeResolveCurrentEnhancementRoute(itemHrid, targetLevel, marketData = null) {
         const normalizedItemHrid = mooncakeNormalizeEnhanceItemHrid(itemHrid) || itemHrid;
         const target = Math.max(1, Math.min(20, Math.floor(Number(targetLevel) || 0)));
@@ -14500,16 +15035,17 @@
 
         const sourceMarketData = marketData || getMarketData();
         const price = mooncakeGetEnhancementRouteMarketPrice(normalizedItemHrid, target, sourceMarketData);
+        const objective = getEnhancementRouteObjective();
         let route = null;
         let fallback = false;
         try {
-            if (price > 0) {
+            if (price > 0 || objective === 'standard') {
                 route = mooncakeGetEnhancementRoute(
                     normalizedItemHrid,
                     target,
                     sourceMarketData,
                     price,
-                    getEnhancementRouteObjective()
+                    objective
                 );
             }
             if (!route) {
@@ -14518,7 +15054,11 @@
                     target,
                     sourceMarketData
                 );
-                route = mooncakeSelectEnhancementRoute(candidates, 0, 'profit');
+                route = mooncakeSelectEnhancementRoute(
+                    candidates,
+                    0,
+                    objective === 'standard' ? 'standard' : 'profit'
+                );
                 fallback = !!route;
             }
         } catch (_) {
@@ -16574,6 +17114,17 @@
         return {
             route,
             label: mooncakeGetEnhancementRiskEntryLabel(entry),
+            totalCost: mooncakeFirstFiniteRiskValue(entry.totalCost, route.totalCost),
+            equivalentCost: mooncakeFirstFiniteRiskValue(
+                entry.equivalentCost,
+                route.equivalentCost,
+                route.routeSelectionPolicy?.selectedEquivalentCost
+            ),
+            standardHourlyWage: mooncakeFirstFiniteRiskValue(
+                entry.standardHourlyWage,
+                route.standardHourlyWage,
+                route.routeSelectionPolicy?.standardHourlyWage
+            ),
             hourlyWage: mooncakeFirstFiniteRiskValue(entry.hourlyWage, route.hourlyWage),
             profit: mooncakeFirstFiniteRiskValue(entry.profit),
             profitMargin: mooncakeFirstFiniteRiskValue(entry.profitMargin, entry.profitRate),
@@ -16594,6 +17145,10 @@
         const metrics = mooncakeGetEnhancementRiskEntryMetrics(itemHrid, entry);
         if (!metrics) return '';
         const rows = [
+            ...(metrics.equivalentCost === null ? [] : [
+                [isZH ? '等效总成本' : 'Equivalent cost', formatNumberWithStyle(metrics.equivalentCost)],
+                [isZH ? '总成本' : 'Total cost', metrics.totalCost === null ? '-' : formatNumberWithStyle(metrics.totalCost)]
+            ]),
             [isZH ? '工时费' : 'Hourly wage', metrics.hourlyWage === null ? '-' : mooncakeFormatHourlyWageWithStyle(metrics.hourlyWage)],
             [isZH ? '利润' : 'Profit', metrics.profit === null ? '-' : formatNumberWithStyle(metrics.profit)],
             [isZH ? '利润率' : 'Margin', mooncakeFormatEnhancementRiskPercent(metrics.profitMargin)],
@@ -16636,6 +17191,8 @@
         const alternateProfit = Number(routePair.alternate.profit);
         const selectedHourly = Number(routePair.selected.hourlyWage);
         const alternateHourly = Number(routePair.alternate.hourlyWage);
+        const selectedEquivalentCost = Number(routePair.selected.equivalentCost);
+        const alternateEquivalentCost = Number(routePair.alternate.equivalentCost);
         const signedMoney = value => Number.isFinite(value)
             ? `${value >= 0 ? '+' : ''}${formatMoney(value)}`
             : '-';
@@ -16643,6 +17200,9 @@
             ? mooncakeFormatSignedHourlyWage(value)
             : '-';
         const deltas = [];
+        if (Number.isFinite(selectedEquivalentCost) && Number.isFinite(alternateEquivalentCost)) {
+            deltas.push(`${isZH ? '等效总成本' : 'Equivalent cost'} ${signedMoney(alternateEquivalentCost - selectedEquivalentCost)}`);
+        }
         if (Number.isFinite(selectedProfit) && Number.isFinite(alternateProfit)) {
             deltas.push(`${isZH ? '单件利润' : 'Profit/item'} ${signedMoney(alternateProfit - selectedProfit)}`);
         }
@@ -16878,7 +17438,8 @@
 
     const MOONCAKE_MARKET_LEVEL_JUMPS = [0, 5, 7, 10, 12];
     const MOONCAKE_MARKET_CHARM_LEVEL_JUMPS = [0, 3, 5, 7, 10];
-    // Layout only: additional level buttons wrap onto a new row.
+    // Additional level buttons wrap into later rows. The category controls
+    // stay aligned with the first row so native listing actions remain clear.
     const MOONCAKE_MARKET_LEVEL_BUTTONS_PER_ROW = 10;
     const MOONCAKE_LEVEL_BAR_ID = 'MooncakeMarketEnhLevelJumpBar';
     const MOONCAKE_RECIPE_BAR_ID = 'MooncakeMarketRecipeJumpBar';
@@ -28247,7 +28808,7 @@
                 display: 'flex',
                 flexDirection: 'row',
                 gap: '4px',
-                alignItems: 'center',
+                alignItems: 'flex-start',
                 zIndex: '8',
                 transform: 'translateX(calc(-100% - 6px))',
                 pointerEvents: 'auto'
@@ -28255,6 +28816,7 @@
 
             const stockControls = mooncakeCreateMarketStockNavigationControls(currentItem, itemHrid);
             if (stockControls) {
+                stockControls.style.alignSelf = 'flex-start';
                 bar.appendChild(stockControls);
             }
 
@@ -31057,6 +31619,9 @@
         const baseItemCost = Number(startResolution?.price) || 0;
         if (!(baseItemCost > 0)) return null;
         const selectionMode = mooncakeGetEnhancementRouteSelectionMode();
+        const standardHourlyWage = selectionMode === 'standard'
+            ? mooncakeGetEnhancementStandardHourlyWage()
+            : null;
         const characterKey = mooncakeCharacterCalcSignature || JSON.stringify(getPlayerEnhanceParams());
         const simulationCharacterKey = `${characterKey}|total=${getEnhancelateTotalSkillLevel()}`;
         return {
@@ -31067,9 +31632,11 @@
             startResolution,
             baseItemCost,
             selectionMode,
+            standardHourlyWage,
             simulationCharacterKey,
             dependencySignature: JSON.stringify([
                 selectionMode,
+                standardHourlyWage,
                 simulationCharacterKey,
                 itemHrid,
                 start,
@@ -31105,6 +31672,7 @@
             protectionPrice,
             baseItemCost,
             selectionMode,
+            standardHourlyWage,
             simulationCharacterKey
         } = pricingContext;
         const overriddenTargetPrice = Number(targetPriceOverride) || 0;
@@ -31157,7 +31725,7 @@
                 totalCost,
                 targetPrice,
                 hourlyWage,
-                priceMode: targetPrice > 0 ? selectionMode : 'minCost'
+                priceMode: targetPrice > 0 || selectionMode === 'standard' ? selectionMode : 'minCost'
             };
             recommendations.push(candidate);
         }
@@ -31165,7 +31733,7 @@
             recommendations,
             selectionMode,
             targetPrice > 0,
-            { price: targetPrice }
+            { price: targetPrice, standardHourlyWage }
         );
         if (best) mooncakeSetBoundedMapEntry(
             mooncakeEnhanceQuickRecommendationCache,
@@ -37209,8 +37777,8 @@
             : 'border:1px solid rgba(170,180,198,.28);background:rgba(54,58,68,.58);color:rgba(220,225,233,.72);';
         const enhancementRouteObjective = getEnhancementRouteObjective();
         const enhancementRouteObjectiveTitle = isZH
-            ? '强化路线选择会同步影响包子页签、市场挂单和聊天工时费。最高工时与最高利润分别按纯期望工时费和单件利润选择；综合策略会比较两个不同的保护等级，当其中一条路线的单件利润或工时费任一高出另一条至少 25% 时采用该路线。'
-            : 'This route objective is shared by the enhancement tab, marketplace listings, and chat hourly wage. Highest hourly and highest profit remain pure objectives; balanced compares two different protection levels and uses a route only when either profit/item or hourly is at least 25% higher than the other.';
+            ? '强化路线选择会同步影响包子页签、市场挂单和聊天工时费。最高工时与最高利润分别按纯期望工时费和单件利润选择；标准工时会把预计耗时按“标准工时设定”折算为成本，选择等效总成本最低的路线。成品卖价只影响利润和工时费展示。'
+            : 'This route objective is shared by the enhancement tab, marketplace listings, and chat hourly wage. Highest hourly and highest profit remain pure objectives; Standard hourly values expected time using the Standard hourly setting and selects the lowest equivalent-cost route. The final-item price only affects displayed profit and hourly wage.';
         const contentHTML = `
             <div style="color: var(--color-text-dark-mode); padding: 10px;">
                 <div data-mooncake-enhancement-toolbar="1" style="display:flex;justify-content:flex-end;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px;">
@@ -37225,7 +37793,7 @@
                         <select data-mooncake-enhancement-route-objective="1" aria-label="${isZH ? '强化路线目标' : 'Enhancement route objective'}" title="${enhancementRouteObjectiveTitle}" style="cursor:pointer;min-width:0;border:0;background:rgba(10,30,31,.68);color:inherit;border-radius:4px;padding:2px 4px;font-size:12px;font-weight:800;">
                             <option value="hourly" ${enhancementRouteObjective === 'hourly' ? 'selected' : ''}>${isZH ? '最高工时' : 'Highest hourly'}</option>
                             <option value="profit" ${enhancementRouteObjective === 'profit' ? 'selected' : ''}>${isZH ? '最高利润' : 'Highest profit'}</option>
-                            <option value="balanced" ${enhancementRouteObjective === 'balanced' ? 'selected' : ''}>${isZH ? '综合策略' : 'Balanced strategy'}</option>
+                            <option value="standard" ${enhancementRouteObjective === 'standard' ? 'selected' : ''}>${isZH ? '标准工时' : 'Standard hourly'}</option>
                         </select>
                     </label>
                     <button type="button" data-mooncake-chat-labor-switch="1" aria-pressed="${chatLaborEnabled}" title="${chatLaborToggleTitle}" style="cursor:pointer;${chatLaborToggleStyle}border-radius:7px;padding:5px 10px;font-size:12px;font-weight:800;white-space:nowrap;">${chatLaborToggleLabel}</button>
@@ -42849,6 +43417,9 @@
         });
         const route = panel.querySelector('[data-mooncake-enhancement-route-objective]');
         if (route) route.value = getEnhancementRouteObjective();
+        panel.querySelectorAll('[data-mooncake-enhancement-standard-hourly]').forEach(input => {
+            input.value = String(mooncakeGetEnhancementStandardHourlyM());
+        });
         const chatFormat = panel.querySelector('[data-mooncake-chat-labor-format]');
         if (chatFormat) chatFormat.value = getChatLaborFormat();
         panel.querySelectorAll('[data-mooncake-chat-labor-expected]').forEach(input => {
@@ -43089,6 +43660,13 @@
             #better-loot-tracker-config-panel [data-mooncake-market-trade-log-start-time], #better-loot-tracker-config-panel [data-mooncake-market-trade-log-end-time] { width:148px; min-width:0; color-scheme:dark; }
             #better-loot-tracker-config-panel [data-mooncake-market-trade-log-date-boundary] { color:rgba(221,230,250,.48); font-size:10px; }
             #better-loot-tracker-config-panel [data-mooncake-market-trade-log-results] { min-width:0; min-height:0; overflow:auto; padding:9px 12px; box-sizing:border-box; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-summary] { display:grid; grid-template-columns:minmax(142px,1.35fr) repeat(6,minmax(76px,1fr)); min-width:680px; margin-bottom:8px; overflow:hidden; border:1px solid rgba(125,151,219,.28); border-radius:5px; background:rgba(37,48,78,.50); }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-summary-item] { min-width:0; min-height:49px; display:flex; flex-direction:column; justify-content:center; gap:2px; padding:6px 8px; box-sizing:border-box; border-left:1px solid rgba(125,151,219,.16); font-variant-numeric:tabular-nums; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-summary-item="item"] { border-left:0; background:rgba(22,29,47,.34); }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-summary-item="item"] strong { color:rgba(232,239,255,.92); font-size:11px; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-summary-item="item"] span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:rgba(223,232,255,.78); font-size:11px; font-weight:800; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-summary-item="item"] small, #better-loot-tracker-config-panel [data-mooncake-market-trade-log-summary-label] { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:rgba(211,222,248,.56); font-size:9px; font-weight:700; }
+            #better-loot-tracker-config-panel [data-mooncake-market-trade-log-summary-value] { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; font-weight:850; }
             #better-loot-tracker-config-panel [data-mooncake-market-trade-log-table] { min-width:680px; overflow:hidden; border:1px solid rgba(125,151,219,.24); border-radius:5px; background:rgba(20,25,38,.45); }
             #better-loot-tracker-config-panel [data-mooncake-market-trade-log-row] { display:grid; grid-template-columns:minmax(130px,1.1fr) 52px minmax(150px,1.45fr) minmax(52px,.6fr) minmax(92px,.85fr) minmax(112px,1fr); align-items:center; gap:8px; min-height:34px; padding:5px 10px; box-sizing:border-box; border-top:1px solid rgba(125,151,219,.13); color:rgba(225,233,249,.82); font-size:12px; line-height:1.3; }
             #better-loot-tracker-config-panel [data-mooncake-market-trade-log-row="header"] { min-height:30px; border-top:0; background:rgba(53,62,91,.58); color:rgba(219,229,253,.68); font-size:10px; font-weight:850; }
@@ -43134,10 +43712,11 @@
             @media (min-width:1180px) {
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-dialog] { width:min(1220px,100%); }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="settings"] { grid-template-columns:repeat(3,minmax(0,1fr)); grid-template-areas:"market listings chat" "market enhance enhance" "quote quote quote"; column-gap:18px; }
-                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-group="enhance"] [data-mooncake-enhancement-settings-rows] { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); grid-template-areas:"lazy inventory" "route protection" "anti-suicide-enhancement anti-suicide-alchemy" "buff style" "reminder reminder-level" "base-cost ."; column-gap:18px; }
+                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-group="enhance"] [data-mooncake-enhancement-settings-rows] { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); grid-template-areas:"lazy base-cost" "route base-cost" "standard-hourly inventory" "protection anti-suicide-enhancement" "anti-suicide-alchemy buff" "style reminder" "reminder-level ."; column-gap:18px; }
                 #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="lazy"] { grid-area:lazy; border-top:0; }
                 #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="inventory"] { grid-area:inventory; border-top:0; }
                 #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="route"] { grid-area:route; border-top:0; }
+                #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="standard-hourly"] { grid-area:standard-hourly; }
                 #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="protection"] { grid-area:protection; }
                 #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="anti-suicide-enhancement"] { grid-area:anti-suicide-enhancement; }
                 #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="anti-suicide-alchemy"] { grid-area:anti-suicide-alchemy; }
@@ -43145,7 +43724,7 @@
                 #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="style"] { grid-area:style; }
                 #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="reminder"] { grid-area:reminder; }
                 #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="reminder-level"] { grid-area:reminder-level; }
-                #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="base-cost"] { grid-area:base-cost; }
+                #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="base-cost"] { grid-area:base-cost; border-top:0; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-group="enhance"] [data-mooncake-enhancement-settings-row-control] { min-width:0; gap:6px; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-group="enhance"] [data-mooncake-enhancement-settings-command] { flex:0 0 78px; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-section] { padding:10px 0; }
@@ -43158,7 +43737,7 @@
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-dialog] { width:min(1420px,100%); }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="settings"] { grid-template-columns:repeat(4,minmax(0,1fr)); grid-template-areas:"market market listings chat" "enhance enhance enhance enhance" "quote quote quote quote"; column-gap:18px; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-group="market"] [data-mooncake-enhancement-settings-rows] { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); align-items:start; column-gap:16px; }
-                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-group="enhance"] [data-mooncake-enhancement-settings-rows] { grid-template-columns:repeat(3,minmax(0,1fr)); grid-template-areas:"lazy inventory queue-next" "route protection buff" "anti-suicide-enhancement anti-suicide-alchemy style" "reminder reminder-level base-cost"; column-gap:16px; }
+                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-group="enhance"] [data-mooncake-enhancement-settings-rows] { grid-template-columns:repeat(3,minmax(0,1fr)); grid-template-areas:"lazy inventory base-cost" "route protection base-cost" "standard-hourly anti-suicide-enhancement queue-next" "style anti-suicide-alchemy buff" "reminder reminder-level ."; column-gap:16px; }
                 #better-loot-tracker-config-panel [data-mooncake-settings-enhance-row="queue-next"] { grid-area:queue-next; border-top:0; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-section] { padding:8px 0; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-section-heading] p { margin:2px 0 5px; }
@@ -43687,7 +44266,7 @@
         const route = document.createElement('select');
         route.setAttribute('data-mooncake-enhancement-route-objective', '1');
         route.setAttribute('aria-label', isZH ? '强化路线目标' : 'Enhancement route objective');
-        [["hourly", isZH ? '最高工时' : 'Highest hourly'], ["profit", isZH ? '最高利润' : 'Highest profit'], ["balanced", isZH ? '综合策略' : 'Balanced strategy']].forEach(([value, label]) => {
+        [["hourly", isZH ? '最高工时' : 'Highest hourly'], ["profit", isZH ? '最高利润' : 'Highest profit'], ["standard", isZH ? '标准工时' : 'Standard hourly']].forEach(([value, label]) => {
             const option = document.createElement('option');
             option.value = value;
             option.textContent = label;
@@ -43705,21 +44284,53 @@
         route.addEventListener('input', applyRouteObjective);
         route.addEventListener('change', applyRouteObjective);
         const routeTitle = isZH
-            ? '强化页、市场挂单和聊天工时共用。最高工时与最高利润为纯策略；综合策略比较不同保护等级，当任一路线的单件利润或工时费至少高出另一条 25% 时采用该路线。'
-            : 'Shared by enhancement, market listings, and chat. Highest hourly and highest profit are pure objectives; balanced uses a route when either profit per item or hourly wage is at least 25% higher than the alternative protection level.';
+            ? '强化页、市场挂单和聊天工时共用。最高工时与最高利润为纯策略；标准工时会把预计耗时按“标准工时设定”折算为成本，选择等效总成本最低的路线。成品卖价不会改变推荐保护等级。'
+            : 'Shared by enhancement, market listings, and chat. Highest hourly and highest profit are pure objectives; Standard hourly values expected time using the Standard hourly setting and selects the lowest equivalent-cost route. The final-item price does not change the recommended protection level.';
         route.title = routeTitle;
         const routeRow = mooncakeCreateEnhancementSettingsSelectRow(
             isZH ? '强化路线' : 'Enhancement route',
-            isZH ? '综合：两档保护不同时，低保路线的利润或工时需高出25%' : 'Balanced: with different protection levels, use fewer protection only when profit or hourly is 25% higher.',
+            isZH ? '标准工时：把时间折算为成本，自动权衡保护消耗与预计耗时。' : 'Standard hourly values time as a cost to balance protection consumption and expected time.',
             route
         );
         routeRow.title = routeTitle;
         routeRow.setAttribute('data-mooncake-settings-enhance-row', 'route');
+        const standardHourlyInput = document.createElement('input');
+        standardHourlyInput.type = 'number';
+        standardHourlyInput.min = '0';
+        standardHourlyInput.max = String(MOONCAKE_ENHANCEMENT_STANDARD_HOURLY_MAX_M);
+        standardHourlyInput.step = '0.1';
+        standardHourlyInput.inputMode = 'decimal';
+        standardHourlyInput.value = String(mooncakeGetEnhancementStandardHourlyM());
+        standardHourlyInput.setAttribute('data-mooncake-enhancement-standard-hourly', '1');
+        standardHourlyInput.setAttribute('aria-label', isZH ? '标准工时设定，单位 M/h' : 'Standard hourly setting in M/h');
+        mooncakeBindNonNegativeHourlyInput(standardHourlyInput);
+        const commitStandardHourly = () => {
+            if (!mooncakeSetEnhancementStandardHourlyM(standardHourlyInput.value)) {
+                standardHourlyInput.value = String(mooncakeGetEnhancementStandardHourlyM());
+            }
+        };
+        standardHourlyInput.addEventListener('change', commitStandardHourly);
+        standardHourlyInput.addEventListener('keydown', event => {
+            if (event.key !== 'Enter') return;
+            event.preventDefault();
+            commitStandardHourly();
+            standardHourlyInput.blur();
+        });
+        const standardHourlyRow = mooncakeCreateEnhancementSettingsHourlyInputRow(
+            isZH ? '标准工时设定' : 'Standard hourly setting',
+            isZH ? '仅供“标准工时”策略使用：按该工时算最低成本来判断保护等级。' : 'Used only by Standard hourly: use this hourly value to choose the lowest-cost protection level.',
+            standardHourlyInput
+        );
+        standardHourlyRow.title = isZH
+            ? '独立于挂单目标工时。数值越高，策略越重视节省强化时间；设为 0 时等同只比较预期总成本。'
+            : 'Independent from the listing target. A larger value places more weight on saving enhancement time; 0 compares expected monetary cost only.';
+        standardHourlyRow.setAttribute('data-mooncake-settings-enhance-row', 'standard-hourly');
         enhance.rows.append(
             lazyEnhancementRow,
             actionQueueQuickOrderRow,
             inventoryWarehouseRow,
             routeRow,
+            standardHourlyRow,
             protectionAssistantRow,
             antiSuicideEnhancementRow,
             antiSuicideAlchemyRow,
