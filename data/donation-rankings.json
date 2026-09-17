@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-09-17T23:37:45+08:00",
+  "updatedAt": "2026-08-19T00:02:00+08:00",
   "rankings": [
     {
       "name": "包您馒意",
@@ -42,17 +42,6 @@
       "nameStyle": {
         "color": "#C6DCFF",
         "weight": 700
-      }
-    },
-    {
-      "name": "MiracleYang",
-      "amount": 9.9,
-      "currency": "CNY",
-      "note": "老板，笼酱肉包，打包带走，谢谢",
-      "nameStyle": {
-        "color": "#FFB22C",
-        "glow": "#D97A00",
-        "weight": 800
       }
     },
     {
