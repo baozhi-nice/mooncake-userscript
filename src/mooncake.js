@@ -27926,9 +27926,9 @@
                 display: flex !important;
                 align-items: center !important;
                 gap: 5px !important;
-                flex: 0 1 auto !important;
+                flex: 1 1 auto !important;
                 min-width: 38px !important;
-                max-width: min(30rem, 100%) !important;
+                max-width: none !important;
                 height: 36px !important;
                 margin-left: 4px !important;
                 box-sizing: border-box !important;
@@ -28194,9 +28194,9 @@
                 display: 'flex',
                 alignItems: 'center',
                 gap: '5px',
-                flex: '0 1 auto',
+                flex: '1 1 auto',
                 minWidth: '38px',
-                maxWidth: 'min(30rem, 100%)',
+                maxWidth: 'none',
                 height: '36px',
                 padding: '1px',
                 borderLeft: '0',

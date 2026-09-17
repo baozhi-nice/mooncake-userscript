@@ -51,4 +51,15 @@ assert.match(levelJumpBar, /alignItems: 'flex-start'/, 'the category control mus
 assert.match(levelJumpBar, /stockControls\.style\.alignSelf = 'flex-start'/, 'the category control must not become vertically centered when more levels wrap');
 assert.match(levelJumpBar, /gridAutoRows: '26px'/, 'extra desktop level jumps must remain visible in additional rows');
 
+assert.match(
+    source,
+    /#\$\{MOONCAKE_RECENT_MARKET_NAV_ID\} \{[\s\S]{0,280}?flex: 1 1 auto !important;[\s\S]{0,180}?max-width: none !important;/,
+    'desktop recent-item navigation must use the full available market toolbar width instead of a fixed cap'
+);
+assert.match(
+    source,
+    /flex: '1 1 auto',[\s\S]{0,100}?maxWidth: 'none',/,
+    'the rendered recent-item navigation must not restore the old inline width cap'
+);
+
 console.log('Mobile market layout checks passed.');
