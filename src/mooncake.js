@@ -14572,29 +14572,10 @@
             contextMemo.set(hrid, context || null);
             return context || null;
         };
-        const isRefined = String(itemHrid || '').endsWith('_refined');
         const primaryContext = getContext(itemHrid);
         const traditionalRoutes = primaryContext
             ? mooncakeBuildTraditionalUnitPlans(primaryContext, target)
             : [];
-        if (isRefined) {
-            const relation = mooncakeGetRefinementActionForItem(itemHrid);
-            const normalContext = relation?.refinedHrid === itemHrid && relation.baseHrid
-                ? getContext(relation.baseHrid)
-                : null;
-            const carryoverCost = mooncakeCalculateRefinementCarryoverCost(
-                relation,
-                marketData,
-                options.resolveRefinementMaterialPrice
-            );
-            if (normalContext && carryoverCost > 0) {
-                traditionalRoutes.push(...mooncakeBuildRefinementCarryoverPlans(
-                    mooncakeBuildTraditionalUnitPlans(normalContext, target),
-                    carryoverCost,
-                    target
-                ));
-            }
-        }
         if (!traditionalRoutes.length) return null;
 
         const mirrorTemplates = [];
@@ -14740,16 +14721,16 @@
         const selectionMode = mooncakeGetEnhancementRouteSelectionMode(objective);
         if (!(Number(price) > 0) && selectionMode !== 'standard') return null;
         const routeOptions = options && typeof options === 'object' ? options : {};
-        // 普通装备低于 +13 使用传统路线；精炼装备仍需比较“先强化后精炼”的配方。
-        if (target < MOONCAKE_MIRROR_OUTPUT_MIN_LEVEL && !String(itemHrid || '').endsWith('_refined')) {
+        const isRefined = String(itemHrid || '').endsWith('_refined');
+        // 精炼白板的市场价和自制价已在白板成本中比较；精炼装备本身仍按保护等级选路线。
+        if (target < MOONCAKE_MIRROR_OUTPUT_MIN_LEVEL && !isRefined) {
             return mooncakeBuildLegacyTraditionalRoute(itemHrid, target, marketData, price, {
                 ...routeOptions,
                 objective: selectionMode
             });
         }
         const candidates = mooncakeBuildGenericEnhancementRouteCandidates(itemHrid, target, marketData);
-        const hasRefinementCarryover = candidates?.traditionalRoutes?.some(route => route.routeType === 'refinementCarryover');
-        if (!candidates?.mirrorTemplates?.length && !hasRefinementCarryover) {
+        if (!candidates?.mirrorTemplates?.length && !isRefined) {
             return mooncakeBuildLegacyTraditionalRoute(itemHrid, target, marketData, price, {
                 ...routeOptions,
                 objective: selectionMode
