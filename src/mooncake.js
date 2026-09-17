@@ -7848,12 +7848,12 @@
         const alternateEquivalentCost = Number(policy.alternateEquivalentCost);
         if (alternateRoute && Number.isFinite(selectedEquivalentCost) && Number.isFinite(alternateEquivalentCost)) {
             return isZH
-                ? `标准工时：按 ${standardHourly} 将预计耗时计入成本；${selectedLabel} 的等效总成本 ${formatMoney(selectedEquivalentCost)} 低于 ${alternateLabel} 的 ${formatMoney(alternateEquivalentCost)}，采用 ${selectedLabel}。成品卖价仅影响利润和工时费展示。`
-                : `Standard hourly: time is valued at ${standardHourly}; ${selectedLabel} has a lower equivalent cost (${formatMoney(selectedEquivalentCost)}) than ${alternateLabel} (${formatMoney(alternateEquivalentCost)}), so it is used. The final-item price only affects displayed profit and hourly wage.`;
+                ? `按工时${standardHourly} 计算价格；${selectedLabel} ${formatMoney(selectedEquivalentCost)} < ${alternateLabel} ${formatMoney(alternateEquivalentCost)}，因此选择 ${selectedLabel}。`
+                : `Time is valued at ${standardHourly}; ${selectedLabel} ${formatMoney(selectedEquivalentCost)} < ${alternateLabel} ${formatMoney(alternateEquivalentCost)}, so ${selectedLabel} is selected.`;
         }
         return isZH
-            ? `标准工时：按 ${standardHourly} 将预计耗时计入成本，选择等效总成本最低的路线；成品卖价仅影响利润和工时费展示。`
-            : `Standard hourly: time is valued at ${standardHourly} and the lowest equivalent-cost route is used; the final-item price only affects displayed profit and hourly wage.`;
+            ? `按工时${standardHourly} 计算价格，选择等效总成本最低的保护等级。`
+            : `Time is valued at ${standardHourly}; the protection route with the lowest equivalent cost is selected.`;
     }
 
     function mooncakeGetObjectiveRoutePairDisplayLabels(routePair) {
@@ -7863,11 +7863,12 @@
         if (!policy || policy.type !== 'standard-hourly-equivalent-cost') {
             return { selectedObjectiveLabel, alternateObjectiveLabel, policyExplanation: '' };
         }
-        const standardHourly = mooncakeFormatEnhancementStandardHourly(policy.standardHourlyWage);
         return {
-            selectedObjectiveLabel: isZH
-                ? `${selectedObjectiveLabel}（${standardHourly}，${mooncakeFormatStandardHourlyRoute(routePair.selected?.route || routePair.selected)}）`
-                : `${selectedObjectiveLabel} (${standardHourly}, ${mooncakeFormatStandardHourlyRoute(routePair.selected?.route || routePair.selected)})`,
+            // The current route already conveys the actionable result. Keep the
+            // configured standard hourly value in the explanation, not the title.
+            selectedObjectiveLabel: mooncakeFormatStandardHourlyRoute(
+                routePair.selected?.route || routePair.selected
+            ),
             alternateObjectiveLabel: mooncakeFormatStandardHourlyRoute(
                 routePair.alternate?.route || routePair.alternate,
                 { notUsed: true }
@@ -17187,28 +17188,6 @@
         const displayLabels = mooncakeGetObjectiveRoutePairDisplayLabels(routePair);
         const selectedObjectiveLabel = displayLabels.selectedObjectiveLabel;
         const alternateObjectiveLabel = displayLabels.alternateObjectiveLabel;
-        const selectedProfit = Number(routePair.selected.profit);
-        const alternateProfit = Number(routePair.alternate.profit);
-        const selectedHourly = Number(routePair.selected.hourlyWage);
-        const alternateHourly = Number(routePair.alternate.hourlyWage);
-        const selectedEquivalentCost = Number(routePair.selected.equivalentCost);
-        const alternateEquivalentCost = Number(routePair.alternate.equivalentCost);
-        const signedMoney = value => Number.isFinite(value)
-            ? `${value >= 0 ? '+' : ''}${formatMoney(value)}`
-            : '-';
-        const signedHourlyWage = value => Number.isFinite(value)
-            ? mooncakeFormatSignedHourlyWage(value)
-            : '-';
-        const deltas = [];
-        if (Number.isFinite(selectedEquivalentCost) && Number.isFinite(alternateEquivalentCost)) {
-            deltas.push(`${isZH ? '等效总成本' : 'Equivalent cost'} ${signedMoney(alternateEquivalentCost - selectedEquivalentCost)}`);
-        }
-        if (Number.isFinite(selectedProfit) && Number.isFinite(alternateProfit)) {
-            deltas.push(`${isZH ? '单件利润' : 'Profit/item'} ${signedMoney(alternateProfit - selectedProfit)}`);
-        }
-        if (Number.isFinite(selectedHourly) && Number.isFinite(alternateHourly)) {
-            deltas.push(`${isZH ? '工时费' : 'Hourly'} ${signedHourlyWage(alternateHourly - selectedHourly)}/h`);
-        }
         const cards = [
             mooncakeBuildEnhancementRiskRouteCard(
                 itemHrid,
@@ -17235,11 +17214,6 @@
                 <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;">
                     ${cards.join('')}
                 </div>
-                ${deltas.length ? `
-                    <div style="margin-top:9px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08);color:var(--color-disabled);font-size:11px;line-height:1.7;">
-                        ${alternateObjectiveLabel} ${isZH ? '相对当前' : 'vs. selected'}：${deltas.join(' · ')}
-                    </div>
-                ` : ''}
             </div>
         `;
     }

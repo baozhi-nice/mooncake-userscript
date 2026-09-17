@@ -94,6 +94,26 @@ assert.match(source, /标准工时设定/, 'settings must expose the independent
 assert.match(source, /仅供“标准工时”策略使用：按该工时算最低成本来判断保护等级。/, 'settings must explain how the standard hourly value determines protection');
 assert.match(
     source,
+    /selectedObjectiveLabel:\s*mooncakeFormatStandardHourlyRoute\(\s*routePair\.selected\?\.route \|\| routePair\.selected\s*\)/,
+    'standard-hourly route titles must show only the actionable protection route'
+);
+assert.doesNotMatch(
+    source,
+    /selectedObjectiveLabel:\s*isZH\s*\?\s*`\$\{selectedObjectiveLabel\}（\$\{standardHourly\}/,
+    'standard-hourly titles must not repeat the strategy name and configured hourly value'
+);
+assert.match(
+    source,
+    /按工时\$\{standardHourly\} 计算价格；\$\{selectedLabel\} \$\{formatMoney\(selectedEquivalentCost\)\} < \$\{alternateLabel\} \$\{formatMoney\(alternateEquivalentCost\)\}，因此选择 \$\{selectedLabel\}。/,
+    'the comparison must state the concise equivalent-cost rule used to choose the protection route'
+);
+assert.doesNotMatch(
+    source,
+    /const deltas = \[\];[\s\S]{0,1100}?相对当前/,
+    'the route comparison must not repeat its choice rationale below the cards'
+);
+assert.match(
+    source,
     /grid-template-areas:"lazy inventory base-cost" "route protection base-cost" "standard-hourly anti-suicide-enhancement queue-next"/,
     'wide settings must put the standard-hourly input below the route selector and pin base-cost controls in the upper-right two rows'
 );
