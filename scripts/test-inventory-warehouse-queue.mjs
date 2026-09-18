@@ -52,57 +52,103 @@ function createStyle(values = {}, priorities = {}) {
     };
 }
 
+const canRetainFunction = extractFunction('mooncakeWarehouseCanRetainCurrentEquipmentNode');
 const repairFunction = extractFunction('mooncakeWarehouseCurrentEquipmentNeedsRepair');
 const root = { contains: node => node.insideRoot !== false };
 const node = {
     isConnected: true,
     insideRoot: true,
     itemHrid: '/items/test_sword',
-    style: createStyle({
-        position: 'absolute',
-        display: 'block',
-        opacity: '1',
-        transform: 'none',
-        visibility: 'visible'
-    }),
-    computed: { display: 'block', visibility: 'visible', opacity: '1' },
-    rect: { width: 60, height: 60 },
-    getBoundingClientRect() {
-        return this.rect;
+    hasItem: true,
+    querySelector() {
+        return this.hasItem ? {} : null;
     }
 };
 const repairSandbox = {
     mooncakeWarehouseNormalizeItemHrid: value => value,
-    mooncakeGetItemHridFromContainer: value => value.itemHrid,
-    getComputedStyle: value => value.computed
+    mooncakeGetItemHridFromContainer: value => value.itemHrid
 };
 vm.runInNewContext(`
+    ${canRetainFunction}
     ${repairFunction}
     globalThis.needsRepair = mooncakeWarehouseCurrentEquipmentNeedsRepair;
 `, repairSandbox);
 
 const currentTarget = { node, role: 'current-equipment', hidden: false };
-assert.equal(repairSandbox.needsRepair(currentTarget, root), false, 'a healthy current card must keep the fast path');
-node.style.values.opacity = '0';
-node.computed.opacity = '0';
-assert.equal(repairSandbox.needsRepair(currentTarget, root), true, 'an opacity-zero current card must be repaired');
-node.style.values.opacity = '1';
-node.computed.opacity = '1';
-node.style.values.display = 'none';
-node.computed.display = 'none';
-assert.equal(repairSandbox.needsRepair(currentTarget, root), true, 'a display-none current card must be repaired');
-node.style.values.display = 'block';
-node.computed.display = 'block';
+assert.equal(repairSandbox.needsRepair(currentTarget, root), false, 'a complete current card must keep the fast path');
+assert.equal(
+    repairSandbox.needsRepair({ ...currentTarget, opacity: 0, transform: 'scale(.9)' }, root),
+    false,
+    'temporary native leave styles must not trigger a Mooncake repair loop'
+);
 node.itemHrid = '';
-assert.equal(repairSandbox.needsRepair(currentTarget, root), true, 'an emptied current card must not pass integrity checks');
+assert.equal(repairSandbox.needsRepair(currentTarget, root), true, 'an empty current identity must not pass integrity checks');
 node.itemHrid = '/items/test_sword';
-node.rect = { width: 0, height: 60 };
-assert.equal(repairSandbox.needsRepair(currentTarget, root), true, 'a zero-size current card must be repaired');
+node.hasItem = false;
+assert.equal(repairSandbox.needsRepair(currentTarget, root), true, 'a removed item shell must request a settled reconcile');
+node.hasItem = true;
+node.isConnected = false;
+assert.equal(repairSandbox.needsRepair(currentTarget, root), true, 'a detached current card must request a settled reconcile');
+node.isConnected = true;
 assert.equal(
     repairSandbox.needsRepair({ ...currentTarget, role: 'queued-equipment' }, root),
     false,
-    'the extra computed-style check must stay limited to the current card'
+    'the current-card reconcile check must stay limited to the current card'
 );
+
+const clearLeaseFunction = extractFunction('mooncakeWarehouseClearCurrentEquipmentLease');
+const scheduleLeaseExpiryFunction = extractFunction('mooncakeWarehouseScheduleCurrentEquipmentLeaseExpiry');
+const rememberCurrentFunction = extractFunction('mooncakeWarehouseRememberCurrentEquipment');
+const getCurrentHandoffLeaseFunction = extractFunction('mooncakeWarehouseGetCurrentEquipmentHandoffLease');
+const startCurrentHandoffFunction = extractFunction('mooncakeWarehouseStartCurrentEquipmentHandoff');
+const getCurrentLeaseFunction = extractFunction('mooncakeWarehouseGetCurrentEquipmentLease');
+let leaseNow = 1000;
+const leaseTimers = [];
+const leaseRoot = { contains: value => value === node };
+const leaseSandbox = {
+    Date: { now: () => leaseNow },
+    Math,
+    MOONCAKE_WAREHOUSE_CURRENT_EQUIPMENT_LEASE_MS: 420,
+    mooncakeWarehouseCurrentEquipmentLease: null,
+    mooncakeWarehouseCurrentEquipmentLeaseTimer: 0,
+    mooncakeWarehouseNormalizeItemHrid: value => value,
+    mooncakeGetItemHridFromContainer: value => value.itemHrid,
+    setTimeout(callback, delay) {
+        leaseTimers.push({ callback, delay });
+        return leaseTimers.length;
+    },
+    clearTimeout() {},
+    mooncakeWarehouseInvalidateInventoryEntries() {},
+    mooncakeScheduleWarehouseRender() {}
+};
+vm.runInNewContext(`
+    ${canRetainFunction}
+    ${clearLeaseFunction}
+    ${scheduleLeaseExpiryFunction}
+    ${rememberCurrentFunction}
+    ${getCurrentHandoffLeaseFunction}
+    ${startCurrentHandoffFunction}
+    ${getCurrentLeaseFunction}
+    globalThis.rememberCurrent = mooncakeWarehouseRememberCurrentEquipment;
+    globalThis.getCurrentHandoffLease = mooncakeWarehouseGetCurrentEquipmentHandoffLease;
+    globalThis.getCurrentLease = mooncakeWarehouseGetCurrentEquipmentLease;
+`, leaseSandbox);
+node.insideRoot = true;
+leaseSandbox.rememberCurrent({ ...currentTarget, point: { left: 12, top: 34 } }, leaseRoot);
+assert.equal(leaseSandbox.mooncakeWarehouseCurrentEquipmentLease.expiresAt, 0, 'a live current card must not start its expiry timer');
+const liveLease = leaseSandbox.getCurrentLease(leaseRoot);
+assert.equal(liveLease.point.left, 12, 'a drawable current card must retain its stable horizontal placement');
+assert.equal(liveLease.expiresAt, 0, 'a drawable current card must not consume the handoff window');
+node.isConnected = false;
+assert.equal(leaseSandbox.getCurrentLease(leaseRoot), null, 'a removed source card must not be rendered as the current card');
+const lease = leaseSandbox.getCurrentHandoffLease(leaseRoot);
+assert.equal(lease.point.left, 12, 'the lease must preserve the last stable horizontal placement');
+assert.equal(lease.point.top, 34, 'the lease must preserve the last stable vertical placement');
+assert.equal(lease.expiresAt, 1420, 'a missing replacement may retain the last stable card for one short handoff window');
+assert.equal(leaseTimers[0].delay, 421, 'the expiry wakeup must follow the handoff window');
+leaseNow = 1421;
+assert.equal(leaseSandbox.getCurrentHandoffLease(leaseRoot), null, 'an expired lease must release the old icon');
+node.isConnected = true;
 
 const restoreOwnedFunction = extractFunction('mooncakeWarehouseRestoreOwnedInlineStyle');
 const restoredNode = {
@@ -164,7 +210,6 @@ const observerSandbox = {
     mooncakeWarehouseObservedCurrentEquipment: null,
     mooncakeWarehouseObservedCurrentEquipmentSignature: '',
     mooncakeWarehouseObservedCurrentEquipmentRoot: null,
-    mooncakeWarehouseCurrentEquipmentIntegrityDirty: false,
     mooncakeWarehouseGetCurrentEquipmentDomSignature: value => value.signature,
     mooncakeWarehouseCurrentEquipmentNeedsRepair: target => target.node.needsRepair,
     mooncakeScheduleWarehouseRender: reason => scheduledReasons.push(reason)
@@ -178,16 +223,16 @@ observerSandbox.observeCurrent(observedNode, observedRoot);
 assert.equal(observerInstances.length, 1, 'the focused observer must be installed for the current card');
 assert.equal(observerInstances[0].options.subtree, true, 'the focused observer must cover inner icon replacements');
 observerInstances[0].callback([{ type: 'attributes', attributeName: 'style' }]);
-assert.equal(scheduledReasons.length, 0, 'a healthy Mooncake style write must not create an observer loop');
+assert.equal(scheduledReasons.length, 0, 'a healthy visual style mutation must not create an observer loop');
 observedNode.needsRepair = true;
 observerInstances[0].callback([{ type: 'attributes', attributeName: 'style' }]);
-assert.deepEqual(scheduledReasons, ['current-equipment-dom'], 'an external hide must schedule one repair');
+assert.deepEqual(scheduledReasons, ['queue-handoff'], 'a removed icon shell must schedule one frame-coalesced handoff');
 observedNode.needsRepair = false;
 observerInstances[0].callback([{ type: 'attributes', attributeName: 'style' }]);
-assert.equal(scheduledReasons.length, 1, 'the healthy repair write must not schedule again');
+assert.equal(scheduledReasons.length, 1, 'a healthy queued card must not schedule again');
 observedNode.signature = '/items/test_sword|5|1';
 observerInstances[0].callback([{ type: 'characterData' }]);
-assert.equal(scheduledReasons.length, 2, 'an identity-level update must schedule reprojection');
+assert.equal(scheduledReasons.length, 1, 'an identity-level update inside the same card must not re-layout the queue');
 observerSandbox.observeCurrent(null, observedRoot, true);
 assert.equal(observerInstances[0].disconnected, false, 'an empty current shell must stay observed until React refills it');
 const replacementRoot = { contains: value => value === observedNode };
@@ -233,6 +278,50 @@ assert.ok(
     'an equally drawable entering node must replace the stale pinned duplicate'
 );
 
+const getPinnedNodeId = extractFunction('mooncakeWarehouseGetPinnedNodeId');
+const getPinnedLayoutSignature = extractFunction('mooncakeWarehouseGetPinnedLayoutSignature');
+const pinnedLayoutSandbox = {
+    WeakMap,
+    Map,
+    Math,
+    JSON,
+    mooncakeWarehousePinnedNodeIds: new WeakMap(),
+    mooncakeWarehouseNextPinnedNodeId: 1
+};
+vm.runInNewContext(`
+    ${getPinnedNodeId}
+    ${getPinnedLayoutSignature}
+    globalThis.getPinnedLayoutSignature = mooncakeWarehouseGetPinnedLayoutSignature;
+`, pinnedLayoutSandbox);
+const stableNode = { isConnected: true };
+const layoutState = { sectionCollapsed: {} };
+const previousProjection = {
+    candidates: new Map([[
+        '/items/test_sword\u00015',
+        { node: stableNode, key: '/items/test_sword\u00015', sectionId: 'system:current-queue', role: 'current-equipment' }
+    ]])
+};
+const nextLevelProjection = {
+    candidates: new Map([[
+        '/items/test_sword\u00016',
+        { node: stableNode, key: '/items/test_sword\u00016', sectionId: 'system:current-queue', role: 'current-equipment' }
+    ]])
+};
+const previousPlacements = new Map([['/items/test_sword\u00015', { left: 8, top: 42 }]]);
+const nextLevelPlacements = new Map([['/items/test_sword\u00016', { left: 8, top: 42 }]]);
+assert.equal(
+    pinnedLayoutSandbox.getPinnedLayoutSignature(previousProjection, layoutState, previousPlacements),
+    pinnedLayoutSandbox.getPinnedLayoutSignature(nextLevelProjection, layoutState, nextLevelPlacements),
+    'a level/key update on the same native card at the same position must retain the fast path'
+);
+assert.notEqual(
+    pinnedLayoutSandbox.getPinnedLayoutSignature(nextLevelProjection, layoutState, new Map([
+        ['/items/test_sword\u00016', { left: 64, top: 42 }]
+    ])),
+    pinnedLayoutSandbox.getPinnedLayoutSignature(nextLevelProjection, layoutState, nextLevelPlacements),
+    'a real card position change must still invalidate the pinned layout'
+);
+
 assert.match(
     source,
     /'display', 'opacity', 'pointer-events', 'transform'/,
@@ -245,17 +334,22 @@ assert.match(
 );
 assert.match(
     source,
-    /mooncakeWarehouseCurrentEquipmentNeedsRepair\(currentEquipmentTarget, root, false\)/,
-    'the normal fast path must avoid a forced layout read'
+    /const MOONCAKE_WAREHOUSE_CURRENT_EQUIPMENT_LEASE_MS = 420/,
+    'the queue must use a bounded current-card handoff lease'
 );
 assert.match(
     source,
-    /!currentEquipmentNeedsRepair\)/,
-    'the unchanged-presentation fast path must honor current-card integrity'
+    /mooncakeWarehouseGetCurrentEquipmentLease\(root\)/,
+    'a temporarily missing current card must use the last valid queue node'
 );
 assert.match(
     source,
-    /mooncakeWarehouseObserveCurrentEquipment\(\s*currentEquipmentTarget\?\.node \|\| null,\s*root,\s*keepExistingCurrentShell\s*\);/,
+    /function mooncakeWarehousePinIncomingCurrentEquipment\(mutations, root\)[\s\S]{0,1800}mooncakeWarehousePinCurrentEquipmentHandoffNode/,
+    'an incoming React card must inherit the active queue placement before the next paint'
+);
+assert.match(
+    source,
+    /mooncakeWarehouseObserveCurrentEquipment\(\s*displayedCurrentEquipmentTarget\?\.node \|\| null,\s*root,\s*keepExistingCurrentShell\s*\);/,
     'the active queue must keep its focused current-card observer wired into rendering'
 );
 assert.match(
@@ -265,23 +359,28 @@ assert.match(
 );
 assert.match(
     source,
-    /target\.role === 'current-equipment'[\s\S]{0,900}mooncakeWarehouseSetInlineStyle\(node, 'display', 'block'\)[\s\S]{0,300}mooncakeWarehouseSetInlineStyle\(node, 'opacity', '1'\)[\s\S]{0,300}mooncakeWarehouseSetInlineStyle\(node, 'transform', 'none'\)/,
-    'the current card must explicitly clear the native leave state'
+    /target\.role === 'current-equipment'[\s\S]{0,900}mooncakeWarehouseRestoreOwnedInlineStyle\(node, 'transition'\)/,
+    'the current card must release visual-transition ownership back to the game'
+);
+assert.doesNotMatch(
+    source,
+    /target\.role === 'current-equipment'[\s\S]{0,900}mooncakeWarehouseSetInlineStyle\(node, '(?:display|opacity|transform)'/,
+    'Mooncake must not fight the game\'s current-card visibility or transform styles'
 );
 assert.match(
     source,
-    /\[\$\{MOONCAKE_WAREHOUSE_ROLE_ATTR\}=\"current-equipment\"\][\s\S]{0,500}display: block !important; visibility: visible !important; opacity: 1 !important; transform: none !important;/,
-    'the current card CSS guard must cover native transition styles between renders'
+    /mooncakeWarehouseCurrentEquipmentObserver\.observe\(node, \{[\s\S]{0,500}attributeFilter: \['hidden', 'aria-hidden', 'href', 'xlink:href'\][\s\S]{0,300}childList: true,[\s\S]{0,200}characterData: true,[\s\S]{0,200}subtree: true/,
+    'only identity and node-replacement signals should trigger the focused queue observer'
 );
 assert.match(
     source,
-    /mooncakeWarehouseCurrentEquipmentObserver\.observe\(node, \{[\s\S]{0,500}attributeFilter: \['class', 'style', 'hidden', 'aria-hidden', 'href', 'xlink:href'\][\s\S]{0,300}childList: true,[\s\S]{0,200}characterData: true,[\s\S]{0,200}subtree: true/,
-    'only the active equipment card should receive the focused DOM integrity observer'
+    /function mooncakeWarehouseRestorePresentation\(\) \{\s*mooncakeWarehouseDisconnectCurrentEquipmentObserver\(\);\s*mooncakeWarehouseClearCurrentEquipmentLease\(\);/,
+    'the current-card observer and handoff lease must be released with the warehouse presentation'
 );
 assert.match(
     source,
-    /function mooncakeWarehouseRestorePresentation\(\) \{\s*mooncakeWarehouseDisconnectCurrentEquipmentObserver\(\);/,
-    'the current-card observer must be disconnected with the warehouse presentation'
+    /reason === 'inventory-dom' \|\| reason === 'queue-handoff'\) \{\s*mooncakeWarehouseRenderFrame = requestAnimationFrame/,
+    'current-card handoffs must reconcile on the next animation frame without a timeout delay'
 );
 assert.match(
     source,

@@ -10439,10 +10439,15 @@
     let mooncakeCharacterActionsSource = 'none';
     const MOONCAKE_WAREHOUSE_QUEUE_SETTLE_MS = 600;
     const MOONCAKE_WAREHOUSE_QUEUE_TOMBSTONE_MS = 750;
+    // React briefly has no stable inventory card while it replaces the result
+    // of an enhancement. Keep the last drawable card in the queue during that
+    // handoff instead of returning it to the native grid for a visible frame.
+    const MOONCAKE_WAREHOUSE_CURRENT_EQUIPMENT_LEASE_MS = 420;
     let mooncakeWarehouseStableEnhanceActions = new Map();
     let mooncakeWarehouseQueueTombstones = new Map();
     let mooncakeWarehouseQueueReconcileTimer = 0;
     let mooncakeWarehouseQueueSnapshotReady = false;
+    let mooncakeWarehouseInventoryStateSignature = '';
 
     const MOONCAKE_CHARACTER_SNAPSHOT_KEY = 'Mooncake_characterEnhanceSnapshot_v1';
     const MOONCAKE_CHARACTER_SNAPSHOT_TTL = 12 * 60 * 60 * 1000;
@@ -10632,6 +10637,7 @@
         if (!payload || typeof payload !== 'object') return false;
         const owns = key => Object.prototype.hasOwnProperty.call(payload, key);
         let touched = false;
+        let inventoryTouched = false;
         const previousCharacterId = mooncakeCharacterId;
 
         if (owns('characterId')) {
@@ -10653,10 +10659,12 @@
             characterItems = mooncakeRelevantCharacterItems(allItems);
             characterInventoryItems = mooncakeInventoryCharacterItems(allItems);
             touched = true;
+            inventoryTouched = true;
         }
         if (owns('characterInventoryItems') && payload.characterInventoryItems != null) {
             characterInventoryItems = mooncakeInventoryCharacterItems(payload.characterInventoryItems);
             touched = true;
+            inventoryTouched = true;
         }
         if (owns('characterBuffs') && payload.characterBuffs != null) {
             characterBuffs = mooncakeCollectionValues(payload.characterBuffs);
@@ -10695,7 +10703,20 @@
                     mooncakeGetVirtualEnhancingCommunityBuffLevel() === 'system'
             });
         }
-        try { mooncakeScheduleWarehouseRender('character-data'); } catch (_) {}
+        // Inventory state may update while the player is fighting, chatting, or
+        // browsing another page. The warehouse will read the latest state when
+        // its visibility observer opens it, so only a visible live root needs
+        // an immediate signature comparison and render request.
+        if (inventoryTouched && mooncakeIsEnhancementInventoryWarehouseEnabled() &&
+            mooncakeWarehouseInventoryRoot?.isConnected && mooncakeWarehouseObservedRootVisible) {
+            try {
+                const inventorySignature = mooncakeWarehouseGetInventoryStateSignature(characterInventoryItems);
+                if (inventorySignature !== mooncakeWarehouseInventoryStateSignature) {
+                    mooncakeWarehouseInventoryStateSignature = inventorySignature;
+                    mooncakeScheduleWarehouseRender('items');
+                }
+            } catch (_) {}
+        }
         return true;
     }
 
@@ -11938,7 +11959,6 @@
                 characterItems: mooncakeMergeCharacterItems(itemUpdates)
             }, 'websocket-update');
             mooncakeScheduleCharacterStateSync();
-            try { mooncakeScheduleWarehouseRender('items'); } catch (_) {}
             try { scheduleMooncakeEnhanceProtectionBuyBox(80); } catch (_) {}
             return true;
         }
@@ -23303,7 +23323,10 @@
     let mooncakeWarehousePinnedNodes = new Set();
     const mooncakeWarehouseNodeStyleSnapshots = new WeakMap();
     const mooncakeWarehouseOwnedInlineStyles = new WeakMap();
+    const mooncakeWarehousePinnedNodeIds = new WeakMap();
+    let mooncakeWarehouseNextPinnedNodeId = 1;
     let mooncakeWarehouseMutationUnsubscribe = null;
+    let mooncakeWarehouseRootMutationObserver = null;
     let mooncakeWarehouseMenuTarget = null;
     let mooncakeWarehouseMenuSequence = 0;
     let mooncakeWarehouseResizeObserver = null;
@@ -23312,7 +23335,8 @@
     let mooncakeWarehouseObservedCurrentEquipment = null;
     let mooncakeWarehouseObservedCurrentEquipmentSignature = '';
     let mooncakeWarehouseObservedCurrentEquipmentRoot = null;
-    let mooncakeWarehouseCurrentEquipmentIntegrityDirty = false;
+    let mooncakeWarehouseCurrentEquipmentLease = null;
+    let mooncakeWarehouseCurrentEquipmentLeaseTimer = 0;
     let mooncakeWarehouseObservedRoot = null;
     let mooncakeWarehouseObservedWidth = null;
     let mooncakeWarehouseObservedRootVisible = false;
@@ -23326,11 +23350,22 @@
     let mooncakeWarehouseDialogSequence = 0;
     let mooncakeWarehousePanel = null;
     let mooncakeWarehousePanelSignature = '';
-    let mooncakeWarehouseProjectionSignature = '';
+    let mooncakeWarehousePinnedLayoutSignature = '';
     let mooncakeWarehouseLayoutSignature = '';
     let mooncakeWarehouseLayoutMetrics = null;
     let mooncakeWarehousePendingVisibleRender = false;
     let mooncakeWarehouseGeometryDirty = true;
+    // The native inventory changes much less often than queue state. Keep the
+    // expensive DOM collection and state-derived indexes scoped to their real
+    // sources instead of rebuilding them for every document mutation.
+    let mooncakeWarehouseInventoryEntriesRoot = null;
+    let mooncakeWarehouseInventoryEntries = [];
+    let mooncakeWarehouseInventoryEntriesDirty = true;
+    let mooncakeWarehouseMembershipIndex = null;
+    let mooncakeWarehouseMembershipIndexState = null;
+    let mooncakeWarehouseMaterialRelations = null;
+    let mooncakeWarehouseMaterialRelationsSignature = '';
+    let mooncakeWarehouseMaterialRelationsItemDetailMap = null;
 
     function mooncakeWarehouseText(key) {
         const zh = {
@@ -23570,6 +23605,40 @@
         };
     }
 
+    function mooncakeWarehouseInvalidateStateCaches() {
+        mooncakeWarehouseMembershipIndex = null;
+        mooncakeWarehouseMembershipIndexState = null;
+        mooncakeWarehouseMaterialRelations = null;
+        mooncakeWarehouseMaterialRelationsSignature = '';
+        mooncakeWarehouseMaterialRelationsItemDetailMap = null;
+    }
+
+    function mooncakeWarehouseInvalidateInventoryEntries(root = null) {
+        if (!root || mooncakeWarehouseInventoryEntriesRoot === root) {
+            mooncakeWarehouseInventoryEntriesDirty = true;
+        }
+    }
+
+    function mooncakeWarehouseResetInventoryEntries() {
+        mooncakeWarehouseInventoryEntriesRoot = null;
+        mooncakeWarehouseInventoryEntries = [];
+        mooncakeWarehouseInventoryEntriesDirty = true;
+    }
+
+    function mooncakeWarehouseGetInventoryStateSignature(items = characterInventoryItems) {
+        const totals = new Map();
+        for (const item of mooncakeInventoryCharacterItems(items)) {
+            const itemHrid = mooncakeWarehouseNormalizeItemHrid(item?.itemHrid);
+            if (!itemHrid) continue;
+            const key = mooncakeWarehouseIdentityKey(itemHrid, item.enhancementLevel);
+            totals.set(key, (totals.get(key) || 0) + Math.max(0, Number(item?.count) || 0));
+        }
+        return [...totals.entries()]
+            .sort((left, right) => left[0].localeCompare(right[0]))
+            .map(([key, count]) => `${key}\u0002${count}`)
+            .join('\u0003');
+    }
+
     function mooncakeWarehouseEnsureState() {
         const characterId = mooncakeCharacterId == null ? null : String(mooncakeCharacterId);
         if (mooncakeWarehouseState && mooncakeWarehouseLoadedCharacterId === characterId) return mooncakeWarehouseState;
@@ -23580,6 +23649,7 @@
         }
         mooncakeWarehouseState = mooncakeWarehouseNormalizeState(raw);
         mooncakeWarehouseLoadedCharacterId = characterId;
+        mooncakeWarehouseInvalidateStateCaches();
         return mooncakeWarehouseState;
     }
 
@@ -23587,6 +23657,7 @@
         const state = mooncakeWarehouseEnsureState();
         const storageKey = mooncakeWarehouseStorageKey();
         state.updatedAt = Date.now();
+        mooncakeWarehouseInvalidateStateCaches();
         if (storageKey) {
             try { localStorage.setItem(storageKey, JSON.stringify(state)); } catch (_) {}
         }
@@ -23692,23 +23763,43 @@
         return true;
     }
 
-    function mooncakeWarehouseGetManualMembership(itemHrid, enhancementLevel) {
+    function mooncakeWarehouseGetMembershipIndex() {
         const state = mooncakeWarehouseEnsureState();
+        if (mooncakeWarehouseMembershipIndex && mooncakeWarehouseMembershipIndexState === state) {
+            return mooncakeWarehouseMembershipIndex;
+        }
+        const exact = new Map();
+        const all = new Map();
+        for (const membership of state.memberships) {
+            if (membership.levelMode === 'exact') {
+                exact.set(mooncakeWarehouseIdentityKey(membership.itemHrid, membership.enhancementLevel), membership);
+            } else {
+                all.set(membership.itemHrid, membership);
+            }
+        }
+        mooncakeWarehouseMembershipIndex = { exact, all };
+        mooncakeWarehouseMembershipIndexState = state;
+        return mooncakeWarehouseMembershipIndex;
+    }
+
+    function mooncakeWarehouseGetManualMembership(itemHrid, enhancementLevel) {
         const normalizedHrid = mooncakeWarehouseNormalizeItemHrid(itemHrid);
         if (!normalizedHrid) return null;
         const level = mooncakeWarehouseNormalizeLevel(enhancementLevel);
-        const exact = state.memberships.find(entry => entry.itemHrid === normalizedHrid && entry.levelMode === 'exact' && entry.enhancementLevel === level);
-        return exact || state.memberships.find(entry => entry.itemHrid === normalizedHrid && entry.levelMode === 'all') || null;
+        const index = mooncakeWarehouseGetMembershipIndex();
+        return index.exact.get(mooncakeWarehouseIdentityKey(normalizedHrid, level)) ||
+            index.all.get(normalizedHrid) || null;
     }
 
     function mooncakeWarehouseGetStoredMembership(itemHrid, enhancementLevel, levelMode) {
-        const state = mooncakeWarehouseEnsureState();
         const normalizedHrid = mooncakeWarehouseNormalizeItemHrid(itemHrid);
         if (!normalizedHrid) return null;
         const normalizedMode = levelMode === 'exact' ? 'exact' : 'all';
         const level = mooncakeWarehouseNormalizeLevel(enhancementLevel);
-        return state.memberships.find(entry => entry.itemHrid === normalizedHrid && entry.levelMode === normalizedMode &&
-            (normalizedMode !== 'exact' || entry.enhancementLevel === level)) || null;
+        const index = mooncakeWarehouseGetMembershipIndex();
+        return normalizedMode === 'exact'
+            ? index.exact.get(mooncakeWarehouseIdentityKey(normalizedHrid, level)) || null
+            : index.all.get(normalizedHrid) || null;
     }
 
     function mooncakeWarehouseSetManualMembership(itemHrid, enhancementLevel, categoryId, levelMode = 'all') {
@@ -23777,6 +23868,13 @@
     }
 
     function mooncakeWarehouseBuildMaterialRelations() {
+        const targets = mooncakeWarehouseGetEnhancementTargets();
+        const targetSignature = JSON.stringify([...targets.keys()].sort());
+        if (mooncakeWarehouseMaterialRelations &&
+            mooncakeWarehouseMaterialRelationsSignature === targetSignature &&
+            mooncakeWarehouseMaterialRelationsItemDetailMap === itemDetailMap) {
+            return mooncakeWarehouseMaterialRelations;
+        }
         const relations = new Map();
         const add = (itemHrid, role, sourceHrid) => {
             const hrid = mooncakeWarehouseNormalizeItemHrid(itemHrid);
@@ -23792,7 +23890,7 @@
             relation.sourceHrids.add(sourceHrid);
             relations.set(key, relation);
         };
-        for (const sourceHrid of mooncakeWarehouseGetEnhancementTargets().keys()) {
+        for (const sourceHrid of targets.keys()) {
             for (const protectionHrid of getProtectionItems(sourceHrid) || []) {
                 if (protectionHrid === sourceHrid) continue;
                 add(protectionHrid, 'protection', sourceHrid);
@@ -23801,6 +23899,9 @@
                 add(cost?.itemHrid, 'material', sourceHrid);
             }
         }
+        mooncakeWarehouseMaterialRelations = relations;
+        mooncakeWarehouseMaterialRelationsSignature = targetSignature;
+        mooncakeWarehouseMaterialRelationsItemDetailMap = itemDetailMap;
         return relations;
     }
 
@@ -23880,7 +23981,10 @@
         const inventoryByKey = new Map();
         const inventoryByHrid = new Map();
         const inventoryStateLevelsByHrid = new Map();
-        for (const item of mooncakeInventoryCharacterItems(characterInventoryItems)) {
+        const inventoryItems = mooncakeInventoryCharacterItems(characterInventoryItems);
+        const inventoryKeys = new Set();
+        for (const item of inventoryItems) {
+            inventoryKeys.add(mooncakeWarehouseIdentityKey(item.itemHrid, item.enhancementLevel));
             if (!(Number(item?.count ?? 1) > 0)) continue;
             const levels = inventoryStateLevelsByHrid.get(item.itemHrid) || new Set();
             levels.add(mooncakeWarehouseNormalizeLevel(item.enhancementLevel));
@@ -23969,11 +24073,11 @@
                 getItemName(left.itemHrid).localeCompare(getItemName(right.itemHrid)) ||
                 left.enhancementLevel - right.enhancementLevel);
         }
-        return { bySection, candidates, queue, materialRelations };
+        return { bySection, candidates, queue, materialRelations, inventoryItems, inventoryKeys };
     }
 
     function mooncakeWarehouseGetUnavailableSectionCount(sectionId, records, projection, shared) {
-        const inventoryKeys = shared?.inventoryKeys || new Set(mooncakeInventoryCharacterItems(characterInventoryItems)
+        const inventoryKeys = shared?.inventoryKeys || projection.inventoryKeys || new Set(mooncakeInventoryCharacterItems(characterInventoryItems)
             .map(item => mooncakeWarehouseIdentityKey(item.itemHrid, item.enhancementLevel)));
         if (!inventoryKeys.size) return 0;
         const expected = new Set();
@@ -23995,7 +24099,7 @@
                 if (!membership || membership.categoryId === MOONCAKE_WAREHOUSE_SECTION_UNCLASSIFIED) expected.add(key);
             }
         } else {
-            for (const item of mooncakeInventoryCharacterItems(characterInventoryItems)) {
+            for (const item of projection.inventoryItems || mooncakeInventoryCharacterItems(characterInventoryItems)) {
                 const membership = mooncakeWarehouseGetManualMembership(item.itemHrid, item.enhancementLevel);
                 const key = mooncakeWarehouseIdentityKey(item.itemHrid, item.enhancementLevel);
                 if (membership?.categoryId === sectionId && !queueKeys.has(key)) {
@@ -24029,8 +24133,11 @@
         for (const mutation of mutations) {
             for (const node of mutation.addedNodes) {
                 if (!(node instanceof Element)) continue;
-                if (node.matches?.(MOONCAKE_WAREHOUSE_SUNNY_CONFLICT_SELECTOR) ||
-                    node.querySelector?.(MOONCAKE_WAREHOUSE_SUNNY_CONFLICT_SELECTOR)) {
+                // Do not descend through every chat/message subtree on the
+                // document observer. Sunny injects its marker node directly;
+                // a batched wrapper is still caught by the next warehouse
+                // render through mooncakeWarehouseHasSunnyConflict().
+                if (node.matches?.(MOONCAKE_WAREHOUSE_SUNNY_CONFLICT_SELECTOR)) {
                     mooncakeWarehouseSunnyConflictLatched = true;
                     return true;
                 }
@@ -24114,39 +24221,101 @@
         if (!ownedStyles.size) mooncakeWarehouseOwnedInlineStyles.delete(element);
     }
 
-    function mooncakeWarehouseRefreshInlineStyleSnapshot(element, properties) {
-        const snapshot = mooncakeWarehouseNodeStyleSnapshots.get(element);
-        if (!element || !snapshot) return;
-        const ownedStyles = mooncakeWarehouseOwnedInlineStyles.get(element);
-        for (const property of properties) {
-            if (ownedStyles?.has(property)) continue;
-            snapshot[property] = {
-                value: element.style.getPropertyValue(property),
-                priority: element.style.getPropertyPriority(property)
-            };
-        }
+    function mooncakeWarehouseCanRetainCurrentEquipmentNode(node, root) {
+        return !!(node?.isConnected && root?.contains?.(node) &&
+            mooncakeWarehouseNormalizeItemHrid(mooncakeGetItemHridFromContainer(node)) &&
+            node.querySelector?.('[class*="Item_item__"]'));
     }
 
-    function mooncakeWarehouseCurrentEquipmentNeedsRepair(target, root, checkLayout = true) {
+    function mooncakeWarehouseCurrentEquipmentNeedsRepair(target, root) {
         if (!target || target.hidden || target.role !== 'current-equipment') return false;
-        const node = target.node;
-        if (!node?.isConnected || !root?.contains?.(node)) return true;
-        if (!mooncakeWarehouseNormalizeItemHrid(mooncakeGetItemHridFromContainer(node))) return true;
-        const expectedInlineStyles = {
-            position: 'absolute',
-            display: 'block',
-            opacity: '1',
-            transform: 'none',
-            visibility: 'visible'
-        };
-        for (const [property, value] of Object.entries(expectedInlineStyles)) {
-            if (node.style.getPropertyValue(property) !== value) return true;
+        // Visibility, opacity and transform are owned by the game while React
+        // swaps an enhancement result. Treating their transient leave state as
+        // damage caused a style fight and made the icon flash.
+        return !mooncakeWarehouseCanRetainCurrentEquipmentNode(target.node, root);
+    }
+
+    function mooncakeWarehouseClearCurrentEquipmentLease() {
+        if (mooncakeWarehouseCurrentEquipmentLeaseTimer) {
+            clearTimeout(mooncakeWarehouseCurrentEquipmentLeaseTimer);
         }
-        if (!checkLayout) return false;
-        const style = getComputedStyle(node);
-        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) <= 0) return true;
-        const rect = node.getBoundingClientRect();
-        return !(rect.width > 0 && rect.height > 0);
+        mooncakeWarehouseCurrentEquipmentLeaseTimer = 0;
+        mooncakeWarehouseCurrentEquipmentLease = null;
+    }
+
+    function mooncakeWarehouseScheduleCurrentEquipmentLeaseExpiry() {
+        if (mooncakeWarehouseCurrentEquipmentLeaseTimer) {
+            clearTimeout(mooncakeWarehouseCurrentEquipmentLeaseTimer);
+        }
+        mooncakeWarehouseCurrentEquipmentLeaseTimer = 0;
+        const lease = mooncakeWarehouseCurrentEquipmentLease;
+        if (!lease || !(lease.expiresAt > Date.now())) return;
+        mooncakeWarehouseCurrentEquipmentLeaseTimer = setTimeout(() => {
+            mooncakeWarehouseCurrentEquipmentLeaseTimer = 0;
+            if (mooncakeWarehouseCurrentEquipmentLease !== lease) return;
+            mooncakeWarehouseInvalidateInventoryEntries(lease.root);
+            mooncakeScheduleWarehouseRender('current-equipment-expired');
+        }, Math.max(0, lease.expiresAt - Date.now() + 1));
+    }
+
+    function mooncakeWarehouseRememberCurrentEquipment(target, root) {
+        if (!target || target.hidden || target.role !== 'current-equipment' ||
+            !mooncakeWarehouseCanRetainCurrentEquipmentNode(target.node, root)) return;
+        if (mooncakeWarehouseCurrentEquipmentLeaseTimer) {
+            clearTimeout(mooncakeWarehouseCurrentEquipmentLeaseTimer);
+        }
+        mooncakeWarehouseCurrentEquipmentLeaseTimer = 0;
+        mooncakeWarehouseCurrentEquipmentLease = {
+            node: target.node,
+            point: { ...target.point },
+            root,
+            itemHrid: mooncakeWarehouseNormalizeItemHrid(mooncakeGetItemHridFromContainer(target.node)),
+            offsetParent: null,
+            left: '',
+            top: '',
+            width: 0,
+            height: 0,
+            expiresAt: 0
+        };
+    }
+
+    function mooncakeWarehouseRememberCurrentEquipmentPlacement(node, root, offsetParent, left, top, metrics) {
+        const lease = mooncakeWarehouseCurrentEquipmentLease;
+        if (!lease || lease.node !== node || lease.root !== root) return;
+        lease.offsetParent = offsetParent;
+        lease.left = String(left || '');
+        lease.top = String(top || '');
+        lease.width = Math.max(0, Number(metrics?.itemWidth) || 0);
+        lease.height = Math.max(0, Number(metrics?.itemHeight) || 0);
+    }
+
+    function mooncakeWarehouseGetCurrentEquipmentHandoffLease(root) {
+        const lease = mooncakeWarehouseCurrentEquipmentLease;
+        if (!lease || lease.root !== root) return null;
+        if (lease.expiresAt > 0 && lease.expiresAt <= Date.now()) {
+            mooncakeWarehouseClearCurrentEquipmentLease();
+            return null;
+        }
+        return lease;
+    }
+
+    function mooncakeWarehouseStartCurrentEquipmentHandoff(lease) {
+        if (!lease || lease !== mooncakeWarehouseCurrentEquipmentLease || lease.expiresAt > 0) return;
+        lease.expiresAt = Date.now() + MOONCAKE_WAREHOUSE_CURRENT_EQUIPMENT_LEASE_MS;
+        mooncakeWarehouseScheduleCurrentEquipmentLeaseExpiry();
+    }
+
+    function mooncakeWarehouseGetCurrentEquipmentLease(root) {
+        const lease = mooncakeWarehouseGetCurrentEquipmentHandoffLease(root);
+        if (!lease) return null;
+        if (!mooncakeWarehouseCanRetainCurrentEquipmentNode(lease.node, root)) {
+            // The old React node can disappear before its replacement mounts.
+            // Keep the placement anchor briefly so the incoming card can be
+            // pinned in the same mutation turn instead of flashing in the grid.
+            mooncakeWarehouseStartCurrentEquipmentHandoff(lease);
+            return null;
+        }
+        return lease;
     }
 
     function mooncakeWarehouseDisconnectCurrentEquipmentObserver() {
@@ -24155,7 +24324,6 @@
         mooncakeWarehouseObservedCurrentEquipment = null;
         mooncakeWarehouseObservedCurrentEquipmentSignature = '';
         mooncakeWarehouseObservedCurrentEquipmentRoot = null;
-        mooncakeWarehouseCurrentEquipmentIntegrityDirty = false;
     }
 
     function mooncakeWarehouseGetCurrentEquipmentDomSignature(node) {
@@ -24184,24 +24352,85 @@
             if (mooncakeWarehouseObservedCurrentEquipment !== node ||
                 mooncakeWarehouseObservedCurrentEquipmentRoot !== root) return;
             if (!node.isConnected || !root.contains(node)) {
-                mooncakeScheduleWarehouseRender('current-equipment-dom');
+                mooncakeScheduleWarehouseRender('queue-handoff');
                 return;
             }
-            const nextSignature = mooncakeWarehouseGetCurrentEquipmentDomSignature(node);
-            const contentChanged = nextSignature !== mooncakeWarehouseObservedCurrentEquipmentSignature;
-            mooncakeWarehouseObservedCurrentEquipmentSignature = nextSignature;
+            // The game changes the icon/level inside the same card for every
+            // enhancement result. That is visual content, not a warehouse
+            // placement change; rerendering here used to make the icon blink.
+            mooncakeWarehouseObservedCurrentEquipmentSignature = mooncakeWarehouseGetCurrentEquipmentDomSignature(node);
             const target = { node, role: 'current-equipment', hidden: false };
-            if (!contentChanged && !mooncakeWarehouseCurrentEquipmentNeedsRepair(target, root)) return;
-            mooncakeWarehouseCurrentEquipmentIntegrityDirty = true;
-            mooncakeScheduleWarehouseRender('current-equipment-dom');
+            if (!mooncakeWarehouseCurrentEquipmentNeedsRepair(target, root)) return;
+            mooncakeScheduleWarehouseRender('queue-handoff');
         });
         mooncakeWarehouseCurrentEquipmentObserver.observe(node, {
             attributes: true,
-            attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'href', 'xlink:href'],
+            attributeFilter: ['hidden', 'aria-hidden', 'href', 'xlink:href'],
             childList: true,
             characterData: true,
             subtree: true
         });
+    }
+
+    function mooncakeWarehousePinCurrentEquipmentHandoffNode(node, root, lease) {
+        if (!node || !root?.contains?.(node) || !lease?.offsetParent ||
+            !lease.left || !lease.top || !(lease.width > 0) || !(lease.height > 0)) {
+            return false;
+        }
+        if (mooncakeWarehousePinnedNodes.has(node)) return false;
+        if (!mooncakeWarehouseNodeStyleSnapshots.has(node)) {
+            mooncakeWarehouseNodeStyleSnapshots.set(node, mooncakeWarehouseSnapshotInlineStyles(node, MOONCAKE_WAREHOUSE_STYLE_PROPS));
+        }
+        // This runs inside the root MutationObserver, before the browser draws
+        // the incoming React card. It deliberately owns only placement styles;
+        // the game's visual transition remains untouched, as in Sunny.
+        mooncakeWarehouseSetInlineStyle(node, 'position', 'absolute');
+        const offsetParent = node.offsetParent instanceof HTMLElement ? node.offsetParent : root;
+        if (offsetParent !== lease.offsetParent) {
+            mooncakeWarehouseRestoreOwnedInlineStyle(node, 'position');
+            return false;
+        }
+        mooncakeWarehouseSetInlineStyle(node, 'left', lease.left);
+        mooncakeWarehouseSetInlineStyle(node, 'top', lease.top);
+        mooncakeWarehouseSetInlineStyle(node, 'width', `${lease.width}px`);
+        mooncakeWarehouseSetInlineStyle(node, 'height', `${lease.height}px`);
+        mooncakeWarehouseSetInlineStyle(node, 'margin', '0px');
+        mooncakeWarehouseSetInlineStyle(node, 'z-index', '5');
+        node.setAttribute(MOONCAKE_WAREHOUSE_PINNED_ATTR, '1');
+        node.setAttribute(MOONCAKE_WAREHOUSE_ROLE_ATTR, 'current-equipment');
+        mooncakeWarehousePinnedNodes.add(node);
+        return true;
+    }
+
+    function mooncakeWarehousePinIncomingCurrentEquipment(mutations, root) {
+        const lease = mooncakeWarehouseGetCurrentEquipmentHandoffLease(root);
+        if (!lease?.itemHrid || !lease.offsetParent ||
+            mooncakeWarehouseEnsureState().sectionCollapsed[MOONCAKE_WAREHOUSE_SECTION_QUEUE] === true) {
+            return false;
+        }
+        const currentQueueItem = mooncakeWarehouseBuildQueueRecords().equipment[0];
+        if (!currentQueueItem || currentQueueItem.itemHrid !== lease.itemHrid) return false;
+        mooncakeWarehouseStartCurrentEquipmentHandoff(lease);
+        let pinned = false;
+        const seen = new Set();
+        for (const mutation of mutations) {
+            for (const addedNode of mutation.addedNodes || []) {
+                if (!(addedNode instanceof Element)) continue;
+                const nodes = [];
+                if (addedNode.matches?.('[class*="Item_itemContainer"]')) nodes.push(addedNode);
+                nodes.push(...addedNode.querySelectorAll?.('[class*="Item_itemContainer"]') || []);
+                for (const node of nodes) {
+                    if (seen.has(node)) continue;
+                    seen.add(node);
+                    if (node === lease.node ||
+                        mooncakeWarehouseNormalizeItemHrid(mooncakeGetItemHridFromContainer(node)) !== lease.itemHrid) {
+                        continue;
+                    }
+                    pinned = mooncakeWarehousePinCurrentEquipmentHandoffNode(node, root, lease) || pinned;
+                }
+            }
+        }
+        return pinned;
     }
 
     function mooncakeWarehouseRestorePinnedNode(node) {
@@ -24214,6 +24443,7 @@
 
     function mooncakeWarehouseRestorePresentation() {
         mooncakeWarehouseDisconnectCurrentEquipmentObserver();
+        mooncakeWarehouseClearCurrentEquipmentLease();
         for (const panel of document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}]`)) panel.remove();
         for (const node of mooncakeWarehousePinnedNodes) {
             mooncakeWarehouseRestorePinnedNode(node);
@@ -24226,10 +24456,11 @@
         mooncakeWarehouseRootStyleSnapshot = null;
         mooncakeWarehousePanel = null;
         mooncakeWarehousePanelSignature = '';
-        mooncakeWarehouseProjectionSignature = '';
+        mooncakeWarehousePinnedLayoutSignature = '';
         mooncakeWarehouseLayoutSignature = '';
         mooncakeWarehouseLayoutMetrics = null;
         mooncakeWarehouseGeometryDirty = true;
+        mooncakeWarehouseResetInventoryEntries();
     }
 
     function mooncakeWarehouseSuspendForSunnyConflict() {
@@ -24252,11 +24483,14 @@
     function mooncakeWarehouseStopObservingInventoryRoot() {
         if (mooncakeWarehouseResizeObserver) mooncakeWarehouseResizeObserver.disconnect();
         if (mooncakeWarehouseVisibilityObserver) mooncakeWarehouseVisibilityObserver.disconnect();
+        if (mooncakeWarehouseRootMutationObserver) mooncakeWarehouseRootMutationObserver.disconnect();
         mooncakeWarehouseResizeObserver = null;
         mooncakeWarehouseVisibilityObserver = null;
+        mooncakeWarehouseRootMutationObserver = null;
         mooncakeWarehouseObservedRoot = null;
         mooncakeWarehouseObservedWidth = null;
         mooncakeWarehouseObservedRootVisible = false;
+        mooncakeWarehouseResetInventoryEntries();
     }
 
     function mooncakeWarehouseIsInventoryRootVisible(root) {
@@ -24294,6 +24528,36 @@
         }
     }
 
+    function mooncakeWarehouseMutationTouchesObservedInventory(mutation, root) {
+        const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
+        if (!target || (target !== root && !root.contains(target)) ||
+            mooncakeIsExternalProfitPanelNode(target) ||
+            target.closest?.(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}]`)) {
+            return false;
+        }
+        return [...mutation.addedNodes, ...mutation.removedNodes].some(node => {
+            if (!mooncakeWarehouseNodeTouchesInventoryStructure(node)) return false;
+            return !node.matches?.(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}], [${MOONCAKE_WAREHOUSE_MENU_ATTR}]`) &&
+                !node.closest?.(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}]`);
+        });
+    }
+
+    function mooncakeWarehouseObserveInventoryStructure(root) {
+        if (!root || typeof MutationObserver !== 'function' || mooncakeWarehouseRootMutationObserver) return;
+        mooncakeWarehouseRootMutationObserver = new MutationObserver(mutations => {
+            if (mooncakeWarehouseObservedRoot !== root || !root.isConnected) return;
+            if (mooncakeWarehouseMutationsIntroduceSunnyConflict(mutations)) {
+                mooncakeWarehouseSuspendForSunnyConflict();
+                return;
+            }
+            if (!mutations.some(mutation => mooncakeWarehouseMutationTouchesObservedInventory(mutation, root))) return;
+            const handedOffCurrentEquipment = mooncakeWarehousePinIncomingCurrentEquipment(mutations, root);
+            mooncakeWarehouseInvalidateInventoryEntries(root);
+            mooncakeScheduleWarehouseRender(handedOffCurrentEquipment ? 'queue-handoff' : 'inventory-dom');
+        });
+        mooncakeWarehouseRootMutationObserver.observe(root, { childList: true, subtree: true });
+    }
+
     function mooncakeWarehouseObserveInventoryRoot(root) {
         if (!root) return;
         if (mooncakeWarehouseObservedRoot !== root) {
@@ -24302,6 +24566,7 @@
             mooncakeWarehouseObservedRootVisible = mooncakeWarehouseIsInventoryRootVisible(root);
             mooncakeWarehouseObserveInventoryVisibility(root);
         }
+        mooncakeWarehouseObserveInventoryStructure(root);
         if (typeof ResizeObserver !== 'function' || mooncakeWarehouseResizeObserver) return;
         mooncakeWarehouseResizeObserver = new ResizeObserver(entries => {
             const entry = entries.find(candidate => candidate.target === mooncakeWarehouseObservedRoot);
@@ -24420,6 +24685,18 @@
         return entries;
     }
 
+    function mooncakeWarehouseGetInventoryEntries(root) {
+        if (mooncakeWarehouseInventoryEntriesRoot !== root) {
+            mooncakeWarehouseInventoryEntriesRoot = root;
+            mooncakeWarehouseInventoryEntriesDirty = true;
+        }
+        if (mooncakeWarehouseInventoryEntriesDirty) {
+            mooncakeWarehouseInventoryEntries = mooncakeWarehouseCollectInventoryNodes(root);
+            mooncakeWarehouseInventoryEntriesDirty = false;
+        }
+        return mooncakeWarehouseInventoryEntries;
+    }
+
     function mooncakeWarehouseGetLayoutMetrics(root, entries, originalPaddingTop = null) {
         // This path runs only for a new root or a real width change. Geometry is
         // read before any item style is changed, and only enough native items are
@@ -24485,13 +24762,6 @@
             [${MOONCAKE_WAREHOUSE_PANEL_ATTR}] *, [${MOONCAKE_WAREHOUSE_UI_ATTR}] * { box-sizing: border-box; }
             [${MOONCAKE_WAREHOUSE_PANEL_ATTR}] button, [${MOONCAKE_WAREHOUSE_UI_ATTR}] button, [${MOONCAKE_WAREHOUSE_UI_ATTR}] input { font: inherit; }
             [${MOONCAKE_WAREHOUSE_PINNED_ATTR}] { box-sizing: border-box; }
-            [${MOONCAKE_WAREHOUSE_ROLE_ATTR}="current-equipment"] {
-                display: block !important; visibility: visible !important; opacity: 1 !important; transform: none !important;
-            }
-            [${MOONCAKE_WAREHOUSE_ROLE_ATTR}="current-equipment"] [class*="Item_item__"] {
-                display: grid !important; visibility: visible !important; opacity: 1 !important; transform: none !important;
-            }
-
             .mooncake-warehouse-button {
                 appearance: none; border: 1px solid #5872a0; border-radius: 4px; min-height: 25px; padding: 3px 8px;
                 background: #293852; color: #e6eeff; cursor: pointer; line-height: 1.2; transition: background .12s ease, border-color .12s ease, color .12s ease;
@@ -24503,14 +24773,20 @@
             .mooncake-warehouse-button.is-primary:hover:not(:disabled) { background: #4d74c4; border-color: #88acff; }
             .mooncake-warehouse-icon-button { width: 28px; min-width: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 15px; }
             .mooncake-warehouse-section {
-                position: absolute; left: 4px; right: 4px; height: 28px; display: flex;
-                align-items: stretch; pointer-events: auto;
+                position: absolute; left: 5px; right: 5px; height: 28px; display: flex;
+                align-items: stretch; pointer-events: auto; border-left: 2px solid #5673a6;
+                border-bottom: 1px solid rgba(92,119,166,.38); background: rgba(37,50,78,.52);
+                box-shadow: inset 0 1px rgba(255,255,255,.025);
             }
+            .mooncake-warehouse-section.is-queue { border-left-color: #d69a57; }
+            .mooncake-warehouse-section.is-enhance { border-left-color: #6688cb; }
+            .mooncake-warehouse-section.is-materials { border-left-color: #65a99f; }
+            .mooncake-warehouse-section.is-custom { border-left-color: #8a71b9; }
             .mooncake-warehouse-section-toggle {
-                appearance: none; min-width: 0; flex: 1; display: flex; align-items: center; gap: 6px; border: 0; padding: 0 6px;
+                appearance: none; min-width: 0; flex: 1; display: flex; align-items: center; gap: 6px; border: 0; padding: 0 7px;
                 background: transparent; color: #d9e3f5; cursor: pointer; text-align: left;
             }
-            .mooncake-warehouse-section-toggle:hover { background: rgba(123,160,218,.12); }
+            .mooncake-warehouse-section-toggle:hover { background: rgba(123,160,218,.16); }
             .mooncake-warehouse-section-chevron { width: 10px; color: #7f8fb0; font-size: 11px; text-align: center; }
             .mooncake-warehouse-section-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
             .mooncake-warehouse-section-settings {
@@ -24523,8 +24799,8 @@
             .mooncake-warehouse-count-badge, .mooncake-warehouse-status-badge {
                 flex: 0 0 auto; font-size: 10px; line-height: 15px; white-space: nowrap;
             }
-            .mooncake-warehouse-count-badge { color: #8fa3c6; }
-            .mooncake-warehouse-status-badge { color: #a98be5; }
+            .mooncake-warehouse-count-badge { min-width: 17px; padding: 0 4px; border: 1px solid rgba(113,142,191,.52); border-radius: 3px; color: #b7c8e8; text-align: center; }
+            .mooncake-warehouse-status-badge { margin-left: -2px; color: #80d0c3; }
             .mooncake-warehouse-empty {
                 position: absolute; left: 10px; right: 10px; min-height: 18px; line-height: 18px; color: #8994aa; font-size: 11px;
                 pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -24615,7 +24891,7 @@
 
     function mooncakeWarehouseAppendSectionHeading(panel, section, top, count, collapsed) {
         const heading = document.createElement('div');
-        heading.className = 'mooncake-warehouse-section';
+        heading.className = `mooncake-warehouse-section is-${section.kind || 'custom'}`;
         heading.style.top = `${Math.round(top)}px`;
         const toggle = document.createElement('button');
         toggle.type = 'button';
@@ -24666,14 +24942,30 @@
         panel.appendChild(empty);
     }
 
-    function mooncakeWarehouseGetProjectionSignature(projection) {
-        const records = [...projection.candidates.values()]
-            .map(record => [
-                record.key, record.sectionId, record.role, record.group,
-                record.enhancementLevel, record.sort || []
-            ])
-            .sort((left, right) => String(left[0]).localeCompare(String(right[0])));
-        return JSON.stringify({ actionCount: projection.queue.actionCount, records });
+    function mooncakeWarehouseGetPinnedNodeId(node) {
+        if (!node) return 0;
+        let id = mooncakeWarehousePinnedNodeIds.get(node);
+        if (!id) {
+            id = mooncakeWarehouseNextPinnedNodeId++;
+            mooncakeWarehousePinnedNodeIds.set(node, id);
+        }
+        return id;
+    }
+
+    function mooncakeWarehouseGetPinnedLayoutSignature(projection, state, placements) {
+        const records = [];
+        for (const record of projection.candidates.values()) {
+            const node = record.node;
+            if (!node?.isConnected) continue;
+            const point = placements.get(record.key) || { left: 0, top: 0 };
+            const hidden = state.sectionCollapsed[record.sectionId] === true || !placements.has(record.key);
+            records.push([
+                mooncakeWarehouseGetPinnedNodeId(node), record.sectionId, record.role,
+                hidden, Math.round(point.left), Math.round(point.top)
+            ]);
+        }
+        records.sort((left, right) => left[0] - right[0]);
+        return JSON.stringify(records);
     }
 
     function mooncakeWarehouseBuildPresentationModel(projection, metrics) {
@@ -24699,7 +24991,7 @@
         });
         sectionsById.set(MOONCAKE_WAREHOUSE_SECTION_MATERIALS, {
             id: MOONCAKE_WAREHOUSE_SECTION_MATERIALS,
-            title: `${mooncakeWarehouseText('materials')} · ${mooncakeWarehouseText('automatic')}`,
+            title: mooncakeWarehouseText('materials'),
             records: sectionRecords(MOONCAKE_WAREHOUSE_SECTION_MATERIALS),
             kind: 'materials',
             badge: mooncakeWarehouseText('automatic'),
@@ -24727,8 +25019,7 @@
             if (!sections.includes(section)) sections.push(section);
         }
         const sharedUnavailableKeys = {
-            inventoryKeys: new Set(mooncakeInventoryCharacterItems(characterInventoryItems)
-                .map(item => mooncakeWarehouseIdentityKey(item.itemHrid, item.enhancementLevel))),
+            inventoryKeys: projection.inventoryKeys,
             queueKeys: new Set([
                 ...[...projection.queue.equipment, ...projection.queue.protection, ...projection.queue.materials]
                     .map(record => mooncakeWarehouseIdentityKey(record.itemHrid, record.enhancementLevel)),
@@ -24799,17 +25090,15 @@
         }
 
         const panelHeight = Math.max(32, Math.ceil(y + 2));
-        const projectionSignature = mooncakeWarehouseGetProjectionSignature(projection);
-        const signature = JSON.stringify({
+        const panelSignature = JSON.stringify({
             layout: metrics.signature,
-            projection: projectionSignature,
             panelHeight,
             rows: rows.map(row => row.type === 'heading'
                 ? ['h', row.section.id, row.section.title, row.section.badge || '', row.top, row.count, row.collapsed]
-                : ['e', row.text, row.top]),
-            placements: [...placements.entries()].sort((left, right) => left[0].localeCompare(right[0]))
+                : ['e', row.text, row.top])
         });
-        return { state, rows, placements, panelHeight, projectionSignature, signature };
+        const pinnedLayoutSignature = mooncakeWarehouseGetPinnedLayoutSignature(projection, state, placements);
+        return { state, rows, placements, panelHeight, panelSignature, pinnedLayoutSignature };
     }
 
     function mooncakeWarehouseCreatePresentationPanel(model) {
@@ -24842,21 +25131,50 @@
         const currentEquipmentTarget = targets.find(target =>
             target.role === 'current-equipment' && !target.hidden
         ) || null;
-        const keepExistingCurrentShell = !currentEquipmentTarget &&
-            projection.queue.actionCount > 0 &&
+        const queueIsExpanded = projection.queue.actionCount > 0 &&
             model.state.sectionCollapsed[MOONCAKE_WAREHOUSE_SECTION_QUEUE] !== true;
+        const currentEquipmentTargetIsDrawable = !!currentEquipmentTarget &&
+            mooncakeWarehouseCanRetainCurrentEquipmentNode(currentEquipmentTarget.node, root);
+        const keepExistingCurrentShell = queueIsExpanded && !currentEquipmentTargetIsDrawable;
+        let displayedCurrentEquipmentTarget = currentEquipmentTarget;
+        if (currentEquipmentTargetIsDrawable) {
+            mooncakeWarehouseRememberCurrentEquipment(currentEquipmentTarget, root);
+        } else if (keepExistingCurrentShell) {
+            const lease = mooncakeWarehouseGetCurrentEquipmentLease(root);
+            if (lease) {
+                displayedCurrentEquipmentTarget = {
+                    node: lease.node,
+                    point: lease.point,
+                    role: 'current-equipment',
+                    hidden: false,
+                    leased: true
+                };
+                const existingTarget = targets.find(target => target.node === lease.node);
+                if (currentEquipmentTarget && currentEquipmentTarget.node !== lease.node) {
+                    const currentIndex = targets.indexOf(currentEquipmentTarget);
+                    if (currentIndex >= 0) targets.splice(currentIndex, 1);
+                    if (!targets.some(target => target.node === currentEquipmentTarget.node)) {
+                        nextPinnedNodes.delete(currentEquipmentTarget.node);
+                    }
+                }
+                if (existingTarget) Object.assign(existingTarget, displayedCurrentEquipmentTarget);
+                else {
+                    targets.push(displayedCurrentEquipmentTarget);
+                }
+                nextPinnedNodes.add(lease.node);
+            }
+        } else if (!queueIsExpanded) {
+            mooncakeWarehouseClearCurrentEquipmentLease();
+        }
         mooncakeWarehouseObserveCurrentEquipment(
-            currentEquipmentTarget?.node || null,
+            displayedCurrentEquipmentTarget?.node || null,
             root,
             keepExistingCurrentShell
         );
-        const currentEquipmentNeedsRepair = mooncakeWarehouseCurrentEquipmentIntegrityDirty ||
-            mooncakeWarehouseCurrentEquipmentNeedsRepair(currentEquipmentTarget, root, false);
 
         if (presentationUnchanged &&
             nextPinnedNodes.size === mooncakeWarehousePinnedNodes.size &&
-            [...nextPinnedNodes].every(node => mooncakeWarehousePinnedNodes.has(node)) &&
-            !currentEquipmentNeedsRepair) {
+            [...nextPinnedNodes].every(node => mooncakeWarehousePinnedNodes.has(node))) {
             return;
         }
 
@@ -24878,20 +25196,18 @@
             mooncakeWarehouseSetInlineStyle(node, 'height', `${metrics.itemHeight}px`);
             mooncakeWarehouseSetInlineStyle(node, 'margin', '0px');
             mooncakeWarehouseSetInlineStyle(node, 'z-index', '5');
-            mooncakeWarehouseSetInlineStyle(node, 'transition', 'none');
             if (target.role === 'current-equipment') {
-                // React briefly applies its native leave state while an
-                // enhancement result replaces the active item. The queue owns
-                // this one card, so keep it drawable until the projection moves
-                // to the next real inventory node.
-                mooncakeWarehouseRefreshInlineStyleSnapshot(node, ['display', 'opacity', 'transform']);
-                mooncakeWarehouseSetInlineStyle(node, 'display', 'block');
-                mooncakeWarehouseSetInlineStyle(node, 'opacity', '1');
-                mooncakeWarehouseSetInlineStyle(node, 'transform', 'none');
+                // Match Sunny's pinned-card boundary: Mooncake owns placement,
+                // while the game keeps ownership of the card's visual transition.
+                mooncakeWarehouseRestoreOwnedInlineStyle(node, 'display');
+                mooncakeWarehouseRestoreOwnedInlineStyle(node, 'opacity');
+                mooncakeWarehouseRestoreOwnedInlineStyle(node, 'transform');
+                mooncakeWarehouseRestoreOwnedInlineStyle(node, 'transition');
             } else {
                 mooncakeWarehouseRestoreOwnedInlineStyle(node, 'display');
                 mooncakeWarehouseRestoreOwnedInlineStyle(node, 'opacity');
                 mooncakeWarehouseRestoreOwnedInlineStyle(node, 'transform');
+                mooncakeWarehouseSetInlineStyle(node, 'transition', 'none');
             }
         }
 
@@ -24907,8 +25223,10 @@
             const parentRect = parentRects.get(target.offsetParent) || rootRect;
             const left = rootRect.left + target.point.left - parentRect.left;
             const top = rootRect.top + target.point.top - parentRect.top;
-            mooncakeWarehouseSetInlineStyle(target.node, 'left', `${Math.round(left)}px`);
-            mooncakeWarehouseSetInlineStyle(target.node, 'top', `${Math.round(top)}px`);
+            const pinnedLeft = `${Math.round(left)}px`;
+            const pinnedTop = `${Math.round(top)}px`;
+            mooncakeWarehouseSetInlineStyle(target.node, 'left', pinnedLeft);
+            mooncakeWarehouseSetInlineStyle(target.node, 'top', pinnedTop);
             mooncakeWarehouseSetInlineStyle(target.node, 'visibility', target.hidden ? 'hidden' : 'visible');
             if (target.node.getAttribute(MOONCAKE_WAREHOUSE_PINNED_ATTR) !== '1') {
                 target.node.setAttribute(MOONCAKE_WAREHOUSE_PINNED_ATTR, '1');
@@ -24918,18 +25236,27 @@
             } else if (target.node.getAttribute(MOONCAKE_WAREHOUSE_ROLE_ATTR) !== target.role) {
                 target.node.setAttribute(MOONCAKE_WAREHOUSE_ROLE_ATTR, target.role);
             }
+            if (currentEquipmentTargetIsDrawable && target.node === currentEquipmentTarget?.node) {
+                mooncakeWarehouseRememberCurrentEquipmentPlacement(
+                    target.node,
+                    root,
+                    target.offsetParent,
+                    pinnedLeft,
+                    pinnedTop,
+                    metrics
+                );
+            }
         }
         mooncakeWarehousePinnedNodes = nextPinnedNodes;
-        mooncakeWarehouseCurrentEquipmentIntegrityDirty = false;
     }
 
     function mooncakeWarehouseRenderPresentation(root, projection, metrics) {
         const model = mooncakeWarehouseBuildPresentationModel(projection, metrics);
         const panelIsReusable = mooncakeWarehousePanel?.isConnected &&
             mooncakeWarehousePanel.parentElement === root &&
-            mooncakeWarehousePanelSignature === model.signature;
+            mooncakeWarehousePanelSignature === model.panelSignature;
         const presentationUnchanged = panelIsReusable &&
-            mooncakeWarehouseProjectionSignature === model.projectionSignature &&
+            mooncakeWarehousePinnedLayoutSignature === model.pinnedLayoutSignature &&
             mooncakeWarehouseLayoutSignature === metrics.signature &&
             !mooncakeWarehouseGeometryDirty;
         if (!panelIsReusable) {
@@ -24937,13 +25264,13 @@
             if (mooncakeWarehousePanel?.isConnected) mooncakeWarehousePanel.replaceWith(nextPanel);
             else root.appendChild(nextPanel);
             mooncakeWarehousePanel = nextPanel;
-            mooncakeWarehousePanelSignature = model.signature;
+            mooncakeWarehousePanelSignature = model.panelSignature;
         }
 
         mooncakeWarehouseSetInlineStyle(root, 'position', 'relative');
         mooncakeWarehouseSetInlineStyle(root, 'padding-top', `${Math.ceil(metrics.paddingTop + model.panelHeight)}px`);
         mooncakeWarehouseApplyPinnedNodes(root, projection, model, metrics, presentationUnchanged);
-        mooncakeWarehouseProjectionSignature = model.projectionSignature;
+        mooncakeWarehousePinnedLayoutSignature = model.pinnedLayoutSignature;
         mooncakeWarehouseLayoutSignature = metrics.signature;
         mooncakeWarehouseGeometryDirty = false;
     }
@@ -24999,14 +25326,14 @@
                 mooncakeWarehouseLastMissingRootProbeAt = 0;
                 mooncakeWarehouseRootStyleSnapshot = mooncakeWarehouseSnapshotInlineStyles(root, MOONCAKE_WAREHOUSE_ROOT_STYLE_PROPS);
             }
-            const entries = mooncakeWarehouseCollectInventoryNodes(root);
+            mooncakeWarehouseObserveInventoryRoot(root);
+            const entries = mooncakeWarehouseGetInventoryEntries(root);
             if (!mooncakeWarehouseLayoutMetrics || (!mooncakeWarehouseLayoutMetrics.measured && entries.length > 0)) {
                 const originalPaddingTop = mooncakeWarehouseLayoutMetrics?.paddingTop ?? null;
                 mooncakeWarehouseLayoutMetrics = mooncakeWarehouseGetLayoutMetrics(root, entries, originalPaddingTop);
             }
             const projection = mooncakeWarehouseBuildProjection(entries);
             mooncakeWarehouseRenderPresentation(root, projection, mooncakeWarehouseLayoutMetrics);
-            mooncakeWarehouseObserveInventoryRoot(root);
         } catch (error) {
             console.warn('[MoonCake] inventory warehouse render failed:', error);
             mooncakeWarehouseRestorePresentation();
@@ -25027,7 +25354,13 @@
             mooncakeWarehouseSuspendForSunnyConflict();
             return;
         }
-        if (reason === 'inventory-dom') mooncakeWarehouseGeometryDirty = true;
+        if (reason === 'inventory-dom' || reason === 'inventory-root') mooncakeWarehouseGeometryDirty = true;
+        if (reason === 'items' || reason === 'action-completed' ||
+            reason === 'queue-handoff' || reason === 'current-equipment-expired' ||
+            reason === 'inventory-visible' ||
+            reason === 'document-visible') {
+            mooncakeWarehouseInvalidateInventoryEntries(mooncakeWarehouseInventoryRoot);
+        }
         if (document.hidden) {
             mooncakeWarehousePendingVisibleRender = true;
             if (mooncakeWarehouseRenderTimer) clearTimeout(mooncakeWarehouseRenderTimer);
@@ -25038,12 +25371,13 @@
         }
         // DOM mutation bursts share one frame. Non-DOM state changes retain the
         // short debounce below so queue leases and automatic materials settle.
-        if (reason === 'inventory-dom' && (mooncakeWarehouseRenderFrame || mooncakeWarehouseRenderTimer)) return;
+        if ((reason === 'inventory-dom' || reason === 'queue-handoff') &&
+            (mooncakeWarehouseRenderFrame || mooncakeWarehouseRenderTimer)) return;
         if (mooncakeWarehouseRenderTimer) clearTimeout(mooncakeWarehouseRenderTimer);
         if (mooncakeWarehouseRenderFrame) cancelAnimationFrame(mooncakeWarehouseRenderFrame);
         mooncakeWarehouseRenderTimer = 0;
         mooncakeWarehouseRenderFrame = 0;
-        if (reason === 'inventory-dom') {
+        if (reason === 'inventory-dom' || reason === 'queue-handoff') {
             mooncakeWarehouseRenderFrame = requestAnimationFrame(() => mooncakeWarehouseRender());
             return;
         }
@@ -25055,6 +25389,8 @@
         mooncakeWarehouseClearStableQueueState();
         mooncakeWarehouseState = null;
         mooncakeWarehouseLoadedCharacterId = null;
+        mooncakeWarehouseInventoryStateSignature = '';
+        mooncakeWarehouseInvalidateStateCaches();
         mooncakeWarehouseMenuTarget = null;
         mooncakeWarehouseMenuSequence += 1;
         mooncakeWarehouseCloseDialogs();
@@ -25713,6 +26049,16 @@
         );
     }
 
+    function mooncakeWarehouseMutationsMayReplaceInventoryRoot(mutations, currentRoot = null) {
+        return mutations.some(mutation => [...mutation.addedNodes].some(node => {
+            if (!(node instanceof Element)) return false;
+            // A live root owns its item mutations through its dedicated
+            // observer. Only a separate inventory root can replace it.
+            if (currentRoot && (node === currentRoot || currentRoot.contains(node) || node.contains(currentRoot))) return false;
+            return mooncakeWarehouseNodeMayReplaceInventoryRoot(node);
+        }));
+    }
+
     function startMooncakeInventoryWarehouse() {
         if (window.__mooncakeInventoryWarehouseStarted) return;
         window.__mooncakeInventoryWarehouseStarted = true;
@@ -25726,37 +26072,35 @@
         mooncakeWarehouseMutationUnsubscribe = subscribeDocumentMutations('mooncake-inventory-warehouse', mutations => {
             if (!mooncakeIsEnhancementInventoryWarehouseEnabled()) return;
             if (mooncakeWarehouseSunnyConflictLatched) return;
+            if (mooncakeWarehouseMutationsIntroduceSunnyConflict(mutations)) {
+                mooncakeWarehouseSuspendForSunnyConflict();
+                return;
+            }
+            const currentRoot = mooncakeWarehouseInventoryRoot;
+            if (currentRoot?.isConnected) {
+                if (!mooncakeWarehouseMutationsMayReplaceInventoryRoot(mutations, currentRoot)) return;
+                if (document.hidden) {
+                    mooncakeWarehousePendingVisibleRender = true;
+                    mooncakeWarehouseGeometryDirty = true;
+                    return;
+                }
+                mooncakeWarehouseInvalidateInventoryEntries(currentRoot);
+                mooncakeScheduleWarehouseRender('inventory-root');
+                return;
+            }
+
+            // No mounted root is rare. Retain a throttled discovery fallback
+            // for keyboard/script navigation, while leaving all active-root
+            // item work to the root-scoped observer above.
+            const activeRoot = mooncakeWarehouseGetActiveRootForMutations();
+            if (!activeRoot) return;
             if (document.hidden) {
                 mooncakeWarehousePendingVisibleRender = true;
                 mooncakeWarehouseGeometryDirty = true;
                 return;
             }
-            const activeRoot = mooncakeWarehouseGetActiveRootForMutations();
-            if (!activeRoot) return;
-            if (mooncakeWarehouseMutationsIntroduceSunnyConflict(mutations)) {
-                mooncakeWarehouseSuspendForSunnyConflict();
-                return;
-            }
-            const relevant = mutations.some(mutation => {
-                const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
-                if (mooncakeIsExternalProfitPanelNode(target) ||
-                    target?.closest?.(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}]`)) return false;
-                if (activeRoot?.isConnected) {
-                    if (target && (target === activeRoot || activeRoot.contains(target))) {
-                        return [...mutation.addedNodes, ...mutation.removedNodes].some(node => {
-                            if (!mooncakeWarehouseNodeTouchesInventoryStructure(node)) return false;
-                            return !node.matches(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}], [${MOONCAKE_WAREHOUSE_MENU_ATTR}]`) &&
-                                !node.closest?.(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}]`);
-                        });
-                    }
-                    // A live inventory root means generic item cards elsewhere (market,
-                    // chat, tooltips) cannot affect the warehouse projection. Only a
-                    // replacement inventory root is relevant outside it.
-                    return [...mutation.addedNodes].some(mooncakeWarehouseNodeMayReplaceInventoryRoot);
-                }
-                return [...mutation.addedNodes].some(mooncakeWarehouseNodeMayReplaceInventoryRoot);
-            });
-            if (relevant) mooncakeScheduleWarehouseRender('inventory-dom');
+            mooncakeWarehouseInvalidateInventoryEntries(activeRoot);
+            mooncakeScheduleWarehouseRender('inventory-root');
         });
         mooncakeScheduleWarehouseRender('warehouse-start');
     }
