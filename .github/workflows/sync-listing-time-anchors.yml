@@ -61,6 +61,14 @@ jobs:
             echo 'Donation rankings mirror is already current.'
             exit 0
           fi
+          if [[ -f "$target" ]]; then
+            local_updated_at="$(node -e "const data=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'));const timestamp=Date.parse(data.updatedAt||'');if(Number.isFinite(timestamp))process.stdout.write(String(timestamp));" "$target")"
+            incoming_updated_at="$(node -e "const data=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'));const timestamp=Date.parse(data.updatedAt||'');if(Number.isFinite(timestamp))process.stdout.write(String(timestamp));" "$temporary")"
+            if [[ -n "$local_updated_at" ]] && { [[ -z "$incoming_updated_at" ]] || (( local_updated_at > incoming_updated_at )); }; then
+              echo 'Keeping newer local donation rankings.'
+              exit 0
+            fi
+          fi
           mv "$temporary" "$target"
 
       - name: Commit updated mirror
