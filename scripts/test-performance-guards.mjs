@@ -71,6 +71,13 @@ vm.runInNewContext(`
 assert.equal(warehouseSandbox.getActiveWarehouseRoot(), null, 'a mounted but hidden inventory must defer to its visibility observer');
 assert.equal(warehouseSandbox.rootLookups, 0, 'hidden inventory must not trigger a root lookup for every document mutation');
 warehouseSandbox.mooncakeWarehouseInventoryRoot = null;
+assert.equal(
+    warehouseSandbox.getActiveWarehouseRoot(),
+    null,
+    'a connected outer inventory root must suppress rediscovery while native views own the layout'
+);
+assert.equal(warehouseSandbox.rootLookups, 0, 'native inventory views must not restart full-document root discovery');
+warehouseSandbox.mooncakeWarehouseObservedRoot = null;
 assert.ok(warehouseSandbox.getActiveWarehouseRoot(), 'a missing root must still be discovered after the probe interval');
 assert.equal(warehouseSandbox.rootLookups, 1, 'the first missing-root probe must query once');
 warehouseSandbox.performance.now = () => 1200;

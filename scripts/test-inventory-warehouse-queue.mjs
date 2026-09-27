@@ -354,8 +354,13 @@ assert.match(
 );
 assert.match(
     source,
-    /mooncakeWarehouseGetDuplicateInventoryNodeScore\(node\) >\s*mooncakeWarehouseGetDuplicateInventoryNodeScore\(entries\[previousIndex\]\.node\)/,
+    /mooncakeWarehouseGetDuplicateInventoryNodeScore\(node\) >\s*mooncakeWarehouseGetDuplicateInventoryNodeScore\(previous\.node\)/,
     'the collector must prefer the drawable entering node over a stale duplicate'
+);
+assert.match(
+    source,
+    /previous\.grid !== grid[\s\S]{0,500}aliasNodes/,
+    'favorite/category copies must be retained as managed aliases instead of leaking into the native grid'
 );
 assert.match(
     source,

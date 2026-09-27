@@ -9,9 +9,23 @@
 
     const userLanguage = localStorage.getItem('i18nextLng');
     const isZH = userLanguage?.startsWith("zh");
-    const MOONCAKE_MARKET_SELL_TAX_RATE = 0.05;
+    const MOONCAKE_MARKET_SELL_TAX_RATE = 0.04;
+    const MOONCAKE_COWBELL_BAG_SELL_TAX_RATE = 0.18;
     const MOONCAKE_MARKET_SELL_NET_FACTOR = 1 - MOONCAKE_MARKET_SELL_TAX_RATE;
     const MOONCAKE_MARKET_SELL_TAX_PERCENT = Math.round(MOONCAKE_MARKET_SELL_TAX_RATE * 100);
+
+    function mooncakeGetMarketSellTaxRate(itemHrid = '') {
+        if (itemHrid === '/items/coin' || itemHrid === '/items/coins') return 0;
+        if (itemHrid === '/items/bag_of_10_cowbells') return MOONCAKE_COWBELL_BAG_SELL_TAX_RATE;
+        return MOONCAKE_MARKET_SELL_TAX_RATE;
+    }
+
+    function mooncakeGetMarketNetSaleUnitPrice(unitPrice, itemHrid = '') {
+        const price = Number(unitPrice);
+        if (!Number.isFinite(price)) return NaN;
+        return Math.floor((1 - mooncakeGetMarketSellTaxRate(itemHrid)) * price);
+    }
+
     // Q7 keeps the history API; live browser reports use the maintained WebSocket service.
     const MOONCAKE_Q7_MARKET_REPORT_SOCKET_URL = 'wss://mooket.qi-e.top/market/ws';
     const MOONCAKE_Q7_MARKET_REPORT_PAYLOAD_TYPE = 'browser_active_report_bulk';
@@ -2365,6 +2379,7 @@
             orderQuantity: mooncakeNormalizeListingFundsNumber(listing.orderQuantity ?? listing.quantity),
             filledQuantity: mooncakeNormalizeListingFundsNumber(listing.filledQuantity),
             price: mooncakeNormalizeListingFundsNumber(listing.price ?? listing.orderPrice ?? listing.listingPrice),
+            workingPrice: mooncakeNormalizeListingFundsNumber(listing.workingPrice),
             coinsAvailable: mooncakeNormalizeListingFundsNumber(listing.coinsAvailable),
             unclaimedCoinCount: mooncakeNormalizeListingFundsNumber(listing.unclaimedCoinCount),
             unclaimedItemCount: mooncakeNormalizeListingFundsNumber(listing.unclaimedItemCount),
@@ -2429,8 +2444,8 @@
             prepaidCoins += listing.coinsAvailable;
             if (!listing.isSell) return;
             const remainingQuantity = Math.max(0, listing.orderQuantity - listing.filledQuantity);
-            const taxRate = listing.itemHrid === '/items/bag_of_10_cowbells' ? 0.82 : 0.95;
-            sellProceeds += remainingQuantity * Math.floor(listing.price * taxRate);
+            const listingPrice = listing.workingPrice > 0 ? listing.workingPrice : listing.price;
+            sellProceeds += remainingQuantity * mooncakeGetMarketNetSaleUnitPrice(listingPrice, listing.itemHrid);
         });
         return {
             unclaimedCoins: Math.floor(unclaimedCoins),
@@ -7547,7 +7562,7 @@
     }
 
     function getProfitPerItem(metrics, price) {
-        return price * MOONCAKE_MARKET_SELL_NET_FACTOR - metrics.totalCost;
+        return mooncakeGetMarketNetSaleUnitPrice(price) - metrics.totalCost;
     }
 
     function buildProfitPerItemTooltipLine(metrics, price) {
@@ -7590,12 +7605,13 @@
             }
         }
         if (!shardLines.length) return null;
+        const netSalePrice = mooncakeGetMarketNetSaleUnitPrice(price, targetHrid);
         return {
             isRefined,
             shardLines,
             refinementCost: missingPrice ? null : refinementCost,
-            equivalentBasePrice: isRefined && !missingPrice ? (Number(price) * MOONCAKE_MARKET_SELL_NET_FACTOR - refinementCost) / MOONCAKE_MARKET_SELL_NET_FACTOR : null,
-            equivalentRefinedPrice: !isRefined && !missingPrice ? (Number(price) * MOONCAKE_MARKET_SELL_NET_FACTOR + refinementCost) / MOONCAKE_MARKET_SELL_NET_FACTOR : null
+            equivalentBasePrice: isRefined && !missingPrice ? (netSalePrice - refinementCost) / MOONCAKE_MARKET_SELL_NET_FACTOR : null,
+            equivalentRefinedPrice: !isRefined && !missingPrice ? (netSalePrice + refinementCost) / MOONCAKE_MARKET_SELL_NET_FACTOR : null
         };
     }
 
@@ -7915,7 +7931,7 @@
         const hourlyWage = Number(entry.hourlyWage);
         const totalCost = Number(entry.totalCost ?? route.totalCost);
         const profit = Number.isFinite(totalCost)
-            ? Number(entry.profit ?? (Number(entry.sellPrice) * MOONCAKE_MARKET_SELL_NET_FACTOR - totalCost))
+            ? Number(entry.profit ?? (mooncakeGetMarketNetSaleUnitPrice(entry.sellPrice) - totalCost))
             : NaN;
         const routeLabel = mooncakeGetEnhancementRouteLabel(route);
         const kindLabel = kind === 'selected'
@@ -8026,7 +8042,7 @@
     }
 
     function buildTooltipHtml(enhancementLevel, metrics, price, options = {}) {
-        const afterTax = price * MOONCAKE_MARKET_SELL_NET_FACTOR;
+        const afterTax = mooncakeGetMarketNetSaleUnitPrice(price, options.itemHrid);
         const hourlyCost = metrics.hourlyWage || 0;
         const isMirrorRoute = metrics.routeType === 'philosophersMirror';
         const isRefinementCarryoverRoute = metrics.routeType === 'refinementCarryover';
@@ -8359,7 +8375,7 @@
         if (!(resolvedItemLevel > 0) || mooncakeGetProfitabilityEnhancementBucket(enhancementLevel) <= 0 || !(price > 0) || !(cost > 0) || !Number.isFinite(wage)) {
             return null;
         }
-        const profit = price * MOONCAKE_MARKET_SELL_NET_FACTOR - cost;
+        const profit = mooncakeGetMarketNetSaleUnitPrice(price, itemHrid) - cost;
         const profitMargin = profit / cost;
         const hourlyTier = mooncakeGetHourlyWageTier(wage);
         const marginTier = mooncakeGetProfitMarginTier(resolvedItemLevel, enhancementLevel, profitMargin);
@@ -8503,7 +8519,7 @@
             return null;
         }
         if (!(manufacturingCost > 0)) return null;
-        const afterTaxRevenue = grossPrice * MOONCAKE_MARKET_SELL_NET_FACTOR;
+        const afterTaxRevenue = mooncakeGetMarketNetSaleUnitPrice(grossPrice, itemHrid);
         return {
             grossPrice,
             afterTaxRevenue,
@@ -11375,7 +11391,7 @@
         const expectedUnitValue = completedCount > 0 ? expectedTotalCost / completedCount : 0;
         const unitFinalValue = getMergeFinalUnitValue(itemHrid, target, success, marketData, expectedUnitValue);
         const finalValue = unitFinalValue * completedCount;
-        const netFinalValue = finalValue * MOONCAKE_MARKET_SELL_NET_FACTOR;
+        const netFinalValue = mooncakeGetMarketNetSaleUnitPrice(unitFinalValue, itemHrid) * completedCount;
         const profit = netFinalValue - actualTotalCost;
         const expectedProfit = netFinalValue - expectedTotalCost;
         const actualHourlyWage = duration > 0 ? profit / (duration / 3600) : 0;
@@ -11487,7 +11503,7 @@
                 diffText, diffColor, originalCost, finalValue, profit, profitColor,
                 expectedProfit, expectedHourlyWage, bestStrategy, actualProtectAt,
                 expectedActions, actualTotalCost, expectedTotalCost, actualHourlyWage,
-                completedCount, unitFinalValue
+                completedCount, unitFinalValue, netFinalValue
             } = data;
 
             // 使用实际持续时间并格式化为标准格式
@@ -11510,8 +11526,8 @@
             // 计算记录数量
             const recordCount = data.recordCount;
             const finalValueText = currentMultiMode
-                ? `${formatNumber(unitFinalValue)} × ${completedCount} = ${formatNumber(finalValue)} (税后: ${formatNumber(finalValue * MOONCAKE_MARKET_SELL_NET_FACTOR)})`
-                : `${formatNumber(finalValue)} (税后: ${formatNumber(finalValue * MOONCAKE_MARKET_SELL_NET_FACTOR)})`;
+                ? `${formatNumber(unitFinalValue)} × ${completedCount} = ${formatNumber(finalValue)} (税后: ${formatNumber(netFinalValue)})`
+                : `${formatNumber(finalValue)} (税后: ${formatNumber(netFinalValue)})`;
 
             // 移除旧的弹出框（如果存在）
             const oldPopup = document.querySelector('.merge-result-popup');
@@ -13570,7 +13586,7 @@
         const baseItemCost = Math.max(0, Number(route?.baseItemCost ?? route?.baseItemPrice) || 0);
         const perActionCost = Math.max(0, Number(route?.perActionCost) || 0);
         const protectCost = Math.max(0, Number(route?.minProtectCost) || 0);
-        const revenue = Number(selectedPrice) * MOONCAKE_MARKET_SELL_NET_FACTOR;
+        const revenue = mooncakeGetMarketNetSaleUnitPrice(selectedPrice);
         if (!(Number(selectedPrice) > 0) || !Number.isFinite(revenue)) return null;
         const cacheKey = JSON.stringify([entry.key, baseItemCost, perActionCost, protectCost, revenue]);
         const cached = mooncakeTraditionalEnhancementRiskCostCache.get(cacheKey);
@@ -13736,7 +13752,7 @@
     function mooncakeBuildTraditionalRouteComparisonEntry(itemHrid, targetLevel, route, selectedPrice) {
         const risk = mooncakeBuildTraditionalRouteRiskSummary(itemHrid, targetLevel, route, selectedPrice);
         if (!risk || !(route.totalTimeHours > 0)) return null;
-        const netRevenue = Number(selectedPrice) * MOONCAKE_MARKET_SELL_NET_FACTOR;
+        const netRevenue = mooncakeGetMarketNetSaleUnitPrice(selectedPrice, itemHrid);
         const profit = netRevenue - Number(route.totalCost);
         return {
             route,
@@ -13998,7 +14014,7 @@
             let hourlyWage = 0;
             if (targetLeftPrice > 0 && totalCost > 0 && totalTimeHours > 0) {
                 // 计算利润和工时费
-                const profit = targetLeftPrice * MOONCAKE_MARKET_SELL_NET_FACTOR - totalCost;
+                const profit = mooncakeGetMarketNetSaleUnitPrice(targetLeftPrice, itemHrid) - totalCost;
                 hourlyWage = profit / totalTimeHours;
             }
 
@@ -14573,7 +14589,7 @@
             const signature = selected.map(component => `${component.itemHrid}:${component.level}:${component.plan.protectAt}`).join('|');
             const route = mooncakeAggregateMirrorRoute(template, selected);
             if (!(route.totalTimeHours > 0)) return route;
-            const nextLambda = (price * MOONCAKE_MARKET_SELL_NET_FACTOR - route.totalCost) / route.totalTimeHours;
+            const nextLambda = (mooncakeGetMarketNetSaleUnitPrice(price) - route.totalCost) / route.totalTimeHours;
             bestRoute = route;
             if (signature === lastSignature || Math.abs(nextLambda - lambda) < 0.01) break;
             lastSignature = signature;
@@ -14643,9 +14659,10 @@
             }
             const validHourlyRoutes = hourlyRoutes.filter(route => Number(route?.totalTimeHours) > 0);
             if (!validHourlyRoutes.length) return null;
+            const netSalePrice = mooncakeGetMarketNetSaleUnitPrice(price, candidates.itemHrid);
             highestHourlyRoute = validHourlyRoutes.reduce((best, route) => {
-                const hourly = (price * MOONCAKE_MARKET_SELL_NET_FACTOR - route.totalCost) / route.totalTimeHours;
-                const bestHourly = best ? (price * MOONCAKE_MARKET_SELL_NET_FACTOR - best.totalCost) / best.totalTimeHours : -Infinity;
+                const hourly = (netSalePrice - route.totalCost) / route.totalTimeHours;
+                const bestHourly = best ? (netSalePrice - best.totalCost) / best.totalTimeHours : -Infinity;
                 return !best || hourly > bestHourly + MOONCAKE_ROUTE_SELECTION_EPSILON ||
                     (Math.abs(hourly - bestHourly) <= MOONCAKE_ROUTE_SELECTION_EPSILON && route.totalCost < best.totalCost) ? route : best;
             }, null);
@@ -14768,7 +14785,7 @@
         if (!route || !(route.totalTimeHours > 0)) return null;
         return {
             ...route,
-            hourlyWage: (Number(price) * MOONCAKE_MARKET_SELL_NET_FACTOR - route.totalCost) / route.totalTimeHours
+            hourlyWage: (mooncakeGetMarketNetSaleUnitPrice(price, itemHrid) - route.totalCost) / route.totalTimeHours
         };
     }
 
@@ -14803,7 +14820,7 @@
         const totalTimeHours = Number(normalizedRoute.totalTimeHours);
         const totalCost = Number(normalizedRoute.totalCost);
         const sellPrice = Number(price);
-        const netRevenue = sellPrice * MOONCAKE_MARKET_SELL_NET_FACTOR;
+        const netRevenue = mooncakeGetMarketNetSaleUnitPrice(sellPrice);
         const profit = Number.isFinite(totalCost) && Number.isFinite(netRevenue)
             ? netRevenue - totalCost
             : null;
@@ -15928,13 +15945,6 @@
         return Number.isFinite(value) && value > 0 ? value : null;
     }
 
-    function mooncakeGetAlchemyOutputNetFactor(itemHrid) {
-        if (itemHrid === '/items/coin' || itemHrid === '/items/coins') return 1;
-        // Cowbell bags use the game's 18% market tax rather than the normal 5%.
-        if (itemHrid === '/items/bag_of_10_cowbells') return 0.82;
-        return MOONCAKE_MARKET_SELL_NET_FACTOR;
-    }
-
     function mooncakeGetAlchemyActionCoinCost(actionKey, inputDetail, attempts, bulkMultiplier) {
         const actionUnits = Number(attempts) * Number(bulkMultiplier);
         if (!(actionUnits >= 0) || !Number.isFinite(actionUnits)) return null;
@@ -16005,7 +16015,7 @@
                 missingOutputItems.push(output);
                 continue;
             }
-            totalOutput += outputPrice * output.count * mooncakeGetAlchemyOutputNetFactor(output.itemHrid);
+            totalOutput += mooncakeGetMarketNetSaleUnitPrice(outputPrice, output.itemHrid) * output.count;
         }
 
         const netInputCount = Math.max(0, grossInputCount - Math.min(grossInputCount, returnedInputCount));
@@ -18949,7 +18959,10 @@
                 for (const [hrid, levelsObj] of Object.entries(json || {})) {
                     const data = levelsObj?.[String(level)];
                     if (!Array.isArray(data)) continue;
-                    const processed = processMarketHistory(data, { includeTimeline });
+                    const processed = processMarketHistory(data, {
+                        includeTimeline,
+                        enhancementLevel: level
+                    });
                     const windows = includeTimeline ? processed.windows : processed;
                     const timeline = includeTimeline ? processed.timeline : null;
                     if (!result[hrid]) result[hrid] = {};
@@ -19024,67 +19037,48 @@
         };
     }
 
-    // Marketplace ticks are now one tenth of the former values. Prices remain
-    // integer coins, so the smallest valid tick is one coin.
-    const MOONCAKE_MARKET_PRICE_TIERS = [
-            { max: 500, step: 1, offset: 0 },
-            { max: 1000, step: 2, offset: 500 },
-            { max: 3000, step: 5, offset: 1000 },
-            { max: 5000, step: 10, offset: 3000 },
-            { max: 10000, step: 20, offset: 5000 },
-            { max: 30000, step: 50, offset: 10000 },
-            { max: 50000, step: 100, offset: 30000 },
-            { max: 100000, step: 200, offset: 50000 },
-            { max: 300000, step: 500, offset: 100000 },
-            { max: 500000, step: 1000, offset: 300000 },
-            { max: 1000000, step: 2000, offset: 500000 },
-            { max: 3000000, step: 5000, offset: 1000000 },
-            { max: 5000000, step: 10000, offset: 3000000 },
-            { max: 10000000, step: 20000, offset: 5000000 },
-            { max: 30000000, step: 50000, offset: 10000000 },
-            { max: 50000000, step: 100000, offset: 30000000 },
-            { max: 100000000, step: 200000, offset: 50000000 },
-            { max: 300000000, step: 500000, offset: 100000000 },
-            { max: 500000000, step: 1000000, offset: 300000000 },
-            { max: 1000000000, step: 2000000, offset: 500000000 },
-            { max: 3000000000, step: 5000000, offset: 1000000000 },
-            { max: 5000000000, step: 10000000, offset: 3000000000 },
-            { max: 10000000000, step: 20000000, offset: 5000000000 },
-            { max: 30000000000, step: 50000000, offset: 10000000000 },
-            { max: 50000000000, step: 100000000, offset: 30000000000 }
+    // Keep this table and its strict upper bounds aligned with the game's
+    // MarketplaceConstants.binGap implementation. Enhanced variants use their
+    // special three-digit steps, then a five-times wider gap from four digits.
+    const MOONCAKE_MARKET_BIN_GAP_UNIT_TIERS = [
+        [12, 4],
+        [15, 5],
+        [18, 6],
+        [24, 8],
+        [30, 10],
+        [36, 12],
+        [48, 16],
+        [60, 20],
+        [75, 25],
+        [90, 30]
     ];
 
-    function mooncakeGetMarketPriceTier(price) {
-        const num = Math.abs(Number(price));
-        if (!Number.isFinite(num)) return null;
-        const tier = MOONCAKE_MARKET_PRICE_TIERS.find(item => num < item.max);
-        if (tier) return tier;
+    function mooncakeGetMarketPriceBinGap(price, enhancementLevel = 0) {
+        const integer = Math.trunc(Math.abs(Number(price)));
+        if (!Number.isSafeInteger(integer) || integer <= 0) return 0;
+        const priceText = String(integer);
+        const digitCount = priceText.length;
+        if (digitCount <= 2) return 1;
 
-        // Continue the game's leading-digit progression above the explicit
-        // common ranges instead of freezing prices above 50B on one step.
-        const integer = Math.max(1, Math.floor(num));
-        const digits = Math.floor(Math.log10(integer)) + 1;
-        const magnitude = Math.pow(10, digits - 1);
-        const leadingDigit = Math.floor(integer / magnitude);
-        if (leadingDigit <= 2) {
-            return {
-                max: 3 * magnitude,
-                step: Math.max(1, 5 * Math.pow(10, digits - 4)),
-                offset: magnitude
-            };
+        const isEnhanced = Number(enhancementLevel) > 0;
+        if (digitCount === 3) {
+            const leadingDigit = priceText[0];
+            if (isEnhanced) {
+                if (leadingDigit === '1') return 2;
+                if (leadingDigit <= '3') return 5;
+                if (leadingDigit <= '7') return 10;
+                return 20;
+            }
+            if (leadingDigit <= '3') return 1;
+            if (leadingDigit <= '7') return 2;
+            return 4;
         }
-        if (leadingDigit <= 4) {
-            return {
-                max: 5 * magnitude,
-                step: Math.max(1, Math.pow(10, digits - 3)),
-                offset: 3 * magnitude
-            };
-        }
-        return {
-            max: 10 * magnitude,
-            step: Math.max(1, 2 * Math.pow(10, digits - 3)),
-            offset: 5 * magnitude
-        };
+
+        const leadingTwoDigits = Number.parseInt(priceText.slice(0, 2), 10);
+        const unitTier = MOONCAKE_MARKET_BIN_GAP_UNIT_TIERS.find(([upperBound]) => leadingTwoDigits < upperBound);
+        const unit = unitTier?.[1] || 40;
+        const gap = unit * Math.pow(10, digitCount - 4);
+        return isEnhanced ? 5 * gap : gap;
     }
 
     function mooncakeGetMarketPriceDisplayParts(value) {
@@ -19107,7 +19101,7 @@
             divisor = 1e3;
             unit = 'K';
         }
-        const priceStep = Number(mooncakeGetMarketPriceTier(abs)?.step);
+        const priceStep = mooncakeGetMarketPriceBinGap(abs);
         const decimalPlaces = priceStep > 0 && priceStep < divisor
             ? Math.min(4, Math.max(3, Math.ceil(Math.log10(divisor / priceStep) - 1e-9)))
             : 3;
@@ -19122,21 +19116,20 @@
         return parts ? `${parts.text}${parts.unit}` : '-';
     }
 
-    function mooncakeSnapMarketPrice(price, direction = 'down') {
-        const num = Number(price);
-        if (!Number.isFinite(num) || num <= 0) return 0;
-        const tier = mooncakeGetMarketPriceTier(num);
-        if (!tier) return 0;
-        const rawIndex = (num - tier.offset) / tier.step;
-        const epsilon = 1e-9;
-        const index = direction === 'up'
-            ? Math.ceil(rawIndex - epsilon)
-            : Math.floor(rawIndex + epsilon);
-        return Math.max(1, tier.offset + Math.max(0, index) * tier.step);
+    function mooncakeSnapMarketPrice(price, direction = 'down', enhancementLevel = 0) {
+        const integer = Number.parseInt(price, 10);
+        if (!Number.isFinite(integer)) return 0;
+        if (integer <= 1) return 2;
+        const gap = mooncakeGetMarketPriceBinGap(integer, enhancementLevel);
+        if (!(gap > 0)) return 0;
+        const remainder = integer % gap;
+        let snappedPrice = integer - remainder;
+        if (direction === 'up' && remainder >= 1) snappedPrice += gap;
+        return Math.max(2, snappedPrice);
     }
 
-    function mooncakeMarketHistoryPriceTier(price, direction) {
-        return mooncakeSnapMarketPrice(price, direction === 'up' ? 'up' : 'down');
+    function mooncakeMarketHistoryPriceTier(price, direction, enhancementLevel = 0) {
+        return mooncakeSnapMarketPrice(price, direction === 'up' ? 'up' : 'down', enhancementLevel);
     }
 
     function mooncakeEstimateMarketHistorySideVolumes(rows) {
@@ -19211,6 +19204,7 @@
 
     function processMarketHistory(history, options = {}) {
         const includeTimeline = options.includeTimeline === true;
+        const enhancementLevel = Math.max(0, Math.floor(Number(options.enhancementLevel) || 0));
         const now = Date.now();
         const windows = {};
         const timeline = includeTimeline ? {} : null;
@@ -19227,10 +19221,10 @@
             let sellVolume = 0;
             const priceStats = mooncakeGetMarketHistoryPriceStats(rows, { includeTimeline });
             const minPrice = priceStats.minPrice > 0
-                ? mooncakeMarketHistoryPriceTier(priceStats.minPrice, 'down')
+                ? mooncakeMarketHistoryPriceTier(priceStats.minPrice, 'down', enhancementLevel)
                 : 0;
             const maxPrice = priceStats.maxPrice > 0
-                ? mooncakeMarketHistoryPriceTier(priceStats.maxPrice, 'up')
+                ? mooncakeMarketHistoryPriceTier(priceStats.maxPrice, 'up', enhancementLevel)
                 : 0;
             ({ buyVolume, sellVolume } = mooncakeEstimateMarketHistorySideVolumes(rows));
             windows[days] = {
@@ -22371,7 +22365,7 @@
                     if (!(totalCost > 0) || !(variant.ask < totalCost * 0.9)) continue;
                     const cheapAmount = totalCost - variant.ask;
                     const negativeHourly = strategy?.expectedSeconds > 0
-                        ? (variant.ask * MOONCAKE_MARKET_SELL_NET_FACTOR - totalCost) / (strategy.expectedSeconds / 3600)
+                        ? (mooncakeGetMarketNetSaleUnitPrice(variant.ask, candidate.itemHrid) - totalCost) / (strategy.expectedSeconds / 3600)
                         : null;
                     rows.push({
                         itemHrid: candidate.itemHrid,
@@ -22807,7 +22801,7 @@
                     if (Number.isFinite(calculatedHourlyWage)) {
                         hourlyWage = calculatedHourlyWage;
                         evaluation = result?.evaluation || null;
-                        undercutPrice = getPriceTier(ask, 'down');
+                        undercutPrice = getPriceTier(ask, 'down', enhancementLevel);
                         const undercutResult = undercutPrice > 0 && undercutPrice < ask
                             ? calcHourlyWageAndMetrics(itemHrid, enhancementLevel, marketData, undercutPrice)
                             : null;
@@ -23105,15 +23099,13 @@
     }
 
     function mooncakeFindVisibleItemNodeByHrid(hrid) {
-        const id = String(hrid || '').replace(/^\/items\//, '');
-        if (!id) return null;
-        const nodes = document.querySelectorAll('[class*="Item_item"], [class*="Item_itemContainer"]');
+        const normalizedHrid = mooncakeWarehouseNormalizeItemHrid(hrid);
+        if (!normalizedHrid) return null;
+        const nodes = document.querySelectorAll('[class*="Item_itemContainer"]');
         for (const node of nodes) {
             if (mooncakeIsExternalProfitPanelNode(node)) continue;
             if (!mooncakeIsVisibleElement(node)) continue;
-            const use = node.querySelector('use');
-            const href = use?.href?.baseVal || use?.getAttribute?.('href') || '';
-            if (href.includes(`#${id}`) || href.includes(`/items/${id}`) || href.endsWith(id)) return node;
+            if (mooncakeGetItemHridFromContainer(node) === normalizedHrid) return node;
         }
         return null;
     }
@@ -23213,8 +23205,7 @@
         return mooncakeClickAllLevelsButton(hrid);
     }
 
-    function mooncakeGetItemHridFromContainer(container) {
-        const use = container?.querySelector?.('svg use');
+    function mooncakeGetItemHridFromUse(use) {
         const href = use?.href?.baseVal || use?.getAttribute?.('href') || use?.getAttribute?.('xlink:href') || '';
         const hashIndex = href.lastIndexOf('#');
         if (hashIndex >= 0 && hashIndex < href.length - 1) {
@@ -23222,6 +23213,22 @@
         }
         const match = String(href).match(/\/items\/([^/?#]+)$/);
         return match ? `/items/${match[1]}` : null;
+    }
+
+    function mooncakeGetItemHridFromContainer(container) {
+        if (!container?.querySelectorAll) return null;
+        const preferredUses = [...container.querySelectorAll('[class*="Item_iconContainer"] svg use, [class*="Item_icon"] svg use')];
+        const remainingUses = [...container.querySelectorAll('svg use')].filter(use => !preferredUses.includes(use));
+        const candidates = [...new Set([...preferredUses, ...remainingUses]
+            .map(mooncakeGetItemHridFromUse)
+            .filter(Boolean))];
+        if (!candidates.length) return null;
+        const detailMap = mooncakeEnsureItemDetailMap();
+        if (detailMap) {
+            const knownItem = candidates.find(itemHrid => !!detailMap[itemHrid]);
+            if (knownItem) return knownItem;
+        }
+        return candidates.find(itemHrid => !/\/(?:favorite|favorites|lock|locked|star)(?:_|$)/i.test(itemHrid)) || null;
     }
 
     function mooncakeGetItemEnhancementLevelFromContainer(container) {
@@ -23492,8 +23499,11 @@
             categories: [],
             memberships: [],
             sectionCollapsed: {},
-            hiddenSections: {},
-            sectionOrder: []
+            hiddenSections: {
+                [MOONCAKE_WAREHOUSE_SECTION_MATERIALS]: true
+            },
+            sectionOrder: [],
+            activeSectionId: null
         };
     }
 
@@ -23563,12 +23573,19 @@
                 sectionCollapsed[id] = collapsed === true;
             }
         }
-        const hiddenSections = {};
+        const hiddenSections = { ...base.hiddenSections };
         for (const [id, hidden] of Object.entries(raw.hiddenSections || {})) {
             if (MOONCAKE_WAREHOUSE_SYSTEM_SECTIONS.has(id) || categoryIds.has(id)) {
                 hiddenSections[id] = hidden === true;
             }
         }
+        const activeSectionCandidate = typeof raw.activeSectionId === 'string' &&
+            (MOONCAKE_WAREHOUSE_SYSTEM_SECTIONS.has(raw.activeSectionId) || categoryIds.has(raw.activeSectionId))
+            ? raw.activeSectionId
+            : null;
+        const activeSectionId = activeSectionCandidate && hiddenSections[activeSectionCandidate] !== true
+            ? activeSectionCandidate
+            : null;
 
         // 可排序分区（强化仓库、强化材料仓库、自定义分区）的统一顺序。
         // 历史数据没有该字段时按“系统仓库在前、自定义分区按 order 在后”补齐。
@@ -23601,7 +23618,8 @@
             memberships,
             sectionCollapsed,
             hiddenSections,
-            sectionOrder
+            sectionOrder,
+            activeSectionId
         };
     }
 
@@ -23653,11 +23671,11 @@
         return mooncakeWarehouseState;
     }
 
-    function mooncakeWarehouseSaveState() {
+    function mooncakeWarehouseSaveState(invalidateDerived = true) {
         const state = mooncakeWarehouseEnsureState();
         const storageKey = mooncakeWarehouseStorageKey();
         state.updatedAt = Date.now();
-        mooncakeWarehouseInvalidateStateCaches();
+        if (invalidateDerived) mooncakeWarehouseInvalidateStateCaches();
         if (storageKey) {
             try { localStorage.setItem(storageKey, JSON.stringify(state)); } catch (_) {}
         }
@@ -23709,6 +23727,8 @@
         state.memberships = state.memberships.filter(entry => entry.categoryId !== categoryId);
         state.sectionOrder = state.sectionOrder.filter(id => id !== categoryId);
         delete state.sectionCollapsed[categoryId];
+        delete state.hiddenSections[categoryId];
+        if (state.activeSectionId === categoryId) state.activeSectionId = null;
         mooncakeWarehouseSaveState();
         mooncakeScheduleWarehouseRender('category-deleted');
         return true;
@@ -23741,6 +23761,16 @@
         return true;
     }
 
+    function mooncakeWarehouseSetActiveSection(sectionId) {
+        const state = mooncakeWarehouseEnsureState();
+        if (!MOONCAKE_WAREHOUSE_SYSTEM_SECTIONS.has(sectionId) && !mooncakeWarehouseGetCustomCategory(sectionId)) return false;
+        if (state.hiddenSections[sectionId] === true || state.activeSectionId === sectionId) return false;
+        state.activeSectionId = sectionId;
+        mooncakeWarehouseSaveState(false);
+        mooncakeScheduleWarehouseRender('section-selected');
+        return true;
+    }
+
     function mooncakeWarehouseClearSection(sectionId) {
         const state = mooncakeWarehouseEnsureState();
         if (!MOONCAKE_WAREHOUSE_SYSTEM_SECTIONS.has(sectionId) && !mooncakeWarehouseGetCustomCategory(sectionId)) return false;
@@ -23758,6 +23788,7 @@
             state.memberships = state.memberships.filter(entry => entry.categoryId !== sectionId);
         }
         state.hiddenSections[sectionId] = hidden === true;
+        if (hidden && state.activeSectionId === sectionId) state.activeSectionId = null;
         mooncakeWarehouseSaveState();
         mooncakeScheduleWarehouseRender('section-hidden');
         return true;
@@ -24017,6 +24048,7 @@
                 enhancementLevel: inventoryEntry.enhancementLevel,
                 key,
                 node: inventoryEntry.node,
+                aliasNodes: inventoryEntry.aliasNodes || [],
                 reconciledLevel
             };
             const previous = candidates.get(key);
@@ -24031,18 +24063,22 @@
         queue.protection.forEach(add);
         queue.materials.forEach(add);
 
-        const materialRelations = mooncakeWarehouseBuildMaterialRelations();
-        for (const relation of materialRelations.values()) {
-            add({
-                itemHrid: relation.itemHrid,
-                enhancementLevel: relation.enhancementLevel,
-                role: relation.roles.has('protection') ? 'warehouse-protection' : 'warehouse-material',
-                sectionId: MOONCAKE_WAREHOUSE_SECTION_MATERIALS,
-                group: relation.roles.has('protection') ? 'protection' : 'material',
-                priority: relation.roles.has('protection') ? 300 : 290,
-                sort: [getItemName(relation.itemHrid)],
-                relation
-            });
+        const materialRelations = mooncakeWarehouseEnsureState().hiddenSections[MOONCAKE_WAREHOUSE_SECTION_MATERIALS] === true
+            ? new Map()
+            : mooncakeWarehouseBuildMaterialRelations();
+        if (materialRelations.size) {
+            for (const relation of materialRelations.values()) {
+                add({
+                    itemHrid: relation.itemHrid,
+                    enhancementLevel: relation.enhancementLevel,
+                    role: relation.roles.has('protection') ? 'warehouse-protection' : 'warehouse-material',
+                    sectionId: MOONCAKE_WAREHOUSE_SECTION_MATERIALS,
+                    group: relation.roles.has('protection') ? 'protection' : 'material',
+                    priority: relation.roles.has('protection') ? 300 : 290,
+                    sort: [getItemName(relation.itemHrid)],
+                    relation
+                });
+            }
         }
 
         for (const entry of inventoryNodes) {
@@ -24404,8 +24440,9 @@
 
     function mooncakeWarehousePinIncomingCurrentEquipment(mutations, root) {
         const lease = mooncakeWarehouseGetCurrentEquipmentHandoffLease(root);
+        const activeSectionId = mooncakeWarehouseEnsureState().activeSectionId;
         if (!lease?.itemHrid || !lease.offsetParent ||
-            mooncakeWarehouseEnsureState().sectionCollapsed[MOONCAKE_WAREHOUSE_SECTION_QUEUE] === true) {
+            (activeSectionId && activeSectionId !== MOONCAKE_WAREHOUSE_SECTION_QUEUE)) {
             return false;
         }
         const currentQueueItem = mooncakeWarehouseBuildQueueRecords().equipment[0];
@@ -24542,6 +24579,13 @@
         });
     }
 
+    function mooncakeWarehouseMutationSwitchesNativeTab(mutation, root) {
+        if (mutation.type !== 'attributes') return false;
+        const target = mutation.target instanceof Element ? mutation.target : null;
+        if (!target || (target !== root && !root.contains(target))) return false;
+        return target.matches?.('[role="tab"], [class*="TabPanel_tabPanel"]') === true;
+    }
+
     function mooncakeWarehouseObserveInventoryStructure(root) {
         if (!root || typeof MutationObserver !== 'function' || mooncakeWarehouseRootMutationObserver) return;
         mooncakeWarehouseRootMutationObserver = new MutationObserver(mutations => {
@@ -24550,12 +24594,23 @@
                 mooncakeWarehouseSuspendForSunnyConflict();
                 return;
             }
-            if (!mutations.some(mutation => mooncakeWarehouseMutationTouchesObservedInventory(mutation, root))) return;
-            const handedOffCurrentEquipment = mooncakeWarehousePinIncomingCurrentEquipment(mutations, root);
-            mooncakeWarehouseInvalidateInventoryEntries(root);
-            mooncakeScheduleWarehouseRender(handedOffCurrentEquipment ? 'queue-handoff' : 'inventory-dom');
+            const nativeTabChanged = mutations.some(mutation => mooncakeWarehouseMutationSwitchesNativeTab(mutation, root));
+            const inventoryChanged = mutations.some(mutation => mooncakeWarehouseMutationTouchesObservedInventory(mutation, root));
+            if (!nativeTabChanged && !inventoryChanged) return;
+            const layoutRoot = mooncakeWarehouseInventoryRoot?.isConnected ? mooncakeWarehouseInventoryRoot : root;
+            const handedOffCurrentEquipment = inventoryChanged &&
+                mooncakeWarehousePinIncomingCurrentEquipment(mutations, layoutRoot);
+            mooncakeWarehouseInvalidateInventoryEntries(layoutRoot);
+            mooncakeScheduleWarehouseRender(nativeTabChanged
+                ? 'native-inventory-tab'
+                : (handedOffCurrentEquipment ? 'queue-handoff' : 'inventory-dom'));
         });
-        mooncakeWarehouseRootMutationObserver.observe(root, { childList: true, subtree: true });
+        mooncakeWarehouseRootMutationObserver.observe(root, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['class', 'hidden', 'aria-hidden', 'aria-selected']
+        });
     }
 
     function mooncakeWarehouseObserveInventoryRoot(root) {
@@ -24610,8 +24665,33 @@
         return null;
     }
 
+    function mooncakeWarehouseIsNativeAllItemsTab(root) {
+        if (!root?.querySelector) return true;
+        const tabsContainer = root.querySelector(':scope > [class*="TabsComponent_tabsComponent"] > [class*="TabsComponent_tabsContainer"]') ||
+            root.querySelector('[class*="TabsComponent_tabsContainer"]');
+        if (!tabsContainer) return true;
+        const tabs = [...tabsContainer.querySelectorAll('[role="tab"]')];
+        if (tabs.length < 2) return true;
+        const selected = tabs.find(tab => tab.getAttribute('aria-selected') === 'true' || tab.classList.contains('Mui-selected'));
+        return !selected || selected === tabs[0];
+    }
+
+    function mooncakeWarehouseHasNativeInventoryFilter(root) {
+        const inventory = root?.closest?.('[class*="Inventory_inventory"]');
+        const input = inventory?.querySelector?.('[class*="Inventory_itemFilter"] input');
+        return String(input?.value || '').trim().length > 0;
+    }
+
+    function mooncakeWarehouseGetLayoutRoot(root) {
+        if (!root?.querySelector) return root;
+        const panels = [...root.querySelectorAll('[class*="TabPanel_tabPanel"]')];
+        return panels.find(panel => !panel.matches('[class*="TabPanel_hidden"]') && mooncakeIsVisibleElement(panel)) || root;
+    }
+
     function mooncakeWarehouseGetActiveRootForMutations() {
-        const root = mooncakeWarehouseInventoryRoot;
+        const root = mooncakeWarehouseObservedRoot?.isConnected
+            ? mooncakeWarehouseObservedRoot
+            : mooncakeWarehouseInventoryRoot;
         if (root?.isConnected) {
             // Visibility and resize observers already schedule the next render
             // when a mounted inventory tab becomes visible. Do not scan every
@@ -24667,19 +24747,24 @@
             if (!itemHrid) continue;
             const enhancementLevel = mooncakeWarehouseNormalizeLevel(mooncakeGetItemEnhancementLevelFromContainer(node));
             const key = mooncakeWarehouseIdentityKey(itemHrid, enhancementLevel);
-            const entry = { node, grid, itemHrid, enhancementLevel };
+            const entry = { node, grid, itemHrid, enhancementLevel, aliasNodes: [] };
             const previousIndex = entryIndexes.get(key);
             if (previousIndex === undefined) {
                 entryIndexes.set(key, entries.length);
                 entries.push(entry);
                 continue;
             }
-            // During a React replacement both the leaving and entering card can
-            // coexist for one frame. Compare only in that rare duplicate case,
-            // otherwise this collector performs no per-card style reads.
-            if (mooncakeWarehouseGetDuplicateInventoryNodeScore(node) >
-                mooncakeWarehouseGetDuplicateInventoryNodeScore(entries[previousIndex].node)) {
+            const previous = entries[previousIndex];
+            // The native All tab renders favorites once in its pinned group and
+            // again in their category. Keep the category copy as the canonical
+            // card and hide every alias while Mooncake owns this item. Same-grid
+            // duplicates are React handoffs and retain the most drawable node.
+            if (previous.grid !== grid || mooncakeWarehouseGetDuplicateInventoryNodeScore(node) >
+                mooncakeWarehouseGetDuplicateInventoryNodeScore(previous.node)) {
+                entry.aliasNodes = [...new Set([...(previous.aliasNodes || []), previous.node])];
                 entries[previousIndex] = entry;
+            } else {
+                previous.aliasNodes = [...new Set([...(previous.aliasNodes || []), node])];
             }
         }
         return entries;
@@ -24772,6 +24857,28 @@
             .mooncake-warehouse-button.is-primary { border-color: #5079c4; background: #3d62ad; color: #fff; }
             .mooncake-warehouse-button.is-primary:hover:not(:disabled) { background: #4d74c4; border-color: #88acff; }
             .mooncake-warehouse-icon-button { width: 28px; min-width: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 15px; }
+            .mooncake-warehouse-tabs {
+                position: absolute; left: 5px; right: 5px; top: 4px; height: 31px; display: flex; align-items: stretch;
+                pointer-events: auto; border-bottom: 1px solid rgba(103,130,181,.55); background: rgba(28,37,57,.9);
+            }
+            .mooncake-warehouse-tab-list {
+                min-width: 0; flex: 1; display: flex; align-items: stretch; gap: 2px; overflow-x: auto; overflow-y: hidden;
+                scrollbar-width: thin; overscroll-behavior-x: contain;
+            }
+            .mooncake-warehouse-tab {
+                appearance: none; flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; min-width: 0;
+                border: 0; border-bottom: 3px solid transparent; padding: 0 9px; background: transparent;
+                color: #9eabc4; cursor: pointer; white-space: nowrap; font-weight: 650;
+            }
+            .mooncake-warehouse-tab:hover { background: rgba(123,160,218,.14); color: #e1e9f8; }
+            .mooncake-warehouse-tab.is-active { border-bottom-color: #7899ea; background: rgba(74,96,151,.25); color: #eef3ff; }
+            .mooncake-warehouse-tab:focus-visible { outline: 2px solid #7aabff; outline-offset: -2px; }
+            .mooncake-warehouse-tab-count {
+                min-width: 17px; padding: 0 4px; border: 1px solid rgba(113,142,191,.52); border-radius: 3px;
+                color: #b7c8e8; font-size: 10px; line-height: 15px; text-align: center;
+            }
+            .mooncake-warehouse-tab-badge { color: #80d0c3; font-size: 10px; }
+            .mooncake-warehouse-tabs .mooncake-warehouse-section-settings { align-self: center; margin: 0 3px; }
             .mooncake-warehouse-section {
                 position: absolute; left: 5px; right: 5px; height: 28px; display: flex;
                 align-items: stretch; pointer-events: auto; border-left: 2px solid #5673a6;
@@ -24889,6 +24996,54 @@
         return button;
     }
 
+    function mooncakeWarehouseAppendTabs(panel, sections, activeSectionId) {
+        const bar = document.createElement('div');
+        bar.className = 'mooncake-warehouse-tabs';
+        const list = document.createElement('div');
+        list.className = 'mooncake-warehouse-tab-list';
+        list.setAttribute('role', 'tablist');
+        for (const section of sections) {
+            const active = section.id === activeSectionId;
+            const tab = document.createElement('button');
+            tab.type = 'button';
+            tab.className = `mooncake-warehouse-tab${active ? ' is-active' : ''}`;
+            tab.setAttribute('role', 'tab');
+            tab.setAttribute('aria-selected', String(active));
+            tab.tabIndex = active ? 0 : -1;
+            const label = document.createElement('span');
+            label.textContent = section.title;
+            const count = document.createElement('span');
+            count.className = 'mooncake-warehouse-tab-count';
+            count.textContent = String(section.count);
+            tab.append(label, count);
+            if (section.badge) {
+                const badge = document.createElement('span');
+                badge.className = 'mooncake-warehouse-tab-badge';
+                badge.textContent = section.badge;
+                tab.appendChild(badge);
+            }
+            tab.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                mooncakeWarehouseSetActiveSection(section.id);
+            });
+            list.appendChild(tab);
+        }
+        const settings = document.createElement('button');
+        settings.type = 'button';
+        settings.className = 'mooncake-warehouse-section-settings';
+        settings.textContent = '\u2699';
+        settings.title = mooncakeWarehouseText('categories');
+        settings.setAttribute('aria-label', mooncakeWarehouseText('categories'));
+        settings.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            mooncakeWarehouseOpenManager({ trigger: settings });
+        });
+        bar.append(list, settings);
+        panel.appendChild(bar);
+    }
+
     function mooncakeWarehouseAppendSectionHeading(panel, section, top, count, collapsed) {
         const heading = document.createElement('div');
         heading.className = `mooncake-warehouse-section is-${section.kind || 'custom'}`;
@@ -24955,14 +25110,15 @@
     function mooncakeWarehouseGetPinnedLayoutSignature(projection, state, placements) {
         const records = [];
         for (const record of projection.candidates.values()) {
-            const node = record.node;
-            if (!node?.isConnected) continue;
             const point = placements.get(record.key) || { left: 0, top: 0 };
-            const hidden = state.sectionCollapsed[record.sectionId] === true || !placements.has(record.key);
-            records.push([
-                mooncakeWarehouseGetPinnedNodeId(node), record.sectionId, record.role,
-                hidden, Math.round(point.left), Math.round(point.top)
-            ]);
+            const nodes = [record.node, ...(record.aliasNodes || [])];
+            nodes.forEach((node, index) => {
+                if (!node?.isConnected) return;
+                records.push([
+                    mooncakeWarehouseGetPinnedNodeId(node), record.sectionId, record.role,
+                    index > 0 || !placements.has(record.key), Math.round(point.left), Math.round(point.top)
+                ]);
+            });
         }
         records.sort((left, right) => left[0] - right[0]);
         return JSON.stringify(records);
@@ -25018,6 +25174,12 @@
         for (const section of sectionsById.values()) {
             if (!sections.includes(section)) sections.push(section);
         }
+        const visibleSections = sections.filter(section => state.hiddenSections[section.id] !== true);
+        const activeSection = visibleSections.find(section => section.id === state.activeSectionId) ||
+            visibleSections.find(section => section.id === MOONCAKE_WAREHOUSE_SECTION_QUEUE) ||
+            visibleSections.find(section => section.id === MOONCAKE_WAREHOUSE_SECTION_ENHANCE) ||
+            visibleSections[0] || null;
+        const activeSectionId = activeSection?.id || null;
         const sharedUnavailableKeys = {
             inventoryKeys: projection.inventoryKeys,
             queueKeys: new Set([
@@ -25026,8 +25188,9 @@
                 ...(projection.bySection.get(MOONCAKE_WAREHOUSE_SECTION_QUEUE) || []).map(record => record.key)
             ])
         };
-        for (const section of sections) {
+        for (const section of visibleSections) {
             section.unavailableCount = mooncakeWarehouseGetUnavailableSectionCount(section.id, section.records, projection, sharedUnavailableKeys);
+            section.count = section.records.length + section.unavailableCount;
         }
 
         const placements = new Map();
@@ -25043,22 +25206,12 @@
             return y + rows * metrics.itemHeight + Math.max(0, rows - 1) * metrics.rowGap;
         };
 
-        let y = 6;
-        for (const section of sections) {
-            if (state.hiddenSections[section.id] === true) continue;
-            const isEmptyCustomSection = section.kind === 'custom' && section.records.length === 0 && section.unavailableCount === 0;
-            const collapsed = state.sectionCollapsed[section.id] === true ||
-                (isEmptyCustomSection && state.sectionCollapsed[section.id] !== false);
-            rows.push({ type: 'heading', section, top: y, count: section.records.length + section.unavailableCount, collapsed });
-            y += 31;
-            if (collapsed) {
-                y += 2;
-                continue;
-            }
-            if (section.queue) {
-                const equipmentRecords = section.records.filter(record => record.group === 'equipment');
-                const protectionRecords = section.records.filter(record => record.group === 'protection');
-                const materialRecords = section.records.filter(record => record.group === 'material');
+        let y = 40;
+        if (activeSection) {
+            if (activeSection.queue) {
+                const equipmentRecords = activeSection.records.filter(record => record.group === 'equipment');
+                const protectionRecords = activeSection.records.filter(record => record.group === 'protection');
+                const materialRecords = activeSection.records.filter(record => record.group === 'material');
                 let hasRecords = false;
                 if (equipmentRecords.length) {
                     hasRecords = true;
@@ -25072,33 +25225,42 @@
                     y += 4;
                 }
                 if (!hasRecords) {
-                    rows.push({ type: 'empty', text: section.emptyText, top: y });
+                    rows.push({ type: 'empty', text: activeSection.emptyText, top: y });
                     y += 20;
                 }
-            } else if (section.records.length) {
-                y = placeRecords(section.records, y);
+            } else if (activeSection.records.length) {
+                y = placeRecords(activeSection.records, y);
                 y += 4;
             } else {
-                rows.push({ type: 'empty', text: section.emptyText, top: y });
+                rows.push({ type: 'empty', text: activeSection.emptyText, top: y });
                 y += 20;
             }
-            if (section.unavailableCount > 0) {
-                rows.push({ type: 'empty', text: mooncakeWarehouseUnavailableText(section.unavailableCount), top: y });
+            if (activeSection.unavailableCount > 0) {
+                rows.push({ type: 'empty', text: mooncakeWarehouseUnavailableText(activeSection.unavailableCount), top: y });
                 y += 20;
             }
             y += 2;
         }
 
-        const panelHeight = Math.max(32, Math.ceil(y + 2));
+        const panelHeight = Math.max(39, Math.ceil(y + 2));
         const panelSignature = JSON.stringify({
             layout: metrics.signature,
             panelHeight,
-            rows: rows.map(row => row.type === 'heading'
-                ? ['h', row.section.id, row.section.title, row.section.badge || '', row.top, row.count, row.collapsed]
-                : ['e', row.text, row.top])
+            activeSectionId,
+            tabs: visibleSections.map(section => [section.id, section.title, section.badge || '', section.count]),
+            rows: rows.map(row => ['e', row.text, row.top])
         });
         const pinnedLayoutSignature = mooncakeWarehouseGetPinnedLayoutSignature(projection, state, placements);
-        return { state, rows, placements, panelHeight, panelSignature, pinnedLayoutSignature };
+        return {
+            state,
+            sections: visibleSections,
+            activeSectionId,
+            rows,
+            placements,
+            panelHeight,
+            panelSignature,
+            pinnedLayoutSignature
+        };
     }
 
     function mooncakeWarehouseCreatePresentationPanel(model) {
@@ -25106,12 +25268,9 @@
         panel.setAttribute(MOONCAKE_WAREHOUSE_PANEL_ATTR, '1');
         panel.className = 'mooncake-warehouse-panel';
         mooncakeWarehouseSetInlineStyle(panel, 'height', `${model.panelHeight}px`);
+        mooncakeWarehouseAppendTabs(panel, model.sections, model.activeSectionId);
         for (const row of model.rows) {
-            if (row.type === 'heading') {
-                mooncakeWarehouseAppendSectionHeading(panel, row.section, row.top, row.count, row.collapsed);
-            } else {
-                mooncakeWarehouseAppendEmptyText(panel, row.text, row.top);
-            }
+            mooncakeWarehouseAppendEmptyText(panel, row.text, row.top);
         }
         return panel;
     }
@@ -25120,19 +25279,21 @@
         const targets = [];
         const nextPinnedNodes = new Set();
         for (const record of projection.candidates.values()) {
-            const node = record.node;
-            if (!node?.isConnected || !root.contains(node)) continue;
             const point = model.placements.get(record.key) || { left: 0, top: 0 };
-            const hidden = model.state.sectionCollapsed[record.sectionId] === true || !model.placements.has(record.key);
-            targets.push({ node, point, role: record.role || 'custom', hidden });
-            nextPinnedNodes.add(node);
+            const nodes = [record.node, ...(record.aliasNodes || [])];
+            nodes.forEach((node, index) => {
+                if (!node?.isConnected || !root.contains(node)) return;
+                const hidden = index > 0 || !model.placements.has(record.key);
+                targets.push({ node, point, role: record.role || 'custom', hidden });
+                nextPinnedNodes.add(node);
+            });
         }
 
         const currentEquipmentTarget = targets.find(target =>
             target.role === 'current-equipment' && !target.hidden
         ) || null;
         const queueIsExpanded = projection.queue.actionCount > 0 &&
-            model.state.sectionCollapsed[MOONCAKE_WAREHOUSE_SECTION_QUEUE] !== true;
+            model.activeSectionId === MOONCAKE_WAREHOUSE_SECTION_QUEUE;
         const currentEquipmentTargetIsDrawable = !!currentEquipmentTarget &&
             mooncakeWarehouseCanRetainCurrentEquipmentNode(currentEquipmentTarget.node, root);
         const keepExistingCurrentShell = queueIsExpanded && !currentEquipmentTargetIsDrawable;
@@ -25293,8 +25454,8 @@
             return;
         }
         try {
-            const root = mooncakeWarehouseFindInventoryRoot();
-            if (!root) {
+            const inventoryRoot = mooncakeWarehouseFindInventoryRoot();
+            if (!inventoryRoot) {
                 // Inventory tabs are commonly kept mounted while hidden. Keep
                 // the stable presentation intact and wait for the tab mutation
                 // instead of restoring/rebuilding it in the background.
@@ -25313,6 +25474,18 @@
             }
             mooncakeWarehousePendingVisibleRender = false;
             mooncakeWarehouseSunnyConflictNotified = false;
+            mooncakeWarehouseObserveInventoryRoot(inventoryRoot);
+
+            // The native Favorites/category tabs and filtered results contain
+            // only a subset of inventory. Leave those views entirely native so
+            // Mooncake cannot override favorite ordering or infer missing cards.
+            if (!mooncakeWarehouseIsNativeAllItemsTab(inventoryRoot) ||
+                mooncakeWarehouseHasNativeInventoryFilter(inventoryRoot)) {
+                if (mooncakeWarehouseInventoryRoot) mooncakeWarehouseRestorePresentation();
+                return;
+            }
+            const root = mooncakeWarehouseGetLayoutRoot(inventoryRoot);
+            if (!root) return;
 
             // Only a root replacement or real responsive-width change needs a
             // native-layout restore. Normal queue/item updates retain the panel,
@@ -25326,7 +25499,6 @@
                 mooncakeWarehouseLastMissingRootProbeAt = 0;
                 mooncakeWarehouseRootStyleSnapshot = mooncakeWarehouseSnapshotInlineStyles(root, MOONCAKE_WAREHOUSE_ROOT_STYLE_PROPS);
             }
-            mooncakeWarehouseObserveInventoryRoot(root);
             const entries = mooncakeWarehouseGetInventoryEntries(root);
             if (!mooncakeWarehouseLayoutMetrics || (!mooncakeWarehouseLayoutMetrics.measured && entries.length > 0)) {
                 const originalPaddingTop = mooncakeWarehouseLayoutMetrics?.paddingTop ?? null;
@@ -26030,6 +26202,15 @@
         }
     }
 
+    function mooncakeWarehouseTrackNativeInventoryFilter(event) {
+        const input = event.target instanceof Element
+            ? event.target.closest?.('[class*="Inventory_itemFilter"] input')
+            : null;
+        if (!input || !input.closest('[class*="Inventory_inventory"]')) return;
+        mooncakeWarehouseInvalidateInventoryEntries();
+        mooncakeScheduleWarehouseRender('native-inventory-filter');
+    }
+
     const MOONCAKE_WAREHOUSE_INVENTORY_STRUCTURE_SELECTOR =
         '[class*="Inventory_itemGrid"], [class*="Item_itemContainer"]';
     const MOONCAKE_WAREHOUSE_INVENTORY_ROOT_SELECTOR =
@@ -26064,6 +26245,7 @@
         window.__mooncakeInventoryWarehouseStarted = true;
         mooncakeWarehouseEnsureStyles();
         document.addEventListener('click', mooncakeWarehouseTrackItemMenu, true);
+        document.addEventListener('input', mooncakeWarehouseTrackNativeInventoryFilter, true);
         document.addEventListener('visibilitychange', () => {
             if (document.hidden || !mooncakeWarehousePendingVisibleRender) return;
             mooncakeWarehousePendingVisibleRender = false;
@@ -26076,7 +26258,13 @@
                 mooncakeWarehouseSuspendForSunnyConflict();
                 return;
             }
-            const currentRoot = mooncakeWarehouseInventoryRoot;
+            // The observed root remains mounted while native Favorites,
+            // category tabs, or search temporarily suspend our layout root.
+            // Use it as the sentinel so ordinary game mutations cannot restart
+            // document-wide inventory discovery in those native views.
+            const currentRoot = mooncakeWarehouseObservedRoot?.isConnected
+                ? mooncakeWarehouseObservedRoot
+                : mooncakeWarehouseInventoryRoot;
             if (currentRoot?.isConnected) {
                 if (!mooncakeWarehouseMutationsMayReplaceInventoryRoot(mutations, currentRoot)) return;
                 if (document.hidden) {
@@ -26084,7 +26272,7 @@
                     mooncakeWarehouseGeometryDirty = true;
                     return;
                 }
-                mooncakeWarehouseInvalidateInventoryEntries(currentRoot);
+                mooncakeWarehouseInvalidateInventoryEntries(mooncakeWarehouseInventoryRoot);
                 mooncakeScheduleWarehouseRender('inventory-root');
                 return;
             }
@@ -26252,6 +26440,7 @@
     const MOONCAKE_DUNGEON_TOKEN_LISTING_BADGE_ATTR = 'data-mooncake-dungeon-token-listing-badge';
     const MOONCAKE_DUNGEON_TOKEN_LISTING_BADGE_IMAGE_SRC = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAekSURBVHhe7ZtrjFXVFcf/YlVUpFh1eKMIIlAGlCAPFTKSFKejhSLTKFAFxoh2BHGUMKMzwM3cCwI6BUR80AEE7j1DxkQ/1JICrdZiUGPAgAUbU6kPPogxCIgIAmeZc5h73Wvtc84MbWa4XNYvWV/W+q/9WPu8776AoiiKoiiKoiiKoiiKoiiKoiiKoiiKoiiKoigRUAytqA6DaDGe9+05lNBaXCp1SgtA5XDpKlCglcKVeqWZoBTi1gKE2SpcJfNzAkqhiFJYKv0tjX95kkX3bDBcGhR4xuTOmUIOprDJVeE/UtPSUAdR9GXYZWn6WZpaqckqyMF8ugXHycFWGTMhB73ZxApxSGpaEnoJP2fj6RV+9DdVd8agWqynG8SRMxnfSJ2E6fObd2I0F9upAC6NBNFK/NmKp1DLxrMI/5CaNPQgXKrER1SNOqpBpYyfcWgSvmGT8eyaxgvM9NeG62k9BtLD+ISGw6UhcGk0jlEKj0idhzWOJCZYvgZjedOxncVTuMeMn1WQg1vlZOWEg2iKnvoG3kxPWQd7Ea37QJTNxNFMXi4tiIc12ZACm0TpKYXLKa9JxXXNx0+6LiBnCepoHQppNv5ixQjn+XnzsIH5k0iw8TgYRynMoEV4lh7FDpoKorFwvbPW1GUNdKtdCKmRROmpu2hvPA6l35JpNI6E5dIAkSferGmYiNfhRt/v4E/MX4ONLE/0F9R3VkEJrJUDpSTmS10a/7NExMSiYkFxegmX+P5hlv8Cllcr4ksxw/fXoYz5p+EDlif7M81Be1ObNVgDfRyHvcHS85hECRz3bvSWxrBMO+swgMWm4gTvCaA4jjHNcqzw/b/BfuZ3MIzlrcRmFl+ANb4/iaHMPwb7Wd4z+JiS2EgOSmksDjDtOhSa2qyBiqIL3phl2nHwOovNxmu8J4BexiimefLUtZymYg/zpzBN5N3B4gnsy8RMf/fwewNVYSfTJjFdarICqsO9bKBR1gkujcAJMbEKv50kKph/FrZZfa1DT6YZ17Ag87CN+R0sZnn14gXwgZ8Kz/ye1eN8MzcNOXiT6Z7DSqnJGqxJdYZLS/wnobtpNVoz7UIsY9oU3vL9hPOY/x77aLUW5LGGBUlhFfM/hXqWtxxtWLzIWJBK7GCx9na/HjRBPFSURX+VOKOwgXrm4BmpSeM/RpraBA5mYrwdqzC0BPOYZjk2+34Hj0YVyzsoWLw/b1v06/dNVdhHDv5LJdhPHQMuy4vwhtlGVkFPYC8bbMRvB9aNdCy+z8S6iok7+C3LbS/iDWef9cV2Mj4383yNGZdPd+vRR8YjbSF2mPlZB6VwtRy01KTxHkmZtptxY0/hPtkO3QSXRuGw5R8ccZTfYR8QMl/GPSJ/oPLscXxPtfiFzMtK5OBl3IRpO4rCrhUf/ILs5kYKflMj8cbGtxb9yMEk37y3/ZAbfVZDxfzoknETURy7eHUoDv0+lcCbUu/hPyx496ckitNv4uc0tAylrHBrcIXUpJFFlvE03sc+WoDVvqUwUcaVRmCFXo6YjCstjL8QveFSBXbQGnSWcUVRFEVRFEVRFEVpHigxBhQvByVWD9n20AYZlvy+vnh7SequjMm48n+yqbgH/7BJc3tKjcmBHq2b/CFU+R+YnxghFiQeuSNEF6SZGbNhIts4Aapmu04kLbIglBhfsKXklX67p70KihfJcE5zw4elX/MFSbBdJ5ImLwjFOvT85LEnCv82aWf+rodXgeLXS4nkti0lfI9Ygx3p+jO3696ZbKtq7kKJXebkB29/iO06kTS2IBcemXO3LKhpl3w35wGZ43G42wUnpVbaiK3375F5uQcl2J6pe+uLI7foRC1Iu4OVNbKIQXbhsdgcM69gyxTrF85N43oc/aJ/W8vflDPt7IbiS8wJP7n4V9auE5OoBZHF+8PKO78DVVcsrRj6g4yF5R3rdD77WfqyA5VPm/HPB7S1frbOLah6sjlhNw/uiQ6tQs3fdxVQ2IItUzaZ/tZHY5+Z3TxbPoTtLW57sMrfFwaqZvuS23xbVWDm+RIjbvaZm1D8Ojnh07F0M5vvujZwoTLQXLan7O2ibv6R/suPpm9keRSztgrtHnZldNu5hizy6VhQG8c7tgq8rJga70z0fPm7p73P2qNYG5k3++mR5+6C7M1v64Ji7cLM1JrFMX3yPpDGa1vm9v73I2xvMWhuJ5k348WiwD5zlrAiBxGmDfObBC0IKNbP9PXYU2btbX5vVGc7L5dpSjHThGmtywpV5/NMnrtnYLvMWWT6fwi43IX1mbOczoTDtHn7ymeZ/r/+ricrbMcvZ60w42Uv/PrTdOzD4XlsMVeUDXJBf7wYFO/z+vheLLZq+sADZrs5SViRg4jSylhN1c1u3r7ymVPXjGGfZ2QeKGb9fzLITjY8COQ8cuIybhKppfhIGQ+yG3eW/pPlncrtLt9xTPu618XnxmJ4HOx+UZNvmrJQMg6K3yk1TE/xBTKFQYmKmtm3fPXu7V3ct0Zf4xb+/b5/gRZeJmU5zTu3d3G/7NvG/XjIFe7Wwi7WP3hNkg/2P2SajDMo/iIo8UGji6AoiqIoiqIoiqIoiqIoiqIoiqIoiqIoiqIoiqIoiqIozc+PgH0qM4DoEHcAAAAASUVORK5CYII=';
     const MOONCAKE_ORDER_TARGET_HOURLY_SEARCH_STEPS = 56;
+    const MOONCAKE_ORDER_TARGET_PRICE_MAX = 1e12;
     const MOONCAKE_ORDER_MODAL_SELECTOR = '[class*="Modal_modalContainer"]';
     const MOONCAKE_ORDER_MODAL_CONTENT_SELECTOR = '[class*="MarketplacePanel_modalContent"]';
     const MOONCAKE_ORDER_MODAL_DEBOUNCE_MS = 140;
@@ -26682,6 +26871,14 @@
         return null;
     }
 
+    function mooncakeGetOrderTargetPriceBounds(itemHrid) {
+        const itemSellPrice = Number(mooncakeGetItemDetailOfHrid(itemHrid)?.sellPrice);
+        return {
+            min: Math.max(2, Number.isFinite(itemSellPrice) ? Math.ceil(itemSellPrice) : 2),
+            max: MOONCAKE_ORDER_TARGET_PRICE_MAX
+        };
+    }
+
     function mooncakeParseOrderModalPrice(value) {
         const parsed = parsePriceText(String(value ?? ''));
         return Number.isFinite(parsed) && parsed >= 0 ? parsed : NaN;
@@ -26718,6 +26915,26 @@
         return controls?.querySelector?.('[class*="MarketplacePanel_priceDisplay"], [class*="priceDisplay"]') || null;
     }
 
+    function mooncakeRecoverOrderModalGrossUnitPrice(itemHrid, enhancementLevel, netTotal, quantity) {
+        const total = Number(netTotal);
+        const count = Number(quantity);
+        if (!Number.isSafeInteger(total) || total <= 0 || !Number.isSafeInteger(count) || count <= 0 || total % count !== 0) {
+            return NaN;
+        }
+        const netUnitPrice = total / count;
+        const netFactor = 1 - mooncakeGetMarketSellTaxRate(itemHrid);
+        if (!(netFactor > 0)) return NaN;
+
+        const priceBounds = mooncakeGetOrderTargetPriceBounds(itemHrid);
+        const firstPossiblePrice = Math.max(priceBounds.min, Math.ceil(netUnitPrice / netFactor));
+        const lastPossiblePrice = Math.min(priceBounds.max, Math.ceil((netUnitPrice + 1) / netFactor) - 1);
+        if (firstPossiblePrice > lastPossiblePrice) return NaN;
+
+        const candidate = mooncakeSnapMarketPrice(firstPossiblePrice, 'up', enhancementLevel);
+        if (!Number.isSafeInteger(candidate) || candidate < firstPossiblePrice || candidate > lastPossiblePrice) return NaN;
+        return mooncakeGetMarketNetSaleUnitPrice(candidate, itemHrid) === netUnitPrice ? candidate : NaN;
+    }
+
     function mooncakeGetOrderModalUnitPrice(modal, orderType) {
         const priceInput = mooncakeFindOrderModalPriceInput(modal);
         const inputPrice = mooncakeParseOrderModalPrice(priceInput?.value);
@@ -26742,20 +26959,27 @@
         const quantity = mooncakeGetOrderModalQuantity(modal);
         // "获得" in a sell listing is the post-tax total, while a buy
         // listing's "支付" value is already the gross order total.
-        const grossTotal = orderType === 'sell' ? total / MOONCAKE_MARKET_SELL_NET_FACTOR : total;
-        return grossTotal / quantity;
+        if (orderType === 'sell') {
+            return mooncakeRecoverOrderModalGrossUnitPrice(
+                mooncakeGetOrderModalItemHrid(modal),
+                mooncakeGetOrderModalEnhancementLevel(modal),
+                total,
+                quantity
+            );
+        }
+        return total / quantity;
     }
 
     function mooncakeCalculateOrderModalEconomicsAtTaxMode(itemHrid, enhancementLevel, price, marketData, taxMode = 'after-tax') {
         if (!(price > 0) || !(enhancementLevel > 0)) return null;
         const isBeforeTax = taxMode === 'before-tax';
         // Route selection is price-sensitive. The existing route calculator
-        // expects a gross sell price and models its 5% tax internally, so the
-        // pre-tax scenario must use price / 0.95 instead of reusing the
-        // post-tax route and merely dividing its displayed wage.
+        // expects a gross sell price and models the standard market tax
+        // internally. Remove that tax for the pre-tax scenario instead of
+        // reusing the post-tax route and merely dividing its displayed wage.
         const netPrice = isBeforeTax
             ? price
-            : price * MOONCAKE_MARKET_SELL_NET_FACTOR;
+            : mooncakeGetMarketNetSaleUnitPrice(price, itemHrid);
         const routePrice = isBeforeTax
             ? price / MOONCAKE_MARKET_SELL_NET_FACTOR
             : price;
@@ -26798,6 +27022,8 @@
         const target = Number(targetHourlyWage);
         if (!Number.isFinite(target) || target < 0 || !itemHrid || !(enhancementLevel > 0) || !orderType) return null;
         const resolvedTaxMode = taxMode || (orderType === 'buy' ? 'before-tax' : 'after-tax');
+        const priceBounds = mooncakeGetOrderTargetPriceBounds(itemHrid);
+        if (!Number.isSafeInteger(priceBounds.min) || priceBounds.min > priceBounds.max) return null;
 
         const evaluate = price => mooncakeCalculateOrderModalEconomics(
             itemHrid,
@@ -26807,11 +27033,20 @@
             marketData,
             resolvedTaxMode
         );
-        const minimumResult = evaluate(1);
+        const minimumPrice = mooncakeSnapMarketPrice(priceBounds.min, 'up', enhancementLevel);
+        if (minimumPrice < priceBounds.min || minimumPrice > priceBounds.max) return null;
+        const minimumResult = evaluate(minimumPrice);
         if (!minimumResult) return null;
-        if (minimumResult.hourlyWage >= target) return { price: 1, result: minimumResult };
+        if (minimumResult.hourlyWage >= target) return { price: minimumPrice, result: minimumResult };
 
-        const normalizedCurrentPrice = mooncakeSnapMarketPrice(Math.max(1, Math.ceil(Number(currentPrice) || 1)), 'up');
+        const normalizedCurrentPrice = Math.min(
+            priceBounds.max,
+            mooncakeSnapMarketPrice(
+                Math.min(priceBounds.max, Math.max(minimumPrice, Math.ceil(Number(currentPrice) || minimumPrice))),
+                'up',
+                enhancementLevel
+            )
+        );
         const currentResult = evaluate(normalizedCurrentPrice) || minimumResult;
         const priceDivisor = resolvedTaxMode === 'after-tax'
             ? MOONCAKE_MARKET_SELL_NET_FACTOR
@@ -26819,22 +27054,31 @@
         const estimatedPrice = Math.ceil(
             (currentResult.route.totalCost + target * currentResult.route.totalTimeHours) / priceDivisor
         );
-        let high = mooncakeSnapMarketPrice(Math.max(
-            normalizedCurrentPrice,
-            Number.isSafeInteger(estimatedPrice) ? estimatedPrice : 1,
-            1
-        ), 'up');
-        if (!Number.isSafeInteger(high) || high > Number.MAX_SAFE_INTEGER) return null;
+        let high = Math.min(
+            priceBounds.max,
+            mooncakeSnapMarketPrice(
+                Math.min(
+                    priceBounds.max,
+                    Math.max(
+                        normalizedCurrentPrice,
+                        Number.isSafeInteger(estimatedPrice) ? estimatedPrice : minimumPrice,
+                        minimumPrice
+                    )
+                ),
+                'up',
+                enhancementLevel
+            )
+        );
+        if (!Number.isSafeInteger(high) || high < minimumPrice || high > priceBounds.max) return null;
 
         let highResult = evaluate(high);
-        for (let attempt = 0; (!highResult || highResult.hourlyWage < target) && attempt < 32; attempt += 1) {
-            if (high >= Math.floor(Number.MAX_SAFE_INTEGER / 2)) return null;
-            high *= 2;
+        if ((!highResult || highResult.hourlyWage < target) && high < priceBounds.max) {
+            high = priceBounds.max;
             highResult = evaluate(high);
         }
         if (!highResult || highResult.hourlyWage < target) return null;
 
-        let low = 1;
+        let low = minimumPrice - 1;
         for (let step = 0; step < MOONCAKE_ORDER_TARGET_HOURLY_SEARCH_STEPS && high - low > 1; step += 1) {
             const middle = low + Math.floor((high - low) / 2);
             const middleResult = evaluate(middle);
@@ -26845,9 +27089,12 @@
                 low = middle;
             }
         }
-        const snappedPrice = mooncakeSnapMarketPrice(high, 'up');
+        const snappedPrice = Math.min(priceBounds.max, mooncakeSnapMarketPrice(high, 'up', enhancementLevel));
+        if (snappedPrice < minimumPrice || snappedPrice > priceBounds.max) return null;
         const snappedResult = evaluate(snappedPrice);
-        return snappedResult ? { price: snappedPrice, result: snappedResult } : null;
+        return snappedResult && snappedResult.hourlyWage >= target
+            ? { price: snappedPrice, result: snappedResult }
+            : null;
     }
 
     function mooncakeSetOrderTargetHourlyStatus(row, message = '', tone = 'error') {
@@ -26878,9 +27125,15 @@
     }
 
     async function mooncakeSetOrderModalUnitPrice(modal, price) {
-        const normalizedPrice = mooncakeSnapMarketPrice(Math.ceil(Number(price)), 'up');
+        const itemHrid = mooncakeGetOrderModalItemHrid(modal);
+        if (!itemHrid) return false;
+        const priceBounds = mooncakeGetOrderTargetPriceBounds(itemHrid);
+        const requestedPrice = Math.ceil(Number(price));
+        if (!Number.isSafeInteger(requestedPrice) || requestedPrice < priceBounds.min || requestedPrice > priceBounds.max) return false;
+        const enhancementLevel = mooncakeGetOrderModalEnhancementLevel(modal);
+        const normalizedPrice = mooncakeSnapMarketPrice(requestedPrice, 'up', enhancementLevel);
         const input = await mooncakeGetEditableOrderModalPriceInput(modal);
-        if (!(input instanceof HTMLInputElement) || !Number.isSafeInteger(normalizedPrice) || normalizedPrice < 1) return false;
+        if (!(input instanceof HTMLInputElement) || !Number.isSafeInteger(normalizedPrice) || normalizedPrice < priceBounds.min || normalizedPrice > priceBounds.max) return false;
         if (!mooncakeSetEnhanceRepeatCount(input, normalizedPrice)) return false;
 
         // The current game stores the draft on input, then commits its order
@@ -30114,7 +30367,7 @@
         const isLevelZeroManufacture = !!manufacture;
         const profit = manufacture
             ? manufacture.profit
-            : (result?.metrics ? parsed.price * MOONCAKE_MARKET_SELL_NET_FACTOR - result.metrics.totalCost : NaN);
+            : (result?.metrics ? mooncakeGetMarketNetSaleUnitPrice(parsed.price, parsed.hrid) - result.metrics.totalCost : NaN);
         const doc = msgEl.ownerDocument || document;
         const bubble = doc.createElement("span");
         bubble.className = MOONCAKE_CHAT_BUBBLE_CLASS;
@@ -32005,7 +32258,7 @@
             const protectCost = protectionPrice * expectedProtects;
             const totalCost = baseItemCost + materialCost + protectCost;
             const hourlyWage = targetPrice > 0
-                ? (targetPrice * MOONCAKE_MARKET_SELL_NET_FACTOR - totalCost) / totalTimeHours
+                ? (mooncakeGetMarketNetSaleUnitPrice(targetPrice, itemHrid) - totalCost) / totalTimeHours
                 : null;
             const candidate = {
                 routeType: 'traditional',
@@ -38270,7 +38523,7 @@
             const enhancementMarketData = isEquipment && enhancementLevel > 0 ? getMarketData() : null;
 
             if (enhancementMarketData && isEquipment && enhancementLevel > 0) {
-                const analysisPriceTiers = getAllPriceTiers(ask, bid);
+                const analysisPriceTiers = getAllPriceTiers(ask, bid, enhancementLevel);
                 enhancementAnalysisPrice = mooncakeResolveEnhancementTabAnalysisPrice(
                     itemHrid,
                     enhancementLevel,
@@ -38333,8 +38586,8 @@
                     const leftExpectedCost = leftRoute?.totalCost || 0;
                     const rightExpectedCost = rightRoute?.totalCost || 0;
 
-                    leftProfit = leftRoute ? ask * MOONCAKE_MARKET_SELL_NET_FACTOR - leftExpectedCost : '-';
-                    rightProfit = rightRoute ? bid * MOONCAKE_MARKET_SELL_NET_FACTOR - rightExpectedCost : '-';
+                    leftProfit = leftRoute ? mooncakeGetMarketNetSaleUnitPrice(ask, itemHrid) - leftExpectedCost : '-';
+                    rightProfit = rightRoute ? mooncakeGetMarketNetSaleUnitPrice(bid, itemHrid) - rightExpectedCost : '-';
                     leftHourlyProfit = leftRoute?.hourlyWage ?? '-';
                     rightHourlyProfit = rightRoute?.hourlyWage ?? '-';
                     hourlyCost = mooncakeGetEnhancementSpendPerHourBreakdown(bestRoute)?.total ?? '-';
@@ -38850,24 +39103,24 @@
         return timeStr.replace(/(\d+)([hms])/g, '<span style="font-size: 14px;">$1</span><span style="font-size: 10px;">$2</span>');
     }
 
-    function getPriceTier(price, direction) {
-        const currentPrice = mooncakeSnapMarketPrice(price, 'down');
+    function getPriceTier(price, direction, enhancementLevel = 0) {
+        const currentPrice = mooncakeSnapMarketPrice(price, 'down', enhancementLevel);
         if (!(currentPrice > 0)) return 0;
         if (direction === 'up') {
-            return mooncakeSnapMarketPrice(currentPrice + 1, 'up');
+            return mooncakeSnapMarketPrice(currentPrice + 1, 'up', enhancementLevel);
         }
-        return mooncakeSnapMarketPrice(currentPrice - 1, 'down');
+        return mooncakeSnapMarketPrice(currentPrice - 1, 'down', enhancementLevel);
     }
 
-    function getAllPriceTiers(leftPrice, rightPrice) {
+    function getAllPriceTiers(leftPrice, rightPrice, enhancementLevel = 0) {
         const tiers = new Set();
 
         const addPriceTiers = (rawPrice) => {
             const price = Number(rawPrice);
             if (!Number.isFinite(price) || price <= 0) return;
             tiers.add(price);
-            const up = getPriceTier(price, 'up');
-            const down = getPriceTier(price, 'down');
+            const up = getPriceTier(price, 'up', enhancementLevel);
+            const down = getPriceTier(price, 'down', enhancementLevel);
             if (up > price) tiers.add(up);
             if (down < price && down > 0) tiers.add(down);
         };
@@ -39828,7 +40081,7 @@
         // tool only reports listings that another seller has already undercut.
         if (!mooncakeIsMyListingStrictlyUndercut(currentAsk, listingPrice)) return false;
 
-        const oneTickBelowAsk = getPriceTier(currentAsk, 'down');
+        const oneTickBelowAsk = getPriceTier(currentAsk, 'down', listing.enhancementLevel);
         if (!(oneTickBelowAsk > 0) || !(oneTickBelowAsk < currentAsk)) return false;
         const result = calcHourlyWageAndMetrics(
             listing.itemHrid,

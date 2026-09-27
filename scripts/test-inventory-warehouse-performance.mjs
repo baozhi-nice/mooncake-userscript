@@ -186,6 +186,7 @@ assert.notEqual(
 );
 
 const observeInventoryStructure = extractFunction('mooncakeWarehouseObserveInventoryStructure');
+const mutationSwitchesNativeTab = extractFunction('mooncakeWarehouseMutationSwitchesNativeTab');
 const observerInstances = [];
 class FakeMutationObserver {
     constructor(callback) {
@@ -206,6 +207,7 @@ const observerSandbox = {
     MutationObserver: FakeMutationObserver,
     mooncakeWarehouseRootMutationObserver: null,
     mooncakeWarehouseObservedRoot: observedRoot,
+    mooncakeWarehouseInventoryRoot: null,
     mooncakeWarehouseMutationsIntroduceSunnyConflict: () => false,
     mooncakeWarehouseMutationTouchesObservedInventory: () => true,
     mooncakeWarehousePinIncomingCurrentEquipment: () => handedOffCurrentEquipment,
@@ -213,6 +215,7 @@ const observerSandbox = {
     mooncakeScheduleWarehouseRender: reason => scheduledReasons.push(reason)
 };
 vm.runInNewContext(`
+    ${mutationSwitchesNativeTab}
     ${observeInventoryStructure}
     globalThis.observeInventoryStructure = mooncakeWarehouseObserveInventoryStructure;
 `, observerSandbox);
@@ -220,12 +223,17 @@ observerSandbox.observeInventoryStructure(observedRoot);
 assert.equal(observerInstances.length, 1, 'an active inventory root must receive one dedicated structure observer');
 assert.equal(observerInstances[0].options.childList, true, 'the root observer must watch child-list changes');
 assert.equal(observerInstances[0].options.subtree, true, 'the root observer must cover nested inventory grids');
-assert.equal(Object.keys(observerInstances[0].options).length, 2, 'the root observer must only watch inventory structure changes');
-observerInstances[0].callback([{}]);
+assert.equal(observerInstances[0].options.attributes, true, 'the root observer must watch native tab selection attributes');
+assert.deepEqual(
+    [...observerInstances[0].options.attributeFilter],
+    ['class', 'hidden', 'aria-hidden', 'aria-selected'],
+    'the root observer must limit attribute work to native visibility and selection state'
+);
+observerInstances[0].callback([{ type: 'childList' }]);
 assert.deepEqual(observedInvalidations, [observedRoot], 'a relevant local mutation must invalidate only this inventory snapshot');
 assert.deepEqual(scheduledReasons, ['inventory-dom'], 'a relevant local mutation must schedule one frame-coalesced render');
 handedOffCurrentEquipment = true;
-observerInstances[0].callback([{}]);
+observerInstances[0].callback([{ type: 'childList' }]);
 assert.deepEqual(
     scheduledReasons,
     ['inventory-dom', 'queue-handoff'],
@@ -239,8 +247,18 @@ assert.match(
 );
 assert.match(
     source,
-    /mooncakeWarehouseRootMutationObserver\.observe\(root, \{ childList: true, subtree: true \}\)/,
-    'the dedicated root observer must own inventory child-list observation'
+    /function mooncakeWarehouseGetActiveRootForMutations\(\)[\s\S]{0,300}mooncakeWarehouseObservedRoot\?\.isConnected[\s\S]{0,150}mooncakeWarehouseInventoryRoot/,
+    'native inventory views must retain the connected observed root as their mounted sentinel'
+);
+assert.match(
+    source,
+    /const currentRoot = mooncakeWarehouseObservedRoot\?\.isConnected[\s\S]{0,150}: mooncakeWarehouseInventoryRoot;[\s\S]{0,600}mooncakeWarehouseInvalidateInventoryEntries\(mooncakeWarehouseInventoryRoot\)/,
+    'the global observer must avoid rediscovery while invalidating only the active layout snapshot'
+);
+assert.match(
+    source,
+    /mooncakeWarehouseRootMutationObserver\.observe\(root, \{[\s\S]{0,300}childList: true,[\s\S]{0,300}attributes: true,[\s\S]{0,300}aria-selected/,
+    'the dedicated root observer must own item changes and native tab selection observation'
 );
 assert.match(
     source,
