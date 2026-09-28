@@ -15,6 +15,7 @@
     "test:warehouse-queue": "node scripts/test-inventory-warehouse-queue.mjs",
     "test:warehouse-performance": "node scripts/test-inventory-warehouse-performance.mjs",
     "test:warehouse-tabs": "node scripts/test-inventory-warehouse-tabs.mjs",
+    "test:warehouse-relayout": "node scripts/test-inventory-warehouse-relayout.mjs",
     "test:virtual-community-buff": "node scripts/test-virtual-community-buff.mjs",
     "test:koukou-right-bid": "node scripts/test-koukou-right-bid.mjs",
     "test:nonnegative-hourly": "node scripts/test-nonnegative-hourly-inputs.mjs",

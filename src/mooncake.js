@@ -23283,7 +23283,7 @@
     }
 
     // ======================
-    // 背包分区：持久分类 + 强化材料投影 + 当前强化队列
+    // 背包分区：持久分类 + 强化材料投影；当前强化队列独立显示在库存前。
     // ======================
     const MOONCAKE_WAREHOUSE_STORAGE_PREFIX = 'Mooncake_inventoryWarehouses_v1:';
     const MOONCAKE_WAREHOUSE_VERSION = 1;
@@ -23296,17 +23296,40 @@
         MOONCAKE_WAREHOUSE_SECTION_ENHANCE,
         MOONCAKE_WAREHOUSE_SECTION_MATERIALS
     ]);
-    // 可参与自定义排序的系统仓库（当前强化队列始终固定在顶部）。
+    // 可参与自定义排序的系统仓库。当前强化队列不属于背包分区排序。
     const MOONCAKE_WAREHOUSE_SORTABLE_SYSTEM_SECTIONS = [
         MOONCAKE_WAREHOUSE_SECTION_ENHANCE,
         MOONCAKE_WAREHOUSE_SECTION_MATERIALS
     ];
     const MOONCAKE_WAREHOUSE_PANEL_ATTR = 'data-mooncake-warehouse-panel';
+    const MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR = 'data-mooncake-warehouse-queue-dock';
+    const MOONCAKE_WAREHOUSE_QUEUE_HEADER_ATTR = 'data-mooncake-warehouse-queue-header';
+    const MOONCAKE_WAREHOUSE_QUEUE_PREVIEW_ITEM_ATTR = 'data-mooncake-warehouse-queue-preview-item';
+    const MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR = 'data-mooncake-warehouse-queue-host';
+    // Kept only to clear the short-lived v1.6.235 layout when users replace
+    // the script without reloading the game page.
+    const MOONCAKE_WAREHOUSE_QUEUE_LAYOUT_ATTR = 'data-mooncake-warehouse-queue-above-inventory';
+    const MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR = 'data-mooncake-warehouse-native-tools';
+    const MOONCAKE_WAREHOUSE_NATIVE_TABS_ATTR = 'data-mooncake-warehouse-native-tabs';
+    const MOONCAKE_WAREHOUSE_INVENTORY_LAYOUT_ATTR = 'data-mooncake-warehouse-inventory-layout';
     const MOONCAKE_WAREHOUSE_PINNED_ATTR = 'data-mooncake-warehouse-pinned';
     const MOONCAKE_WAREHOUSE_ROLE_ATTR = 'data-mooncake-warehouse-role';
     const MOONCAKE_WAREHOUSE_MENU_ATTR = 'data-mooncake-warehouse-menu-action';
     const MOONCAKE_WAREHOUSE_UI_ATTR = 'data-mooncake-inventory-zone-ui';
     const MOONCAKE_WAREHOUSE_CUSTOM_ID_RE = /^custom:[A-Za-z0-9_-]{1,80}$/;
+    const MOONCAKE_WAREHOUSE_CUSTOM_ICON_KEYS = [
+        'sword', 'star', 'shield', 'chest', 'gem', 'scroll', 'flask', 'tool'
+    ];
+    const MOONCAKE_WAREHOUSE_CUSTOM_ICON_GLYPHS = {
+        sword: '\u2694',
+        star: '\u2726',
+        shield: '\u26e8',
+        chest: '\u25a3',
+        gem: '\u25c6',
+        scroll: '\u25a4',
+        flask: '\u2697',
+        tool: '\u2692'
+    };
     const MOONCAKE_WAREHOUSE_STYLE_PROPS = [
         'position', 'left', 'top', 'z-index', 'margin', 'width', 'height',
         'display', 'opacity', 'pointer-events', 'transform', 'transition', 'visibility'
@@ -23356,6 +23379,8 @@
     let mooncakeWarehouseActiveDialogClose = null;
     let mooncakeWarehouseDialogSequence = 0;
     let mooncakeWarehousePanel = null;
+    let mooncakeWarehouseNativeTools = null;
+    const mooncakeWarehouseNativeTabBindings = new WeakSet();
     let mooncakeWarehousePanelSignature = '';
     let mooncakeWarehousePinnedLayoutSignature = '';
     let mooncakeWarehouseLayoutSignature = '';
@@ -23412,7 +23437,7 @@
             inheritedAll: '当前 +{level} 继承自“全部等级”的归属',
             queueNotice: '此物品当前显示在强化队列中，手动归属会在队列结束后生效。',
             materialsNotice: '此物品由强化仓库中的装备关联；手动分区会优先显示。',
-            managerIntro: '系统仓库由强化计划自动维护。这里可以创建、改名和排序自定义分区。',
+            managerIntro: '系统仓库由强化计划自动维护。这里可以创建、改名、排序和切换自定义分区图标。',
             noCategories: '还没有自定义分区',
             itemCount: '{count} 件物品',
             deleteCategory: '删除“{name}”？其中物品会回到未分类。',
@@ -23421,7 +23446,8 @@
             hide: '隐藏',
             show: '显示',
             hiddenBadge: '已隐藏',
-            edit: '编辑'
+            edit: '编辑',
+            changeIcon: '切换图标'
         };
         const en = {
             queue: 'Current Enhancement Queue',
@@ -23460,7 +23486,7 @@
             inheritedAll: '+{level} inherits the All owned levels assignment',
             queueNotice: 'This item is currently shown in the enhancement queue. Its manual section applies after the queue ends.',
             materialsNotice: 'This item is linked by equipment in the enhancement warehouse. Its manual section takes display priority.',
-            managerIntro: 'System warehouses are maintained by enhancement plans. Create, rename, and order custom sections here.',
+            managerIntro: 'System warehouses are maintained by enhancement plans. Create, rename, order, and change custom section icons here.',
             noCategories: 'No custom sections yet',
             itemCount: '{count} items',
             deleteCategory: 'Delete "{name}"? Its items will return to Unclassified.',
@@ -23469,7 +23495,8 @@
             hide: 'Hide',
             show: 'Show',
             hiddenBadge: 'Hidden',
-            edit: 'Edit'
+            edit: 'Edit',
+            changeIcon: 'Change icon'
         };
         return (isZH ? zh : en)[key] || key;
     }
@@ -23519,6 +23546,30 @@
         return `custom:${suffix}`;
     }
 
+    function mooncakeWarehouseNormalizeCategoryIcon(value, fallbackIndex = 0) {
+        const iconKey = String(value || '').trim();
+        if (MOONCAKE_WAREHOUSE_CUSTOM_ICON_KEYS.includes(iconKey)) return iconKey;
+        const index = Math.max(0, Math.trunc(Number(fallbackIndex) || 0));
+        return MOONCAKE_WAREHOUSE_CUSTOM_ICON_KEYS[index % MOONCAKE_WAREHOUSE_CUSTOM_ICON_KEYS.length];
+    }
+
+    function mooncakeWarehouseGetCustomSectionOrdinal(state, sectionId) {
+        if (!sectionId || !state?.categories?.some(category => category.id === sectionId)) return 0;
+        const customIds = (state.sectionOrder || [])
+            .filter(id => state.categories.some(category => category.id === id));
+        const index = customIds.indexOf(sectionId);
+        return index >= 0 ? index + 1 : 0;
+    }
+
+    function mooncakeWarehouseGetSectionIcon(section, customOrdinal = 0) {
+        if (!section) return '';
+        if (section.id === MOONCAKE_WAREHOUSE_SECTION_QUEUE) return '\u2699';
+        if (section.id === MOONCAKE_WAREHOUSE_SECTION_ENHANCE) return '\u2694';
+        if (section.id === MOONCAKE_WAREHOUSE_SECTION_MATERIALS) return '\u2697';
+        const iconKey = mooncakeWarehouseNormalizeCategoryIcon(section.iconKey, Math.max(0, customOrdinal - 1));
+        return MOONCAKE_WAREHOUSE_CUSTOM_ICON_GLYPHS[iconKey] || String(customOrdinal || '');
+    }
+
     function mooncakeWarehouseNormalizeState(raw) {
         const base = mooncakeWarehouseDefaultState();
         if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return base;
@@ -23535,6 +23586,7 @@
             categories.push({
                 id,
                 name,
+                iconKey: mooncakeWarehouseNormalizeCategoryIcon(input?.iconKey, categories.length),
                 order: Number.isFinite(Number(input?.order)) ? Math.max(0, Math.trunc(Number(input.order))) : categories.length,
                 collapsed: input?.collapsed === true,
                 createdAt: Number.isFinite(Number(input?.createdAt)) ? Math.max(0, Number(input.createdAt)) : 0,
@@ -23583,7 +23635,11 @@
             (MOONCAKE_WAREHOUSE_SYSTEM_SECTIONS.has(raw.activeSectionId) || categoryIds.has(raw.activeSectionId))
             ? raw.activeSectionId
             : null;
-        const activeSectionId = activeSectionCandidate && hiddenSections[activeSectionCandidate] !== true
+        // v1.6.235 briefly made the queue an inventory tab. It is now a
+        // standalone preview, so discard that saved selection during migration.
+        const activeSectionId = activeSectionCandidate &&
+            activeSectionCandidate !== MOONCAKE_WAREHOUSE_SECTION_QUEUE &&
+            hiddenSections[activeSectionCandidate] !== true
             ? activeSectionCandidate
             : null;
 
@@ -23693,6 +23749,7 @@
         const category = {
             id: mooncakeWarehouseCreateCategoryId(),
             name: normalized,
+            iconKey: mooncakeWarehouseNormalizeCategoryIcon('', state.categories.length),
             order: state.categories.length,
             collapsed: false,
             createdAt: now,
@@ -23715,6 +23772,22 @@
         category.updatedAt = Date.now();
         mooncakeWarehouseSaveState();
         mooncakeScheduleWarehouseRender('category-renamed');
+        return true;
+    }
+
+    function mooncakeWarehouseCycleCategoryIcon(categoryId) {
+        const state = mooncakeWarehouseEnsureState();
+        const category = state.categories.find(entry => entry.id === categoryId);
+        if (!category) return false;
+        const currentIndex = MOONCAKE_WAREHOUSE_CUSTOM_ICON_KEYS.indexOf(
+            mooncakeWarehouseNormalizeCategoryIcon(category.iconKey)
+        );
+        category.iconKey = MOONCAKE_WAREHOUSE_CUSTOM_ICON_KEYS[
+            (Math.max(0, currentIndex) + 1) % MOONCAKE_WAREHOUSE_CUSTOM_ICON_KEYS.length
+        ];
+        category.updatedAt = Date.now();
+        mooncakeWarehouseSaveState(false);
+        mooncakeScheduleWarehouseRender('category-icon');
         return true;
     }
 
@@ -23763,6 +23836,15 @@
 
     function mooncakeWarehouseSetActiveSection(sectionId) {
         const state = mooncakeWarehouseEnsureState();
+        if (sectionId === MOONCAKE_WAREHOUSE_SECTION_QUEUE) sectionId = null;
+        if (sectionId == null) {
+            if (state.activeSectionId == null) return false;
+            state.activeSectionId = null;
+            mooncakeWarehouseSaveState(false);
+            mooncakeWarehouseRestorePresentation({ keepExternal: true });
+            mooncakeScheduleWarehouseRender('section-selected');
+            return true;
+        }
         if (!MOONCAKE_WAREHOUSE_SYSTEM_SECTIONS.has(sectionId) && !mooncakeWarehouseGetCustomCategory(sectionId)) return false;
         if (state.hiddenSections[sectionId] === true || state.activeSectionId === sectionId) return false;
         state.activeSectionId = sectionId;
@@ -24478,9 +24560,14 @@
         node.removeAttribute(MOONCAKE_WAREHOUSE_ROLE_ATTR);
     }
 
-    function mooncakeWarehouseRestorePresentation() {
+    function mooncakeWarehouseRestorePresentation(options = {}) {
+        if (options.keepExternal !== true) {
+            mooncakeWarehouseRemoveQueueDock();
+            mooncakeWarehouseRemoveNativeSectionTools();
+        }
         mooncakeWarehouseDisconnectCurrentEquipmentObserver();
         mooncakeWarehouseClearCurrentEquipmentLease();
+        mooncakeWarehouseClearLegacyQueueLayout();
         for (const panel of document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}]`)) panel.remove();
         for (const node of mooncakeWarehousePinnedNodes) {
             mooncakeWarehouseRestorePinnedNode(node);
@@ -24566,16 +24653,25 @@
     }
 
     function mooncakeWarehouseMutationTouchesObservedInventory(mutation, root) {
+        const activeNativeTools = mooncakeWarehouseNativeTools;
+        const removedNativeTools = !!activeNativeTools && !activeNativeTools.isConnected &&
+            [...mutation.removedNodes].some(node => node === activeNativeTools ||
+                (node instanceof Element && node.contains(activeNativeTools))
+            );
+        // React may rebuild the native tab list and discard our display:contents
+        // wrapper or one of its ancestors. Treat that removal as a render trigger
+        // so the controls rejoin the rebuilt list; changes inside stay ignored.
+        if (removedNativeTools) return true;
         const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
         if (!target || (target !== root && !root.contains(target)) ||
             mooncakeIsExternalProfitPanelNode(target) ||
-            target.closest?.(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}]`)) {
+            target.closest?.(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}], [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}], [${MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR}]`)) {
             return false;
         }
         return [...mutation.addedNodes, ...mutation.removedNodes].some(node => {
             if (!mooncakeWarehouseNodeTouchesInventoryStructure(node)) return false;
-            return !node.matches?.(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}], [${MOONCAKE_WAREHOUSE_MENU_ATTR}]`) &&
-                !node.closest?.(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}]`);
+            return !node.matches?.(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}], [${MOONCAKE_WAREHOUSE_MENU_ATTR}], [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}], [${MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR}]`) &&
+                !node.closest?.(`[${MOONCAKE_WAREHOUSE_PANEL_ATTR}], [${MOONCAKE_WAREHOUSE_UI_ATTR}], [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}], [${MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR}]`);
         });
     }
 
@@ -24836,9 +24932,12 @@
     }
 
     function mooncakeWarehouseEnsureStyles() {
-        if (document.getElementById('mooncake-inventory-warehouse-style')) return;
+        const existing = document.getElementById('mooncake-inventory-warehouse-style');
+        if (existing?.dataset.mooncakeWarehouseStyleVersion === '3') return;
+        existing?.remove();
         const style = document.createElement('style');
         style.id = 'mooncake-inventory-warehouse-style';
+        style.dataset.mooncakeWarehouseStyleVersion = '3';
         style.textContent = `
             [${MOONCAKE_WAREHOUSE_PANEL_ATTR}] {
                 position: absolute; left: 0; right: 0; top: 0; z-index: 4; pointer-events: none;
@@ -24857,28 +24956,78 @@
             .mooncake-warehouse-button.is-primary { border-color: #5079c4; background: #3d62ad; color: #fff; }
             .mooncake-warehouse-button.is-primary:hover:not(:disabled) { background: #4d74c4; border-color: #88acff; }
             .mooncake-warehouse-icon-button { width: 28px; min-width: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 15px; }
-            .mooncake-warehouse-tabs {
-                position: absolute; left: 5px; right: 5px; top: 4px; height: 31px; display: flex; align-items: stretch;
-                pointer-events: auto; border-bottom: 1px solid rgba(103,130,181,.55); background: rgba(28,37,57,.9);
+            [${MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR}] {
+                display: contents;
             }
-            .mooncake-warehouse-tab-list {
-                min-width: 0; flex: 1; display: flex; align-items: stretch; gap: 2px; overflow-x: auto; overflow-y: hidden;
-                scrollbar-width: thin; overscroll-behavior-x: contain;
+            [${MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR}] .mooncake-warehouse-native-button {
+                appearance: none; position: relative; box-sizing: border-box; flex: 0 0 var(--mooncake-warehouse-native-tab-width, 2.75rem);
+                display: inline-flex; align-items: center; justify-content: center; width: var(--mooncake-warehouse-native-tab-width, 2.75rem);
+                min-width: var(--mooncake-warehouse-native-tab-width, 2.75rem); height: var(--mooncake-warehouse-native-tab-height, 2.75rem);
+                min-height: var(--mooncake-warehouse-native-tab-height, 2.75rem); margin: 0; padding: 0; border: 1px solid rgba(91,111,169,.72);
+                border-radius: 4px; background: rgba(45,57,89,.84); color: #d9e5ff; cursor: pointer; font: inherit;
             }
-            .mooncake-warehouse-tab {
-                appearance: none; flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; min-width: 0;
-                border: 0; border-bottom: 3px solid transparent; padding: 0 9px; background: transparent;
-                color: #9eabc4; cursor: pointer; white-space: nowrap; font-weight: 650;
+            [${MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR}] .mooncake-warehouse-native-button:hover { background: rgba(73,96,151,.82); color: #fff; }
+            [${MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR}] .mooncake-warehouse-native-button.is-active { background: rgba(74,96,151,.92); box-shadow: inset 0 -2px #8eaeff; color: #fff; }
+            [${MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR}] .mooncake-warehouse-native-icon {
+                display: inline-flex; align-items: center; justify-content: center; line-height: 1;
+                font-size: var(--mooncake-warehouse-native-icon-size, 1.4rem);
             }
-            .mooncake-warehouse-tab:hover { background: rgba(123,160,218,.14); color: #e1e9f8; }
-            .mooncake-warehouse-tab.is-active { border-bottom-color: #7899ea; background: rgba(74,96,151,.25); color: #eef3ff; }
-            .mooncake-warehouse-tab:focus-visible { outline: 2px solid #7aabff; outline-offset: -2px; }
-            .mooncake-warehouse-tab-count {
-                min-width: 17px; padding: 0 4px; border: 1px solid rgba(113,142,191,.52); border-radius: 3px;
-                color: #b7c8e8; font-size: 10px; line-height: 15px; text-align: center;
+            [${MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR}] .mooncake-warehouse-native-order {
+                position: absolute; right: 1px; bottom: 1px; min-width: 11px; height: 11px; padding: 0 2px; border-radius: 6px;
+                background: #3f7ab9; color: #fff; font-size: 8px; font-weight: 800; line-height: 11px; text-align: center;
             }
-            .mooncake-warehouse-tab-badge { color: #80d0c3; font-size: 10px; }
-            .mooncake-warehouse-tabs .mooncake-warehouse-section-settings { align-self: center; margin: 0 3px; }
+            [${MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR}] .mooncake-warehouse-native-settings { color: #afc0e8; }
+            [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] {
+                box-sizing: border-box; display: flex; flex-direction: column; width: 100%; max-height: min(42dvh, 360px); padding: 4px 5px 7px;
+                color: #dce4ff; font: 13px system-ui, sans-serif;
+            }
+            [${MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR}="1"] {
+                display: flex !important; flex-direction: column; min-height: 0;
+            }
+            [${MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR}="1"] > [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] { flex: 0 0 auto; }
+            [${MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR}="1"] > [class*="TabsComponent_tabsComponent"] {
+                flex: 1 1 auto; min-height: 0; height: auto !important;
+            }
+            [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] *,
+            [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] *::before,
+            [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] *::after { box-sizing: border-box; }
+            [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] .mooncake-warehouse-queue-preview-header {
+                min-height: 28px; display: flex; align-items: center; gap: 7px; padding: 0 7px;
+                border-left: 2px solid #d69a57; border-bottom: 1px solid rgba(92,119,166,.38);
+                background: rgba(37,50,78,.52); color: #dce4ff; overflow: hidden;
+            }
+            [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] .mooncake-warehouse-queue-preview-title { flex: 0 0 auto; font-weight: 700; }
+            [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] .mooncake-warehouse-queue-preview-count {
+                flex: 0 0 auto; min-width: 17px; padding: 0 4px; border: 1px solid rgba(129,157,211,.62); border-radius: 3px;
+                color: #bcd1f8; font-size: 10px; line-height: 15px; text-align: center;
+            }
+            [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] .mooncake-warehouse-queue-preview-summary {
+                min-width: 0; overflow: hidden; color: #a9b7d3; text-overflow: ellipsis; white-space: nowrap;
+            }
+            [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] .mooncake-warehouse-queue-preview-grid {
+                display: flex; flex: 0 1 auto; flex-wrap: wrap; align-items: flex-start; min-height: 0; overflow: auto; overscroll-behavior: contain;
+                gap: var(--mooncake-warehouse-queue-row-gap, 4px) var(--mooncake-warehouse-queue-column-gap, 4px);
+                padding: 4px 0 0 var(--mooncake-warehouse-queue-left, 0px);
+            }
+            [${MOONCAKE_WAREHOUSE_QUEUE_PREVIEW_ITEM_ATTR}] {
+                position: relative !important; left: auto !important; top: auto !important; z-index: auto !important;
+                flex: 0 0 var(--mooncake-warehouse-queue-item-width, 52px); width: var(--mooncake-warehouse-queue-item-width, 52px) !important;
+                height: var(--mooncake-warehouse-queue-item-height, 52px) !important; min-width: 0; margin: 0 !important;
+                visibility: visible !important; pointer-events: none !important; transform: none !important; transition: none !important;
+            }
+            [${MOONCAKE_WAREHOUSE_QUEUE_HEADER_ATTR}] {
+                position: absolute; left: 5px; right: 5px; height: 28px; display: flex; align-items: center; gap: 7px;
+                padding: 0 7px; border-left: 2px solid #d69a57; border-bottom: 1px solid rgba(92,119,166,.38);
+                background: rgba(37,50,78,.52); color: #dce4ff; overflow: hidden; pointer-events: none;
+            }
+            [${MOONCAKE_WAREHOUSE_QUEUE_HEADER_ATTR}] .mooncake-warehouse-queue-title { flex: 0 0 auto; font-weight: 700; }
+            [${MOONCAKE_WAREHOUSE_QUEUE_HEADER_ATTR}] .mooncake-warehouse-queue-count {
+                flex: 0 0 auto; min-width: 17px; padding: 0 4px; border: 1px solid rgba(129,157,211,.62); border-radius: 3px;
+                color: #bcd1f8; font-size: 10px; line-height: 15px; text-align: center;
+            }
+            [${MOONCAKE_WAREHOUSE_QUEUE_HEADER_ATTR}] .mooncake-warehouse-queue-summary {
+                min-width: 0; overflow: hidden; color: #a9b7d3; text-overflow: ellipsis; white-space: nowrap;
+            }
             .mooncake-warehouse-section {
                 position: absolute; left: 5px; right: 5px; height: 28px; display: flex;
                 align-items: stretch; pointer-events: auto; border-left: 2px solid #5673a6;
@@ -24961,6 +25110,10 @@
             .mooncake-warehouse-manager-empty { padding: 16px 10px; border: 1px dashed #52617f; border-radius: 5px; color: #9aa8c1; text-align: center; }
             .mooncake-warehouse-manager-row { padding: 8px; border: 1px solid #4d5e81; border-radius: 5px; background: #1d2639; }
             .mooncake-warehouse-manager-row-head { display: flex; align-items: center; gap: 8px; min-height: 29px; }
+            .mooncake-warehouse-manager-order {
+                flex: 0 0 auto; min-width: 19px; color: #9db8ed; font-size: 12px; font-weight: 800; text-align: center;
+            }
+            .mooncake-warehouse-manager-icon { flex: 0 0 auto; width: 28px; min-width: 28px; color: #d6e4ff; }
             .mooncake-warehouse-manager-name { min-width: 0; flex: 1; color: #ebf1ff; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
             .mooncake-warehouse-manager-count { flex: 0 0 auto; color: #a9b9d8; font-size: 11px; }
             .mooncake-warehouse-action-group { flex: 0 0 auto; display: flex; gap: 4px; }
@@ -24979,6 +25132,9 @@
             }
         `;
         document.head.appendChild(style);
+        // Remove the v1.6.235 tab reordering attribute when a userscript
+        // update is applied without a full game reload.
+        mooncakeWarehouseClearLegacyQueueLayout();
     }
 
     function mooncakeWarehouseCreateButton(label, secondary = false, variant = '') {
@@ -24996,52 +25152,289 @@
         return button;
     }
 
-    function mooncakeWarehouseAppendTabs(panel, sections, activeSectionId) {
-        const bar = document.createElement('div');
-        bar.className = 'mooncake-warehouse-tabs';
-        const list = document.createElement('div');
-        list.className = 'mooncake-warehouse-tab-list';
-        list.setAttribute('role', 'tablist');
-        for (const section of sections) {
-            const active = section.id === activeSectionId;
-            const tab = document.createElement('button');
-            tab.type = 'button';
-            tab.className = `mooncake-warehouse-tab${active ? ' is-active' : ''}`;
-            tab.setAttribute('role', 'tab');
-            tab.setAttribute('aria-selected', String(active));
-            tab.tabIndex = active ? 0 : -1;
-            const label = document.createElement('span');
-            label.textContent = section.title;
-            const count = document.createElement('span');
-            count.className = 'mooncake-warehouse-tab-count';
-            count.textContent = String(section.count);
-            tab.append(label, count);
-            if (section.badge) {
-                const badge = document.createElement('span');
-                badge.className = 'mooncake-warehouse-tab-badge';
-                badge.textContent = section.badge;
-                tab.appendChild(badge);
+    function mooncakeWarehouseGetNativeTabsComponent(root) {
+        if (!root?.querySelector) return null;
+        return root.querySelector(':scope > [class*="TabsComponent_tabsComponent"]') ||
+            root.querySelector('[class*="TabsComponent_tabsComponent"]');
+    }
+
+    function mooncakeWarehouseGetNativeTabsContainer(root) {
+        const nativeTabs = mooncakeWarehouseGetNativeTabsComponent(root);
+        return nativeTabs?.querySelector?.(':scope > [class*="TabsComponent_tabsContainer"]') ||
+            nativeTabs?.querySelector?.('[class*="TabsComponent_tabsContainer"]') || null;
+    }
+
+    function mooncakeWarehouseGetNativeTabsFlexContainer(root) {
+        const tabs = mooncakeWarehouseGetNativeTabsContainer(root);
+        const muiTabs = tabs?.querySelector?.(':scope > [class*="MuiTabs-root"]') ||
+            tabs?.querySelector?.('[class*="MuiTabs-root"]') || null;
+        return muiTabs?.querySelector?.('[class*="MuiTabs-flexContainer"]') || null;
+    }
+
+    function mooncakeWarehouseClearLegacyQueueLayout() {
+        for (const component of document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_QUEUE_LAYOUT_ATTR}]`)) {
+            component.removeAttribute(MOONCAKE_WAREHOUSE_QUEUE_LAYOUT_ATTR);
+            component.style.removeProperty('--mooncake-warehouse-queue-height');
+        }
+    }
+
+    function mooncakeWarehouseGetQueuePreviewRecords(queueSection) {
+        const records = queueSection?.records || [];
+        return [
+            ...records.filter(record => record.group === 'equipment'),
+            ...records.filter(record => record.group === 'protection'),
+            ...records.filter(record => record.group === 'material')
+        ].filter(record => record?.node?.isConnected);
+    }
+
+    function mooncakeWarehouseCloneQueuePreviewItem(node) {
+        if (!node?.cloneNode) return null;
+        const clone = node.cloneNode(true);
+        const reset = element => {
+            if (!(element instanceof Element)) return;
+            element.removeAttribute(MOONCAKE_WAREHOUSE_PINNED_ATTR);
+            element.removeAttribute(MOONCAKE_WAREHOUSE_ROLE_ATTR);
+            if (!(element instanceof HTMLElement)) return;
+            for (const property of ['position', 'left', 'top', 'z-index', 'margin', 'width', 'height', 'visibility', 'pointer-events', 'transform', 'transition']) {
+                element.style.removeProperty(property);
             }
-            tab.addEventListener('click', event => {
+        };
+        reset(clone);
+        clone.querySelectorAll?.(`[${MOONCAKE_WAREHOUSE_PINNED_ATTR}], [${MOONCAKE_WAREHOUSE_ROLE_ATTR}]`).forEach(reset);
+        clone.setAttribute(MOONCAKE_WAREHOUSE_QUEUE_PREVIEW_ITEM_ATTR, '1');
+        clone.setAttribute('aria-hidden', 'true');
+        return clone;
+    }
+
+    function mooncakeWarehouseCreateQueuePreviewHeader(queueSection) {
+        const header = document.createElement('div');
+        header.className = 'mooncake-warehouse-queue-preview-header';
+        const title = document.createElement('span');
+        title.className = 'mooncake-warehouse-queue-preview-title';
+        title.textContent = queueSection.title;
+        const count = document.createElement('span');
+        count.className = 'mooncake-warehouse-queue-preview-count';
+        count.textContent = String(queueSection.actionCount);
+        const summary = document.createElement('span');
+        summary.className = 'mooncake-warehouse-queue-preview-summary';
+        const first = queueSection.records.find(record => record.group === 'equipment') ||
+            queueSection.sourceEquipment?.[0] || null;
+        summary.textContent = first
+            ? `${getItemName(first.itemHrid)} +${mooncakeWarehouseNormalizeLevel(first.enhancementLevel)}`
+            : mooncakeWarehouseText('emptyCustom');
+        header.append(title, count, summary);
+        return header;
+    }
+
+    function mooncakeWarehouseSyncQueueDock(root, model, metrics) {
+        mooncakeWarehouseClearLegacyQueueLayout();
+        const component = mooncakeWarehouseGetNativeTabsComponent(root);
+        const queueSection = model?.queueSection;
+        const records = mooncakeWarehouseGetQueuePreviewRecords(queueSection);
+        if (!component || !queueSection?.actionCount) {
+            mooncakeWarehouseRemoveQueueDock();
+            return;
+        }
+
+        let dock = component.previousElementSibling?.matches?.(`[${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}]`)
+            ? component.previousElementSibling
+            : null;
+        for (const staleDock of document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}]`)) {
+            if (staleDock !== dock) {
+                staleDock.parentElement?.removeAttribute(MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR);
+                staleDock.remove();
+            }
+        }
+        if (!dock) {
+            dock = document.createElement('section');
+            dock.setAttribute(MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR, '1');
+            dock.setAttribute('aria-label', mooncakeWarehouseText('queue'));
+            component.before(dock);
+        }
+        component.parentElement?.setAttribute(MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR, '1');
+
+        const signature = JSON.stringify([
+            queueSection.actionCount,
+            Math.round(metrics?.itemWidth || 0),
+            Math.round(metrics?.itemHeight || 0),
+            Math.round(metrics?.columnGap || 0),
+            Math.round(metrics?.rowGap || 0),
+            Math.round(metrics?.baseLeft || 0),
+            records.map(record => [
+                record.key,
+                record.group,
+                record.node?.textContent || '',
+                record.node?.querySelector?.('use')?.getAttribute?.('href') || ''
+            ])
+        ]);
+        dock.style.setProperty('--mooncake-warehouse-queue-item-width', `${Math.max(1, Math.round(metrics?.itemWidth || 52))}px`);
+        dock.style.setProperty('--mooncake-warehouse-queue-item-height', `${Math.max(1, Math.round(metrics?.itemHeight || 52))}px`);
+        dock.style.setProperty('--mooncake-warehouse-queue-column-gap', `${Math.max(2, Math.round(metrics?.columnGap || 4))}px`);
+        dock.style.setProperty('--mooncake-warehouse-queue-row-gap', `${Math.max(2, Math.round(metrics?.rowGap || 4))}px`);
+        dock.style.setProperty('--mooncake-warehouse-queue-left', `${Math.max(0, Math.round(metrics?.baseLeft || 0))}px`);
+        if (dock.dataset.mooncakeWarehouseSignature === signature) return;
+        dock.dataset.mooncakeWarehouseSignature = signature;
+
+        const grid = document.createElement('div');
+        grid.className = 'mooncake-warehouse-queue-preview-grid';
+        for (const record of records) {
+            const clone = mooncakeWarehouseCloneQueuePreviewItem(record.node);
+            if (clone) grid.appendChild(clone);
+        }
+        if (!grid.childElementCount) {
+            const empty = document.createElement('div');
+            empty.className = 'mooncake-warehouse-empty';
+            empty.textContent = mooncakeWarehouseText('emptyCustom');
+            grid.appendChild(empty);
+        }
+        dock.replaceChildren(mooncakeWarehouseCreateQueuePreviewHeader(queueSection), grid);
+    }
+
+    function mooncakeWarehouseMeasureNativeTab(tools, tabList) {
+        const nativeTab = [...tabList.querySelectorAll(':scope > [role="tab"]')]
+            .find(tab => tab.parentElement === tabList) || null;
+        const rect = nativeTab?.getBoundingClientRect?.();
+        if (!rect || !(rect.width > 0) || !(rect.height > 0)) return;
+        tools.style.setProperty('--mooncake-warehouse-native-tab-width', `${Math.round(rect.width * 10) / 10}px`);
+        tools.style.setProperty('--mooncake-warehouse-native-tab-height', `${Math.round(rect.height * 10) / 10}px`);
+        const icon = nativeTab.querySelector?.('[class*="Inventory_tabIconImage"], img, svg') || null;
+        const iconRect = icon?.getBoundingClientRect?.();
+        if (iconRect && iconRect.width > 0 && iconRect.height > 0) {
+            tools.style.setProperty('--mooncake-warehouse-native-icon-size', `${Math.round(Math.min(iconRect.width, iconRect.height) * 10) / 10}px`);
+        }
+    }
+
+    function mooncakeWarehouseRemoveQueueDock() {
+        for (const dock of document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}]`)) dock.remove();
+        document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR}]`).forEach(host => {
+            host.removeAttribute(MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR);
+        });
+        document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_INVENTORY_LAYOUT_ATTR}]`).forEach(root => {
+            root.removeAttribute(MOONCAKE_WAREHOUSE_INVENTORY_LAYOUT_ATTR);
+        });
+        mooncakeWarehouseClearLegacyQueueLayout();
+    }
+
+    function mooncakeWarehouseRemoveNativeSectionTools() {
+        for (const tools of document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR}]`)) tools.remove();
+        document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_NATIVE_TABS_ATTR}]`).forEach(tabs => {
+            tabs.removeAttribute(MOONCAKE_WAREHOUSE_NATIVE_TABS_ATTR);
+        });
+        mooncakeWarehouseNativeTools = null;
+    }
+
+    function mooncakeWarehouseActivateSectionFromNativeTools(root, sectionId) {
+        const tabs = mooncakeWarehouseGetNativeTabsContainer(root);
+        const nativeTabs = tabs ? [...tabs.querySelectorAll('[role="tab"]')] : [];
+        const firstTab = nativeTabs[0] || null;
+        const nativeAllSelected = !firstTab || firstTab.getAttribute('aria-selected') === 'true' || firstTab.classList.contains('Mui-selected');
+        if (!nativeAllSelected) firstTab.click();
+        mooncakeWarehouseSetActiveSection(sectionId);
+    }
+
+    function mooncakeWarehouseBindNativeTabSelection(root) {
+        const tabs = mooncakeWarehouseGetNativeTabsContainer(root);
+        if (!tabs || mooncakeWarehouseNativeTabBindings.has(tabs)) return;
+        mooncakeWarehouseNativeTabBindings.add(tabs);
+        tabs.addEventListener('click', event => {
+            const tab = event.target instanceof Element ? event.target.closest?.('[role="tab"]') : null;
+            if (!tab || !tabs.contains(tab)) return;
+            mooncakeWarehouseSetActiveSection(null);
+        }, true);
+        tabs.addEventListener('keydown', event => {
+            if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+            const tabList = mooncakeWarehouseGetNativeTabsFlexContainer(root);
+            const tab = event.target instanceof Element ? event.target.closest?.('[role="tab"]') : null;
+            const tools = mooncakeWarehouseNativeTools;
+            if (!tabList || !tab || !tools?.isConnected || tools.parentElement !== tabList) return;
+            const nativeTabs = [...tabList.querySelectorAll(':scope > [role="tab"]')]
+                .filter(candidate => candidate.parentElement === tabList);
+            if (nativeTabs.length < 2) return;
+            const firstTab = nativeTabs[0];
+            const lastTab = nativeTabs[nativeTabs.length - 1];
+            const destination = event.key === 'ArrowRight' && tab === lastTab
+                ? firstTab
+                : (event.key === 'ArrowLeft' && tab === firstTab ? lastTab : null);
+            if (!destination) return;
+            // MUI's arrow navigation walks DOM siblings. The display:contents
+            // toolbar is visually flattened but remains a sibling in that walk.
+            event.preventDefault();
+            event.stopPropagation();
+            destination.focus();
+        }, true);
+    }
+
+    function mooncakeWarehouseSyncNativeSectionTools(root, model) {
+        const tabList = mooncakeWarehouseGetNativeTabsFlexContainer(root);
+        if (!tabList || !model) {
+            mooncakeWarehouseRemoveNativeSectionTools();
+            return;
+        }
+        mooncakeWarehouseBindNativeTabSelection(root);
+        let tools = mooncakeWarehouseNativeTools;
+        if (!tools?.isConnected || tools.parentElement !== tabList) {
+            mooncakeWarehouseRemoveNativeSectionTools();
+            tools = document.createElement('div');
+            tools.setAttribute(MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR, '1');
+            tools.setAttribute('role', 'toolbar');
+            tools.setAttribute('aria-label', mooncakeWarehouseText('categories'));
+            mooncakeWarehouseNativeTools = tools;
+            const nativeTabs = [...tabList.querySelectorAll(':scope > [role="tab"]')]
+                .filter(tab => tab.parentElement === tabList);
+            const lastNativeTab = nativeTabs[nativeTabs.length - 1] || null;
+            if (lastNativeTab) lastNativeTab.after(tools);
+            else tabList.appendChild(tools);
+        }
+        mooncakeWarehouseMeasureNativeTab(tools, tabList);
+        // Queue is a standalone preview above the game inventory rather than a
+        // selectable icon in this native tab row.
+        const navigationSections = model.sections;
+        const signature = JSON.stringify(navigationSections.map(section => [
+            section.id, section.title, section.icon, section.ordinal || 0, section.count, section.id === model.activeSectionId
+        ]));
+        if (tools.dataset.mooncakeWarehouseSignature === signature) return;
+        tools.dataset.mooncakeWarehouseSignature = signature;
+        const fragment = document.createDocumentFragment();
+        for (const section of navigationSections) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = `mooncake-warehouse-native-button${section.id === model.activeSectionId ? ' is-active' : ''}`;
+            button.title = `${section.title} (${section.count})`;
+            button.setAttribute('aria-label', button.title);
+            button.setAttribute('aria-pressed', String(section.id === model.activeSectionId));
+            const icon = document.createElement('span');
+            icon.className = 'mooncake-warehouse-native-icon';
+            icon.textContent = section.icon;
+            button.appendChild(icon);
+            if (section.ordinal > 0) {
+                const ordinal = document.createElement('span');
+                ordinal.className = 'mooncake-warehouse-native-order';
+                ordinal.textContent = String(section.ordinal);
+                button.appendChild(ordinal);
+            }
+            button.addEventListener('click', event => {
                 event.preventDefault();
                 event.stopPropagation();
-                mooncakeWarehouseSetActiveSection(section.id);
+                mooncakeWarehouseActivateSectionFromNativeTools(root, section.id);
             });
-            list.appendChild(tab);
+            fragment.appendChild(button);
         }
         const settings = document.createElement('button');
         settings.type = 'button';
-        settings.className = 'mooncake-warehouse-section-settings';
-        settings.textContent = '\u2699';
+        settings.className = 'mooncake-warehouse-native-button mooncake-warehouse-native-settings';
+        const settingsIcon = document.createElement('span');
+        settingsIcon.className = 'mooncake-warehouse-native-icon';
+        settingsIcon.textContent = '\u2699';
         settings.title = mooncakeWarehouseText('categories');
-        settings.setAttribute('aria-label', mooncakeWarehouseText('categories'));
+        settings.setAttribute('aria-label', settings.title);
         settings.addEventListener('click', event => {
             event.preventDefault();
             event.stopPropagation();
             mooncakeWarehouseOpenManager({ trigger: settings });
         });
-        bar.append(list, settings);
-        panel.appendChild(bar);
+        settings.appendChild(settingsIcon);
+        fragment.appendChild(settings);
+        tools.replaceChildren(fragment);
     }
 
     function mooncakeWarehouseAppendSectionHeading(panel, section, top, count, collapsed) {
@@ -25097,6 +25490,24 @@
         panel.appendChild(empty);
     }
 
+    function mooncakeWarehouseAppendQueueHeader(panel, header) {
+        if (!header) return;
+        const element = document.createElement('div');
+        element.setAttribute(MOONCAKE_WAREHOUSE_QUEUE_HEADER_ATTR, '1');
+        element.style.top = `${Math.round(header.top)}px`;
+        const title = document.createElement('span');
+        title.className = 'mooncake-warehouse-queue-title';
+        title.textContent = header.title;
+        const count = document.createElement('span');
+        count.className = 'mooncake-warehouse-queue-count';
+        count.textContent = String(header.count);
+        const summary = document.createElement('span');
+        summary.className = 'mooncake-warehouse-queue-summary';
+        summary.textContent = header.summary;
+        element.append(title, count, summary);
+        panel.appendChild(element);
+    }
+
     function mooncakeWarehouseGetPinnedNodeId(node) {
         if (!node) return 0;
         let id = mooncakeWarehousePinnedNodeIds.get(node);
@@ -25128,21 +25539,23 @@
         const state = mooncakeWarehouseEnsureState();
         const sectionRecords = sectionId => projection.bySection.get(sectionId) || [];
         const sectionsById = new Map();
-        if (projection.queue.actionCount > 0) {
-            sectionsById.set(MOONCAKE_WAREHOUSE_SECTION_QUEUE, {
-                id: MOONCAKE_WAREHOUSE_SECTION_QUEUE,
-                title: mooncakeWarehouseText('queue'),
-                records: sectionRecords(MOONCAKE_WAREHOUSE_SECTION_QUEUE),
-                queue: true,
-                kind: 'queue',
-                emptyText: mooncakeWarehouseText('emptyCustom')
-            });
-        }
+        const queueSection = projection.queue.actionCount > 0 ? {
+            id: MOONCAKE_WAREHOUSE_SECTION_QUEUE,
+            title: mooncakeWarehouseText('queue'),
+            records: sectionRecords(MOONCAKE_WAREHOUSE_SECTION_QUEUE),
+            sourceEquipment: projection.queue.equipment,
+            queue: true,
+            kind: 'queue',
+            actionCount: projection.queue.actionCount,
+            icon: mooncakeWarehouseGetSectionIcon({ id: MOONCAKE_WAREHOUSE_SECTION_QUEUE }),
+            emptyText: mooncakeWarehouseText('emptyCustom')
+        } : null;
         sectionsById.set(MOONCAKE_WAREHOUSE_SECTION_ENHANCE, {
             id: MOONCAKE_WAREHOUSE_SECTION_ENHANCE,
             title: mooncakeWarehouseText('enhance'),
             records: sectionRecords(MOONCAKE_WAREHOUSE_SECTION_ENHANCE),
             kind: 'enhance',
+            icon: mooncakeWarehouseGetSectionIcon({ id: MOONCAKE_WAREHOUSE_SECTION_ENHANCE }),
             emptyText: mooncakeWarehouseText('emptyEnhance')
         });
         sectionsById.set(MOONCAKE_WAREHOUSE_SECTION_MATERIALS, {
@@ -25150,6 +25563,7 @@
             title: mooncakeWarehouseText('materials'),
             records: sectionRecords(MOONCAKE_WAREHOUSE_SECTION_MATERIALS),
             kind: 'materials',
+            icon: mooncakeWarehouseGetSectionIcon({ id: MOONCAKE_WAREHOUSE_SECTION_MATERIALS }),
             badge: mooncakeWarehouseText('automatic'),
             emptyText: mooncakeWarehouseText('emptyMaterials')
         });
@@ -25159,14 +25573,13 @@
                 title: category.name,
                 records: sectionRecords(category.id),
                 kind: 'custom',
+                iconKey: category.iconKey,
                 emptyText: mooncakeWarehouseText('emptyCustom')
             });
         }
 
-        // 当前强化队列固定在顶部；强化仓库 / 强化材料仓库 / 自定义分区按用户顺序排列。
+        // 队列保留独立的数据模型并显示在库存栏前；其余分区按用户顺序排列。
         const sections = [];
-        const queueSection = sectionsById.get(MOONCAKE_WAREHOUSE_SECTION_QUEUE);
-        if (queueSection) sections.push(queueSection);
         for (const id of (state.sectionOrder || [])) {
             const section = sectionsById.get(id);
             if (section) sections.push(section);
@@ -25175,10 +25588,10 @@
             if (!sections.includes(section)) sections.push(section);
         }
         const visibleSections = sections.filter(section => state.hiddenSections[section.id] !== true);
-        const activeSection = visibleSections.find(section => section.id === state.activeSectionId) ||
-            visibleSections.find(section => section.id === MOONCAKE_WAREHOUSE_SECTION_QUEUE) ||
-            visibleSections.find(section => section.id === MOONCAKE_WAREHOUSE_SECTION_ENHANCE) ||
-            visibleSections[0] || null;
+        // The current enhancement queue is rendered as a separate preview above
+        // the inventory. Only persisted warehouses and custom sections replace
+        // the native grid below it.
+        const activeSection = visibleSections.find(section => section.id === state.activeSectionId) || null;
         const activeSectionId = activeSection?.id || null;
         const sharedUnavailableKeys = {
             inventoryKeys: projection.inventoryKeys,
@@ -25191,6 +25604,12 @@
         for (const section of visibleSections) {
             section.unavailableCount = mooncakeWarehouseGetUnavailableSectionCount(section.id, section.records, projection, sharedUnavailableKeys);
             section.count = section.records.length + section.unavailableCount;
+            section.ordinal = section.kind === 'custom' ? mooncakeWarehouseGetCustomSectionOrdinal(state, section.id) : 0;
+            section.icon = mooncakeWarehouseGetSectionIcon(section, section.ordinal);
+        }
+        if (queueSection) {
+            queueSection.unavailableCount = mooncakeWarehouseGetUnavailableSectionCount(queueSection.id, queueSection.records, projection, sharedUnavailableKeys);
+            queueSection.count = queueSection.actionCount;
         }
 
         const placements = new Map();
@@ -25206,9 +25625,23 @@
             return y + rows * metrics.itemHeight + Math.max(0, rows - 1) * metrics.rowGap;
         };
 
-        let y = 40;
+        let queueHeader = null;
+        let y = 4;
         if (activeSection) {
             if (activeSection.queue) {
+                const first = activeSection.records.find(record => record.group === 'equipment') ||
+                    activeSection.sourceEquipment?.[0] || null;
+                const firstLabel = first
+                    ? `${getItemName(first.itemHrid)} +${mooncakeWarehouseNormalizeLevel(first.enhancementLevel)}`
+                    : mooncakeWarehouseText('emptyCustom');
+                queueHeader = {
+                    title: activeSection.title,
+                    count: activeSection.actionCount,
+                    summary: firstLabel,
+                    top: y,
+                    height: 28
+                };
+                y += queueHeader.height + 4;
                 const equipmentRecords = activeSection.records.filter(record => record.group === 'equipment');
                 const protectionRecords = activeSection.records.filter(record => record.group === 'protection');
                 const materialRecords = activeSection.records.filter(record => record.group === 'material');
@@ -25242,19 +25675,21 @@
             y += 2;
         }
 
-        const panelHeight = Math.max(39, Math.ceil(y + 2));
+        const panelHeight = activeSection ? Math.max(4, Math.ceil(y + 2)) : 0;
         const panelSignature = JSON.stringify({
             layout: metrics.signature,
             panelHeight,
             activeSectionId,
-            tabs: visibleSections.map(section => [section.id, section.title, section.badge || '', section.count]),
+            queueHeader: queueHeader && [queueHeader.title, queueHeader.count, queueHeader.summary, queueHeader.top, queueHeader.height],
             rows: rows.map(row => ['e', row.text, row.top])
         });
         const pinnedLayoutSignature = mooncakeWarehouseGetPinnedLayoutSignature(projection, state, placements);
         return {
             state,
             sections: visibleSections,
+            queueSection,
             activeSectionId,
+            queueHeader,
             rows,
             placements,
             panelHeight,
@@ -25268,7 +25703,7 @@
         panel.setAttribute(MOONCAKE_WAREHOUSE_PANEL_ATTR, '1');
         panel.className = 'mooncake-warehouse-panel';
         mooncakeWarehouseSetInlineStyle(panel, 'height', `${model.panelHeight}px`);
-        mooncakeWarehouseAppendTabs(panel, model.sections, model.activeSectionId);
+        mooncakeWarehouseAppendQueueHeader(panel, model.queueHeader);
         for (const row of model.rows) {
             mooncakeWarehouseAppendEmptyText(panel, row.text, row.top);
         }
@@ -25411,8 +25846,16 @@
         mooncakeWarehousePinnedNodes = nextPinnedNodes;
     }
 
-    function mooncakeWarehouseRenderPresentation(root, projection, metrics) {
+    function mooncakeWarehouseRenderPresentation(root, projection, metrics, inventoryRoot = root) {
         const model = mooncakeWarehouseBuildPresentationModel(projection, metrics);
+        mooncakeWarehouseSyncNativeSectionTools(inventoryRoot, model);
+        if (!model.activeSectionId) {
+            if (mooncakeWarehousePanel || mooncakeWarehousePinnedNodes.size) {
+                mooncakeWarehouseRestorePresentation({ keepExternal: true });
+            }
+            mooncakeWarehouseSyncQueueDock(inventoryRoot, model, metrics);
+            return model;
+        }
         const panelIsReusable = mooncakeWarehousePanel?.isConnected &&
             mooncakeWarehousePanel.parentElement === root &&
             mooncakeWarehousePanelSignature === model.panelSignature;
@@ -25431,9 +25874,31 @@
         mooncakeWarehouseSetInlineStyle(root, 'position', 'relative');
         mooncakeWarehouseSetInlineStyle(root, 'padding-top', `${Math.ceil(metrics.paddingTop + model.panelHeight)}px`);
         mooncakeWarehouseApplyPinnedNodes(root, projection, model, metrics, presentationUnchanged);
+        mooncakeWarehouseSyncQueueDock(inventoryRoot, model, metrics);
         mooncakeWarehousePinnedLayoutSignature = model.pinnedLayoutSignature;
         mooncakeWarehouseLayoutSignature = metrics.signature;
         mooncakeWarehouseGeometryDirty = false;
+    }
+
+    function mooncakeWarehouseRenderNativeNavigation(inventoryRoot) {
+        const navigationMetrics = {
+            baseLeft: 0,
+            columns: 1,
+            columnStep: 1,
+            itemHeight: 1,
+            rowGap: 0,
+            signature: 'native-navigation'
+        };
+        const model = mooncakeWarehouseBuildPresentationModel(
+            mooncakeWarehouseBuildProjection([]),
+            navigationMetrics
+        );
+        // Native Favorites, category, and filtered views remain owned by the
+        // game. The Mooncake controls stay available but never imply that a
+        // custom section is being rendered in those views.
+        model.activeSectionId = null;
+        mooncakeWarehouseRemoveQueueDock();
+        mooncakeWarehouseSyncNativeSectionTools(inventoryRoot, model);
     }
 
     function mooncakeWarehouseRender() {
@@ -25481,7 +25946,10 @@
             // Mooncake cannot override favorite ordering or infer missing cards.
             if (!mooncakeWarehouseIsNativeAllItemsTab(inventoryRoot) ||
                 mooncakeWarehouseHasNativeInventoryFilter(inventoryRoot)) {
-                if (mooncakeWarehouseInventoryRoot) mooncakeWarehouseRestorePresentation();
+                mooncakeWarehouseRenderNativeNavigation(inventoryRoot);
+                if (mooncakeWarehouseInventoryRoot || mooncakeWarehousePanel || mooncakeWarehousePinnedNodes.size) {
+                    mooncakeWarehouseRestorePresentation({ keepExternal: true });
+                }
                 return;
             }
             const root = mooncakeWarehouseGetLayoutRoot(inventoryRoot);
@@ -25492,7 +25960,7 @@
             // root padding, and pinned item nodes.
             const needsLayoutMeasurement = root !== mooncakeWarehouseInventoryRoot || !mooncakeWarehouseLayoutMetrics;
             if (needsLayoutMeasurement && mooncakeWarehouseInventoryRoot) {
-                mooncakeWarehouseRestorePresentation();
+                mooncakeWarehouseRestorePresentation({ keepExternal: true });
             }
             if (root !== mooncakeWarehouseInventoryRoot) {
                 mooncakeWarehouseInventoryRoot = root;
@@ -25505,7 +25973,7 @@
                 mooncakeWarehouseLayoutMetrics = mooncakeWarehouseGetLayoutMetrics(root, entries, originalPaddingTop);
             }
             const projection = mooncakeWarehouseBuildProjection(entries);
-            mooncakeWarehouseRenderPresentation(root, projection, mooncakeWarehouseLayoutMetrics);
+            mooncakeWarehouseRenderPresentation(root, projection, mooncakeWarehouseLayoutMetrics, inventoryRoot);
         } catch (error) {
             console.warn('[MoonCake] inventory warehouse render failed:', error);
             mooncakeWarehouseRestorePresentation();
@@ -25917,13 +26385,19 @@
             const list = document.createElement('div');
             list.className = 'mooncake-warehouse-manager-list';
 
-            const materialRelationCount = mooncakeWarehouseBuildMaterialRelations().size;
+            const materialRelationCount = state.hiddenSections[MOONCAKE_WAREHOUSE_SECTION_MATERIALS] === true
+                ? 0
+                : mooncakeWarehouseBuildMaterialRelations().size;
             const order = state.sectionOrder || [];
             const orderIndex = id => order.indexOf(id);
             const orderedRows = [];
             const seenOrdered = new Set();
             const pushRow = entry => {
                 if (seenOrdered.has(entry.id)) return;
+                if (entry.kind === 'custom') {
+                    entry.ordinal = mooncakeWarehouseGetCustomSectionOrdinal(state, entry.id);
+                    entry.icon = mooncakeWarehouseGetSectionIcon(entry.category, entry.ordinal);
+                }
                 seenOrdered.add(entry.id);
                 orderedRows.push(entry);
             };
@@ -25979,6 +26453,21 @@
                 row.className = 'mooncake-warehouse-manager-row';
                 const head = document.createElement('div');
                 head.className = 'mooncake-warehouse-manager-row-head';
+
+                if (entry.kind === 'custom') {
+                    const order = document.createElement('span');
+                    order.className = 'mooncake-warehouse-manager-order';
+                    order.textContent = String(entry.ordinal);
+                    const icon = mooncakeWarehouseCreateIconButton(
+                        entry.icon,
+                        mooncakeWarehouseText('changeIcon'),
+                        'mooncake-warehouse-manager-icon'
+                    );
+                    icon.addEventListener('click', () => {
+                        if (mooncakeWarehouseCycleCategoryIcon(entry.id)) render();
+                    });
+                    head.append(order, icon);
+                }
 
                 if (entry.kind === 'custom' && editingCategoryId === entry.id) {
                     const name = document.createElement('input');

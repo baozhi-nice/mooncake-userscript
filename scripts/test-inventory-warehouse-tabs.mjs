@@ -39,12 +39,14 @@ const systemSections = new Set([QUEUE, ENHANCE, MATERIALS]);
 const defaultState = extractFunction('mooncakeWarehouseDefaultState');
 const normalizeItemHrid = extractFunction('mooncakeWarehouseNormalizeItemHrid');
 const normalizeLevel = extractFunction('mooncakeWarehouseNormalizeLevel');
+const normalizeCategoryIcon = extractFunction('mooncakeWarehouseNormalizeCategoryIcon');
 const normalizeState = extractFunction('mooncakeWarehouseNormalizeState');
 const stateSandbox = {
     Set,
     Object,
     Number,
     String,
+    Math,
     MOONCAKE_WAREHOUSE_VERSION: 1,
     MOONCAKE_WAREHOUSE_SECTION_QUEUE: QUEUE,
     MOONCAKE_WAREHOUSE_SECTION_ENHANCE: ENHANCE,
@@ -52,12 +54,14 @@ const stateSandbox = {
     MOONCAKE_WAREHOUSE_SECTION_UNCLASSIFIED: UNCLASSIFIED,
     MOONCAKE_WAREHOUSE_SYSTEM_SECTIONS: systemSections,
     MOONCAKE_WAREHOUSE_SORTABLE_SYSTEM_SECTIONS: [ENHANCE, MATERIALS],
+    MOONCAKE_WAREHOUSE_CUSTOM_ICON_KEYS: ['sword', 'star', 'shield', 'chest'],
     MOONCAKE_WAREHOUSE_CUSTOM_ID_RE: /^custom:[A-Za-z0-9_-]{1,80}$/
 };
 vm.runInNewContext(`
     ${defaultState}
     ${normalizeItemHrid}
     ${normalizeLevel}
+    ${normalizeCategoryIcon}
     ${normalizeState}
     globalThis.defaultState = mooncakeWarehouseDefaultState;
     globalThis.normalizeState = mooncakeWarehouseNormalizeState;
@@ -191,7 +195,7 @@ const badgeOnly = {
 };
 assert.equal(itemSandbox.getItemHrid(badgeOnly), null, 'a badge-only node must not be treated as an inventory item');
 
-assert.match(source, /mooncakeWarehouseAppendTabs\(panel, model\.sections, model\.activeSectionId\)/, 'presentation must render warehouse tabs');
+assert.match(source, /mooncakeWarehouseSyncNativeSectionTools\(inventoryRoot, model\)/, 'presentation must render warehouse section controls in the native tab strip');
 assert.match(source, /const hidden = index > 0 \|\| !model\.placements\.has\(record\.key\)/, 'inactive tabs and favorite aliases must stay hidden');
 assert.match(source, /mooncakeWarehouseGetLayoutRoot\(inventoryRoot\)/, 'warehouse layout must mount inside the active native tab panel');
 assert.match(source, /mooncakeWarehouseHasNativeInventoryFilter\(inventoryRoot\)/, 'filtered inventory must remain under native layout control');

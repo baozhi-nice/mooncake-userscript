@@ -379,7 +379,7 @@ assert.match(
 );
 assert.match(
     source,
-    /function mooncakeWarehouseRestorePresentation\(\) \{\s*mooncakeWarehouseDisconnectCurrentEquipmentObserver\(\);\s*mooncakeWarehouseClearCurrentEquipmentLease\(\);/,
+    /function mooncakeWarehouseRestorePresentation\([^)]*\) \{[\s\S]{0,500}mooncakeWarehouseDisconnectCurrentEquipmentObserver\(\);\s*mooncakeWarehouseClearCurrentEquipmentLease\(\);/,
     'the current-card observer and handoff lease must be released with the warehouse presentation'
 );
 assert.match(
