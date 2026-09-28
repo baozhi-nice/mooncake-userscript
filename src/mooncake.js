@@ -23306,6 +23306,7 @@
     const MOONCAKE_WAREHOUSE_QUEUE_HEADER_ATTR = 'data-mooncake-warehouse-queue-header';
     const MOONCAKE_WAREHOUSE_QUEUE_PREVIEW_ITEM_ATTR = 'data-mooncake-warehouse-queue-preview-item';
     const MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR = 'data-mooncake-warehouse-queue-host';
+    const MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR = 'data-mooncake-warehouse-scroll-root';
     // Kept only to clear the short-lived v1.6.235 layout when users replace
     // the script without reloading the game page.
     const MOONCAKE_WAREHOUSE_QUEUE_LAYOUT_ATTR = 'data-mooncake-warehouse-queue-above-inventory';
@@ -24564,6 +24565,9 @@
         if (options.keepExternal !== true) {
             mooncakeWarehouseRemoveQueueDock();
             mooncakeWarehouseRemoveNativeSectionTools();
+            document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR}]`).forEach(root => {
+                root.removeAttribute(MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR);
+            });
         }
         mooncakeWarehouseDisconnectCurrentEquipmentObserver();
         mooncakeWarehouseClearCurrentEquipmentLease();
@@ -24933,11 +24937,11 @@
 
     function mooncakeWarehouseEnsureStyles() {
         const existing = document.getElementById('mooncake-inventory-warehouse-style');
-        if (existing?.dataset.mooncakeWarehouseStyleVersion === '3') return;
+        if (existing?.dataset.mooncakeWarehouseStyleVersion === '4') return;
         existing?.remove();
         const style = document.createElement('style');
         style.id = 'mooncake-inventory-warehouse-style';
-        style.dataset.mooncakeWarehouseStyleVersion = '3';
+        style.dataset.mooncakeWarehouseStyleVersion = '4';
         style.textContent = `
             [${MOONCAKE_WAREHOUSE_PANEL_ATTR}] {
                 position: absolute; left: 0; right: 0; top: 0; z-index: 4; pointer-events: none;
@@ -24977,8 +24981,25 @@
                 background: #3f7ab9; color: #fff; font-size: 8px; font-weight: 800; line-height: 11px; text-align: center;
             }
             [${MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR}] .mooncake-warehouse-native-settings { color: #afc0e8; }
+            /* Assets, queue and inventory share one scrollport. Native panels
+               must grow with their contents instead of taking the space left
+               after the queue and creating a second, tiny scrollport. */
+            [${MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR}="1"] {
+                min-height: 0; overflow-x: hidden !important; overflow-y: auto !important;
+                scrollbar-gutter: stable;
+            }
+            [${MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR}="1"] > * { flex-shrink: 0; }
+            [${MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR}="1"] > [class*="Inventory_items"],
+            [${MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR}="1"] > [class*="Inventory_items"] > [class*="TabsComponent_tabsComponent"],
+            [${MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR}="1"] > [class*="Inventory_items"] > [class*="TabsComponent_tabsComponent"] > [class*="TabsComponent_tabPanelsContainer"],
+            [${MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR}="1"] > [class*="Inventory_items"] > [class*="TabsComponent_tabsComponent"] > [class*="TabsComponent_tabPanelsContainer"] > [class*="TabPanel_tabPanel"] {
+                flex: 0 0 auto !important; height: auto !important; min-height: 0; overflow: visible !important;
+            }
+            [${MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR}="1"] > [class*="Inventory_items"] > [class*="TabsComponent_tabsComponent"] > [class*="TabsComponent_tabsContainer"] {
+                position: sticky; top: 0; z-index: 6; background: var(--color-midnight-700, #181923);
+            }
             [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] {
-                box-sizing: border-box; display: flex; flex-direction: column; width: 100%; max-height: min(42dvh, 360px); padding: 4px 5px 7px;
+                box-sizing: border-box; display: flex; flex-direction: column; width: 100%; padding: 4px 5px 7px;
                 color: #dce4ff; font: 13px system-ui, sans-serif;
             }
             [${MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR}="1"] {
@@ -24986,7 +25007,7 @@
             }
             [${MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR}="1"] > [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] { flex: 0 0 auto; }
             [${MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR}="1"] > [class*="TabsComponent_tabsComponent"] {
-                flex: 1 1 auto; min-height: 0; height: auto !important;
+                flex: 0 0 auto; min-height: 0; height: auto !important;
             }
             [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] *,
             [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] *::before,
@@ -25005,10 +25026,11 @@
                 min-width: 0; overflow: hidden; color: #a9b7d3; text-overflow: ellipsis; white-space: nowrap;
             }
             [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] .mooncake-warehouse-queue-preview-grid {
-                display: flex; flex: 0 1 auto; flex-wrap: wrap; align-items: flex-start; min-height: 0; overflow: auto; overscroll-behavior: contain;
+                display: flex; flex: 0 0 auto; flex-wrap: wrap; align-items: flex-start; min-height: 0;
                 gap: var(--mooncake-warehouse-queue-row-gap, 4px) var(--mooncake-warehouse-queue-column-gap, 4px);
                 padding: 4px 0 0 var(--mooncake-warehouse-queue-left, 0px);
             }
+            [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] .mooncake-warehouse-empty { position: static; }
             [${MOONCAKE_WAREHOUSE_QUEUE_PREVIEW_ITEM_ATTR}] {
                 position: relative !important; left: auto !important; top: auto !important; z-index: auto !important;
                 flex: 0 0 var(--mooncake-warehouse-queue-item-width, 52px); width: var(--mooncake-warehouse-queue-item-width, 52px) !important;
@@ -25176,6 +25198,15 @@
             component.removeAttribute(MOONCAKE_WAREHOUSE_QUEUE_LAYOUT_ATTR);
             component.style.removeProperty('--mooncake-warehouse-queue-height');
         }
+    }
+
+    function mooncakeWarehouseSyncInventoryScroll(root) {
+        const inventory = root?.closest?.('[class*="Inventory_inventory"]');
+        if (!inventory || inventory.getAttribute(MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR) === '1') return;
+        for (const staleRoot of document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR}]`)) {
+            staleRoot.removeAttribute(MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR);
+        }
+        inventory.setAttribute(MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR, '1');
     }
 
     function mooncakeWarehouseGetQueuePreviewRecords(queueSection) {
@@ -25940,6 +25971,11 @@
             mooncakeWarehousePendingVisibleRender = false;
             mooncakeWarehouseSunnyConflictNotified = false;
             mooncakeWarehouseObserveInventoryRoot(inventoryRoot);
+
+            // Apply the shared scroll layout before measuring native cards.
+            // Keep it for Favorites, search and empty queues as well, so a tab
+            // switch cannot reintroduce nested scrolling or reset the layout.
+            mooncakeWarehouseSyncInventoryScroll(inventoryRoot);
 
             // The native Favorites/category tabs and filtered results contain
             // only a subset of inventory. Leave those views entirely native so
