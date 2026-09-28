@@ -12,6 +12,9 @@
 
 `dist/mooncake.user.js` 必须提交到 `main`。其大小会在构建时校验，避免超过 Greasy Fork 的 2 MiB 发布上限。
 
+背包相关检查可运行 `pnpm test:warehouse-native-queue`、`pnpm test:warehouse-queue`、`pnpm test:warehouse-tabs`、`pnpm test:warehouse-performance` 和 `pnpm test:warehouse-relayout`。
+浏览器交互检查使用 `pnpm test:warehouse-scroll <游戏官方 main.*.chunk.js 的本地路径>`，打开输出的本地地址，运行布局和队列交互检查。该页面提取官方物品组件，使用测试数据和操作回调，不连接游戏账号。React 开发依赖仅用于此测试页面，发布脚本复用游戏已加载的组件和渲染器。
+
 ## 发布到 Greasy Fork
 
 脚本 ID 为 `570078`，现有的 `@downloadURL` 与 `@updateURL` 必须保持 Greasy Fork 地址不变。

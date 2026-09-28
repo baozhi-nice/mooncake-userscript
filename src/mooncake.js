@@ -10724,7 +10724,7 @@
         // its visibility observer opens it, so only a visible live root needs
         // an immediate signature comparison and render request.
         if (inventoryTouched && mooncakeIsEnhancementInventoryWarehouseEnabled() &&
-            mooncakeWarehouseInventoryRoot?.isConnected && mooncakeWarehouseObservedRootVisible) {
+            mooncakeWarehouseObservedRoot?.isConnected && mooncakeWarehouseObservedRootVisible) {
             try {
                 const inventorySignature = mooncakeWarehouseGetInventoryStateSignature(characterInventoryItems);
                 if (inventorySignature !== mooncakeWarehouseInventoryStateSignature) {
@@ -23381,6 +23381,9 @@
     let mooncakeWarehouseDialogSequence = 0;
     let mooncakeWarehousePanel = null;
     let mooncakeWarehouseNativeTools = null;
+    let mooncakeWarehouseNativeItemRuntime = null;
+    const mooncakeWarehouseNativeQueueRoots = new Map();
+    const mooncakeWarehouseNativeInventoryOwners = new Map();
     const mooncakeWarehouseNativeTabBindings = new WeakSet();
     let mooncakeWarehousePanelSignature = '';
     let mooncakeWarehousePinnedLayoutSignature = '';
@@ -24035,6 +24038,7 @@
                 role: queueIndex === 0 ? 'current-equipment' : 'queued-equipment',
                 sectionId: MOONCAKE_WAREHOUSE_SECTION_QUEUE,
                 group: 'equipment',
+                actionKey: mooncakeGetCharacterActionKey(action),
                 priority: 400,
                 sort: [queueIndex, 0],
                 actionIndexes: [actionIndex],
@@ -24666,6 +24670,8 @@
         // wrapper or one of its ancestors. Treat that removal as a render trigger
         // so the controls rejoin the rebuilt list; changes inside stay ignored.
         if (removedNativeTools) return true;
+        if ([...mutation.removedNodes].some(node => node instanceof Element &&
+            node.matches?.(`[${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}]`) && !node.isConnected)) return true;
         const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
         if (!target || (target !== root && !root.contains(target)) ||
             mooncakeIsExternalProfitPanelNode(target) ||
@@ -24937,11 +24943,11 @@
 
     function mooncakeWarehouseEnsureStyles() {
         const existing = document.getElementById('mooncake-inventory-warehouse-style');
-        if (existing?.dataset.mooncakeWarehouseStyleVersion === '4') return;
+        if (existing?.dataset.mooncakeWarehouseStyleVersion === '5') return;
         existing?.remove();
         const style = document.createElement('style');
         style.id = 'mooncake-inventory-warehouse-style';
-        style.dataset.mooncakeWarehouseStyleVersion = '4';
+        style.dataset.mooncakeWarehouseStyleVersion = '5';
         style.textContent = `
             [${MOONCAKE_WAREHOUSE_PANEL_ATTR}] {
                 position: absolute; left: 0; right: 0; top: 0; z-index: 4; pointer-events: none;
@@ -25026,16 +25032,12 @@
                 min-width: 0; overflow: hidden; color: #a9b7d3; text-overflow: ellipsis; white-space: nowrap;
             }
             [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] .mooncake-warehouse-queue-preview-grid {
-                display: flex; flex: 0 0 auto; flex-wrap: wrap; align-items: flex-start; min-height: 0;
-                gap: var(--mooncake-warehouse-queue-row-gap, 4px) var(--mooncake-warehouse-queue-column-gap, 4px);
-                padding: 4px 0 0 var(--mooncake-warehouse-queue-left, 0px);
+                display: grid; flex: 0 0 auto; grid-template-columns: repeat(auto-fill, var(--item-size-normal, 52px));
+                align-items: start; justify-content: center; min-height: 0; gap: var(--spacing-xs, 4px); padding-top: 4px;
             }
-            [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] .mooncake-warehouse-empty { position: static; }
+            [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] .mooncake-warehouse-empty { position: static; grid-column: 1 / -1; }
             [${MOONCAKE_WAREHOUSE_QUEUE_PREVIEW_ITEM_ATTR}] {
-                position: relative !important; left: auto !important; top: auto !important; z-index: auto !important;
-                flex: 0 0 var(--mooncake-warehouse-queue-item-width, 52px); width: var(--mooncake-warehouse-queue-item-width, 52px) !important;
-                height: var(--mooncake-warehouse-queue-item-height, 52px) !important; min-width: 0; margin: 0 !important;
-                visibility: visible !important; pointer-events: none !important; transform: none !important; transition: none !important;
+                position: relative; min-width: 0; margin: 0;
             }
             [${MOONCAKE_WAREHOUSE_QUEUE_HEADER_ATTR}] {
                 position: absolute; left: 5px; right: 5px; height: 28px; display: flex; align-items: center; gap: 7px;
@@ -25209,32 +25211,144 @@
         inventory.setAttribute(MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR, '1');
     }
 
-    function mooncakeWarehouseGetQueuePreviewRecords(queueSection) {
-        const records = queueSection?.records || [];
-        return [
-            ...records.filter(record => record.group === 'equipment'),
-            ...records.filter(record => record.group === 'protection'),
-            ...records.filter(record => record.group === 'material')
-        ].filter(record => record?.node?.isConnected);
+    function mooncakeWarehouseGetQueuePreviewRecords(queueSection, inventory = characterInventoryItems) {
+        const queue = queueSection?.sourceQueue;
+        if (!queue) return [];
+        const items = mooncakeInventoryCharacterItems(inventory);
+        const byKey = new Map(items.map(item => [
+            mooncakeWarehouseIdentityKey(item.itemHrid, item.enhancementLevel), item
+        ]));
+        const records = new Map();
+        for (const record of [...queue.equipment, ...queue.protection, ...queue.materials]) {
+            let key = mooncakeWarehouseIdentityKey(record.itemHrid, record.enhancementLevel);
+            let item = byKey.get(key);
+            if (!item && record.allowLevelReconcile) {
+                const matches = items.filter(candidate => candidate.itemHrid === record.itemHrid);
+                if (matches.length === 1) {
+                    item = matches[0];
+                    key = mooncakeWarehouseIdentityKey(item.itemHrid, item.enhancementLevel);
+                }
+            }
+            if (records.has(key)) continue;
+            records.set(key, {
+                ...record,
+                key,
+                // Enhancement results change the level/hash, not the card's
+                // identity. Keep the native component (and its menu) mounted.
+                previewKey: record.group === 'equipment'
+                    ? `equipment:${record.actionKey || (record.actionIndexes?.[0] ?? record.itemHrid)}`
+                    : `${record.group}:${key}`,
+                enhancementLevel: mooncakeWarehouseNormalizeLevel(item?.enhancementLevel ?? record.enhancementLevel),
+                available: !!item,
+                item: item || {
+                    itemHrid: record.itemHrid,
+                    enhancementLevel: record.enhancementLevel,
+                    itemLocationHrid: '/item_locations/inventory',
+                    count: 0
+                }
+            });
+        }
+        return [...records.values()];
     }
 
-    function mooncakeWarehouseCloneQueuePreviewItem(node) {
-        if (!node?.cloneNode) return null;
-        const clone = node.cloneNode(true);
-        const reset = element => {
-            if (!(element instanceof Element)) return;
-            element.removeAttribute(MOONCAKE_WAREHOUSE_PINNED_ATTR);
-            element.removeAttribute(MOONCAKE_WAREHOUSE_ROLE_ATTR);
-            if (!(element instanceof HTMLElement)) return;
-            for (const property of ['position', 'left', 'top', 'z-index', 'margin', 'width', 'height', 'visibility', 'pointer-events', 'transform', 'transition']) {
-                element.style.removeProperty(property);
+    function mooncakeWarehouseGetNativeInventoryOwner(root) {
+        const inventory = root?.closest?.('[class*="Inventory_inventory"]');
+        const fiberKey = inventory && mooncakeGetFiberKey(inventory);
+        let fiber = fiberKey ? inventory[fiberKey] : null;
+        for (let depth = 0; fiber && depth < 24; depth += 1, fiber = fiber.return) {
+            const owner = fiber.stateNode;
+            if (typeof owner?.renderItem === 'function' &&
+                typeof owner?.getAddEnhancingItemHandler === 'function' &&
+                owner.props?.characterItemMap) return owner;
+        }
+        return null;
+    }
+
+    function mooncakeWarehouseGetNativeItemRuntime() {
+        if (mooncakeWarehouseNativeItemRuntime) return mooncakeWarehouseNativeItemRuntime;
+        // Reuse the renderer already loaded by the game. A second React copy
+        // would break the native Item's hooks, tooltip and action-menu state.
+        const chunks = window.webpackJsonprpg_web;
+        if (!Array.isArray(chunks)) return null;
+        let requireGame = null;
+        const moduleId = 'mooncake-native-queue-runtime';
+        chunks.push([[moduleId], {
+            [moduleId]: (module, exports, require) => { requireGame = require; }
+        }, [[moduleId]]]);
+        if (!requireGame?.c) return null;
+        let react = null;
+        let renderer = null;
+        for (const module of Object.values(requireGame.c)) {
+            const value = module?.exports;
+            if (typeof value?.createElement === 'function' && typeof value?.cloneElement === 'function') react = value;
+            if (typeof value?.render === 'function' && typeof value?.unmountComponentAtNode === 'function' &&
+                typeof value?.createPortal === 'function') renderer = value;
+            if (react && renderer) break;
+        }
+        delete requireGame.c[moduleId];
+        if (requireGame.m) delete requireGame.m[moduleId];
+        if (react && renderer) mooncakeWarehouseNativeItemRuntime = { react, renderer };
+        return mooncakeWarehouseNativeItemRuntime;
+    }
+
+    function mooncakeWarehouseRenderNativeQueueItems(grid, owner, records) {
+        const runtime = mooncakeWarehouseGetNativeItemRuntime();
+        if (!owner || !runtime) return false;
+        const { react, renderer } = runtime;
+        const children = records.map(record => {
+            // Inventory.renderItem supplies the game's current handlers,
+            // equipment requirements, combat restrictions and favorite/lock
+            // marks, including its original left- and right-click behavior.
+            let item = owner.renderItem(record.previewKey, record.item);
+            if (!record.available) {
+                item = react.cloneElement(item, {
+                    equipItemHandler: null, learnAbilityBookHandler: null,
+                    openLootHandler: null, sellToShopHandler: null,
+                    addEnhancingItemHandler: null, addAlchemyItemHandler: null,
+                    itemLinkHandler: null
+                });
             }
-        };
-        reset(clone);
-        clone.querySelectorAll?.(`[${MOONCAKE_WAREHOUSE_PINNED_ATTR}], [${MOONCAKE_WAREHOUSE_ROLE_ATTR}]`).forEach(reset);
-        clone.setAttribute(MOONCAKE_WAREHOUSE_QUEUE_PREVIEW_ITEM_ATTR, '1');
-        clone.setAttribute('aria-hidden', 'true');
-        return clone;
+            return react.createElement('div', {
+                key: record.previewKey,
+                [MOONCAKE_WAREHOUSE_QUEUE_PREVIEW_ITEM_ATTR]: '1'
+            }, item);
+        });
+        if (!mooncakeWarehouseNativeInventoryOwners.has(owner)) {
+            const original = owner.componentDidUpdate;
+            const descriptor = Object.getOwnPropertyDescriptor(owner, 'componentDidUpdate');
+            const hook = function(previousProps, ...args) {
+                original?.call(this, previousProps, ...args);
+                // These can change without changing any visible inventory
+                // cards, especially while a category is collapsed/filtered.
+                if (['characterItemMap', 'characterItemMarkDict', 'characterSkillMap',
+                    'characterAbilityMap', 'isInCombat'].some(key => previousProps?.[key] !== this.props[key])) {
+                    mooncakeScheduleWarehouseRender('native-inventory-props');
+                }
+            };
+            owner.componentDidUpdate = hook;
+            mooncakeWarehouseNativeInventoryOwners.set(owner, { hook, descriptor });
+        }
+        mooncakeWarehouseNativeQueueRoots.set(grid, { renderer, owner });
+        renderer.render(children, grid);
+        return true;
+    }
+
+    function mooncakeWarehouseDisposeQueueDock(dock) {
+        for (const [grid, { renderer }] of mooncakeWarehouseNativeQueueRoots) {
+            if (dock?.contains(grid) || !grid.isConnected) {
+                renderer.unmountComponentAtNode(grid);
+                mooncakeWarehouseNativeQueueRoots.delete(grid);
+            }
+        }
+        for (const [owner, { hook, descriptor }] of mooncakeWarehouseNativeInventoryOwners) {
+            if ([...mooncakeWarehouseNativeQueueRoots.values()].some(entry => entry.owner === owner)) continue;
+            if (owner.componentDidUpdate === hook) {
+                if (descriptor) Object.defineProperty(owner, 'componentDidUpdate', descriptor);
+                else delete owner.componentDidUpdate;
+            }
+            mooncakeWarehouseNativeInventoryOwners.delete(owner);
+        }
+        dock?.remove();
     }
 
     function mooncakeWarehouseCreateQueuePreviewHeader(queueSection) {
@@ -25257,11 +25371,11 @@
         return header;
     }
 
-    function mooncakeWarehouseSyncQueueDock(root, model, metrics) {
+    function mooncakeWarehouseSyncQueueDock(root, model) {
         mooncakeWarehouseClearLegacyQueueLayout();
+        mooncakeWarehouseDisposeQueueDock(null);
         const component = mooncakeWarehouseGetNativeTabsComponent(root);
         const queueSection = model?.queueSection;
-        const records = mooncakeWarehouseGetQueuePreviewRecords(queueSection);
         if (!component || !queueSection?.actionCount) {
             mooncakeWarehouseRemoveQueueDock();
             return;
@@ -25273,7 +25387,7 @@
         for (const staleDock of document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}]`)) {
             if (staleDock !== dock) {
                 staleDock.parentElement?.removeAttribute(MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR);
-                staleDock.remove();
+                mooncakeWarehouseDisposeQueueDock(staleDock);
             }
         }
         if (!dock) {
@@ -25284,41 +25398,30 @@
         }
         component.parentElement?.setAttribute(MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR, '1');
 
-        const signature = JSON.stringify([
-            queueSection.actionCount,
-            Math.round(metrics?.itemWidth || 0),
-            Math.round(metrics?.itemHeight || 0),
-            Math.round(metrics?.columnGap || 0),
-            Math.round(metrics?.rowGap || 0),
-            Math.round(metrics?.baseLeft || 0),
-            records.map(record => [
-                record.key,
-                record.group,
-                record.node?.textContent || '',
-                record.node?.querySelector?.('use')?.getAttribute?.('href') || ''
-            ])
-        ]);
-        dock.style.setProperty('--mooncake-warehouse-queue-item-width', `${Math.max(1, Math.round(metrics?.itemWidth || 52))}px`);
-        dock.style.setProperty('--mooncake-warehouse-queue-item-height', `${Math.max(1, Math.round(metrics?.itemHeight || 52))}px`);
-        dock.style.setProperty('--mooncake-warehouse-queue-column-gap', `${Math.max(2, Math.round(metrics?.columnGap || 4))}px`);
-        dock.style.setProperty('--mooncake-warehouse-queue-row-gap', `${Math.max(2, Math.round(metrics?.rowGap || 4))}px`);
-        dock.style.setProperty('--mooncake-warehouse-queue-left', `${Math.max(0, Math.round(metrics?.baseLeft || 0))}px`);
-        if (dock.dataset.mooncakeWarehouseSignature === signature) return;
-        dock.dataset.mooncakeWarehouseSignature = signature;
-
-        const grid = document.createElement('div');
-        grid.className = 'mooncake-warehouse-queue-preview-grid';
-        for (const record of records) {
-            const clone = mooncakeWarehouseCloneQueuePreviewItem(record.node);
-            if (clone) grid.appendChild(clone);
+        const owner = mooncakeWarehouseGetNativeInventoryOwner(root);
+        const records = mooncakeWarehouseGetQueuePreviewRecords(queueSection,
+            owner?.props.characterItemMap ?? characterInventoryItems);
+        const headerModel = { ...queueSection, records };
+        const headerSignature = JSON.stringify([queueSection.actionCount, records[0]?.key]);
+        let grid = dock.querySelector(':scope > .mooncake-warehouse-queue-preview-grid');
+        if (!grid) {
+            grid = document.createElement('div');
+            grid.className = 'mooncake-warehouse-queue-preview-grid';
+            dock.appendChild(grid);
         }
-        if (!grid.childElementCount) {
-            const empty = document.createElement('div');
-            empty.className = 'mooncake-warehouse-empty';
-            empty.textContent = mooncakeWarehouseText('emptyCustom');
-            grid.appendChild(empty);
+        if (dock.dataset.mooncakeWarehouseSignature !== headerSignature) {
+            dock.querySelector(':scope > .mooncake-warehouse-queue-preview-header')?.remove();
+            dock.prepend(mooncakeWarehouseCreateQueuePreviewHeader(headerModel));
+            dock.dataset.mooncakeWarehouseSignature = headerSignature;
         }
-        dock.replaceChildren(mooncakeWarehouseCreateQueuePreviewHeader(queueSection), grid);
+        // The grid's React root is retained across inventory filters, quantity
+        // updates and enhancement results; only the native Item props change.
+        if (!mooncakeWarehouseRenderNativeQueueItems(grid, owner, records) && !grid.childElementCount) {
+            const loading = document.createElement('div');
+            loading.className = 'mooncake-warehouse-empty';
+            loading.textContent = isZH ? '正在加载物品…' : 'Loading items…';
+            grid.appendChild(loading);
+        }
     }
 
     function mooncakeWarehouseMeasureNativeTab(tools, tabList) {
@@ -25336,7 +25439,8 @@
     }
 
     function mooncakeWarehouseRemoveQueueDock() {
-        for (const dock of document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}]`)) dock.remove();
+        for (const dock of document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}]`)) mooncakeWarehouseDisposeQueueDock(dock);
+        mooncakeWarehouseDisposeQueueDock(null);
         document.querySelectorAll(`[${MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR}]`).forEach(host => {
             host.removeAttribute(MOONCAKE_WAREHOUSE_QUEUE_HOST_ATTR);
         });
@@ -25575,6 +25679,7 @@
             title: mooncakeWarehouseText('queue'),
             records: sectionRecords(MOONCAKE_WAREHOUSE_SECTION_QUEUE),
             sourceEquipment: projection.queue.equipment,
+            sourceQueue: projection.queue,
             queue: true,
             kind: 'queue',
             actionCount: projection.queue.actionCount,
@@ -25884,7 +25989,7 @@
             if (mooncakeWarehousePanel || mooncakeWarehousePinnedNodes.size) {
                 mooncakeWarehouseRestorePresentation({ keepExternal: true });
             }
-            mooncakeWarehouseSyncQueueDock(inventoryRoot, model, metrics);
+            mooncakeWarehouseSyncQueueDock(inventoryRoot, model);
             return model;
         }
         const panelIsReusable = mooncakeWarehousePanel?.isConnected &&
@@ -25905,7 +26010,7 @@
         mooncakeWarehouseSetInlineStyle(root, 'position', 'relative');
         mooncakeWarehouseSetInlineStyle(root, 'padding-top', `${Math.ceil(metrics.paddingTop + model.panelHeight)}px`);
         mooncakeWarehouseApplyPinnedNodes(root, projection, model, metrics, presentationUnchanged);
-        mooncakeWarehouseSyncQueueDock(inventoryRoot, model, metrics);
+        mooncakeWarehouseSyncQueueDock(inventoryRoot, model);
         mooncakeWarehousePinnedLayoutSignature = model.pinnedLayoutSignature;
         mooncakeWarehouseLayoutSignature = metrics.signature;
         mooncakeWarehouseGeometryDirty = false;
@@ -25928,8 +26033,8 @@
         // game. The Mooncake controls stay available but never imply that a
         // custom section is being rendered in those views.
         model.activeSectionId = null;
-        mooncakeWarehouseRemoveQueueDock();
         mooncakeWarehouseSyncNativeSectionTools(inventoryRoot, model);
+        mooncakeWarehouseSyncQueueDock(inventoryRoot, model);
     }
 
     function mooncakeWarehouseRender() {
@@ -25955,15 +26060,15 @@
                 // Inventory tabs are commonly kept mounted while hidden. Keep
                 // the stable presentation intact and wait for the tab mutation
                 // instead of restoring/rebuilding it in the background.
-                if (mooncakeWarehouseInventoryRoot &&
-                    (mooncakeIsExternalProfitPanelNode(mooncakeWarehouseInventoryRoot) ||
-                        !mooncakeWarehouseInventoryRoot.isConnected)) {
+                const previousRoot = mooncakeWarehouseObservedRoot || mooncakeWarehouseInventoryRoot;
+                if (previousRoot &&
+                    (mooncakeIsExternalProfitPanelNode(previousRoot) || !previousRoot.isConnected)) {
                     mooncakeWarehouseRestorePresentation();
                     mooncakeWarehouseStopObservingInventoryRoot();
-                } else if (mooncakeWarehouseInventoryRoot) {
+                } else if (previousRoot) {
                     mooncakeWarehousePendingVisibleRender = true;
-                    mooncakeWarehouseObserveInventoryRoot(mooncakeWarehouseInventoryRoot);
-                } else if (!mooncakeWarehouseInventoryRoot) {
+                    mooncakeWarehouseObserveInventoryRoot(previousRoot);
+                } else {
                     mooncakeWarehouseStopObservingInventoryRoot();
                 }
                 return;
@@ -25982,10 +26087,10 @@
             // Mooncake cannot override favorite ordering or infer missing cards.
             if (!mooncakeWarehouseIsNativeAllItemsTab(inventoryRoot) ||
                 mooncakeWarehouseHasNativeInventoryFilter(inventoryRoot)) {
-                mooncakeWarehouseRenderNativeNavigation(inventoryRoot);
                 if (mooncakeWarehouseInventoryRoot || mooncakeWarehousePanel || mooncakeWarehousePinnedNodes.size) {
                     mooncakeWarehouseRestorePresentation({ keepExternal: true });
                 }
+                mooncakeWarehouseRenderNativeNavigation(inventoryRoot);
                 return;
             }
             const root = mooncakeWarehouseGetLayoutRoot(inventoryRoot);
@@ -26805,6 +26910,9 @@
             // No mounted root is rare. Retain a throttled discovery fallback
             // for keyboard/script navigation, while leaving all active-root
             // item work to the root-scoped observer above.
+            // Independent React roots need an explicit unmount if the game
+            // removes the inventory, including their portaled item menus.
+            if (mooncakeWarehouseNativeQueueRoots.size) mooncakeWarehouseDisposeQueueDock(null);
             const activeRoot = mooncakeWarehouseGetActiveRootForMutations();
             if (!activeRoot) return;
             if (document.hidden) {

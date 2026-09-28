@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
+import { nativeItemFixture } from './fixtures/native-queue-item.mjs';
 
 // Open the printed local URL in a browser. This checks real CSS geometry using
 // production queue rendering; the native container rules below were verified
@@ -15,10 +16,18 @@ const constants = [...source.matchAll(/^    const MOONCAKE_WAREHOUSE_\w+_ATTR = 
 const functions = [
     'mooncakeWarehouseEnsureStyles', 'mooncakeWarehouseClearLegacyQueueLayout',
     'mooncakeWarehouseSyncInventoryScroll', 'mooncakeWarehouseGetNativeTabsComponent',
-    'mooncakeWarehouseGetQueuePreviewRecords', 'mooncakeWarehouseCloneQueuePreviewItem',
+    'mooncakeWarehouseGetQueuePreviewRecords', 'mooncakeWarehouseGetNativeInventoryOwner',
+    'mooncakeWarehouseGetNativeItemRuntime', 'mooncakeWarehouseRenderNativeQueueItems',
+    'mooncakeWarehouseDisposeQueueDock',
     'mooncakeWarehouseCreateQueuePreviewHeader', 'mooncakeWarehouseSyncQueueDock',
     'mooncakeWarehouseRemoveQueueDock', 'mooncakeWarehouseRestorePresentation'
 ].map(extractFunction).join('\n');
+const nativeBundle = process.argv[2];
+if (!nativeBundle) throw new Error('Pass the downloaded official main.*.chunk.js bundle path to test native Item behavior.');
+const nativeFixture = await nativeItemFixture(nativeBundle);
+const assets = new Map(await Promise.all(['react', 'react-dom'].map(async name => [
+    `/${name}.js`, await readFile(new URL(`umd/${name}.development.js`, import.meta.resolve(name)), 'utf8')
+])));
 
 const html = String.raw`<!doctype html><html lang="zh-CN"><meta charset="UTF-8">
 <title>库存滚动布局检查</title><style>
@@ -42,19 +51,57 @@ header { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 .MuiTabs-flexContainer { display:flex; flex-wrap:wrap; gap:4px; }
 .MuiTabs-flexContainer button { width:48px; height:48px; padding:0; flex-shrink:0; }
 .Item_itemContainer__fixture { width:var(--item-size-normal); height:var(--item-size-normal); background:#2c3047; position:relative; border:0; }
+.Item_item__fixture { height:100%; position:relative; cursor:pointer; border:1px solid transparent; }
+.Item_selected__fixture { border-color:#9aaceb; }
+.Item_iconContainer__fixture { font-size:36px; text-align:center; padding-top:20px; }
+.Item_count__fixture { position:absolute; right:4px; bottom:4px; }
+.Item_enhancementLevel__fixture { position:absolute; top:2px; left:4px; }
+.Item_empty__fixture { opacity:.5; }
+.Item_markBadges__fixture { position:absolute; left:4px; bottom:4px; }
+.native-menu { position:fixed; top:80px; left:680px; padding:12px; width:300px; background:#222638; border:2px solid #657195; border-radius:5px; z-index:100; }
+.native-menu button { display:block; width:100%; margin-top:6px; }
+.native-menu .Item_itemInfo__fixture { position:relative; height:32px; padding-left:22px; }
+.native-menu .Item_itemInfo__fixture .Item_count__fixture { position:static; }
+.native-menu .Item_itemInfo__fixture .Item_enhancementLevel__fixture { position:static; }
 .card-icon { font-size:32px; }
 .card-quantity { position:absolute; bottom:3px; right:5px; }
 </style><header>
 <button id="run">运行布局检查</button><button id="scroll">滚动到库存</button>
 <button id="top">回到顶部</button><button id="native">原生分类</button>
 <button id="queue">长队列</button><button id="disable">关闭背包功能</button>
+<button id="behavior">运行队列交互检查</button><button id="empty">筛选无结果</button>
+<button id="upgrade">强化结果更新</button><button id="combat">切换战斗</button>
+<button id="lock">锁定装备</button>
 </header><div id="stage"></div><pre id="result" role="status">等待检查</pre>
+<pre id="action" role="log">尚未操作物品</pre>
+<script src="/react.js"></script><script src="/react-dom.js"></script>
 <script>
 ${constants}
 ${functions}
 const mooncakeWarehouseText = key => ({queue:'当前强化队列', emptyCustom:'暂无物品'}[key] || key);
 const getItemName = hrid => hrid;
 const mooncakeWarehouseNormalizeLevel = value => Number(value) || 0;
+const mooncakeWarehouseIdentityKey = (hrid, level) => hrid + ':' + (Number(level) || 0);
+const mooncakeInventoryCharacterItems = value => [...value.values()].filter(item => item.itemLocationHrid === '/item_locations/inventory' && item.count > 0);
+const mooncakeGetFiberKey = element => Object.keys(element).find(key => key.startsWith('__reactFiber$'));
+let characterInventoryItems = new Map(), mooncakeWarehouseNativeItemRuntime = null;
+const mooncakeWarehouseNativeQueueRoots = new Map(), mooncakeWarehouseNativeInventoryOwners = new Map();
+const isZH = true;
+const actionLog = [];
+function recordAction(name, args) {
+    actionLog.push({name, args});
+    document.getElementById('action').textContent = JSON.stringify(actionLog.at(-1));
+}
+${nativeFixture}
+const requireGame = {c:{react:{exports:React}, renderer:{exports:ReactDOM}}, m:{}};
+window.webpackJsonprpg_web = [];
+window.webpackJsonprpg_web.push = function([chunks, modules]) {
+    for (const [key, factory] of Object.entries(modules)) {
+        requireGame.m[key] = factory;
+        requireGame.c[key] = {exports:{}};
+        factory(requireGame.c[key], requireGame.c[key].exports, requireGame);
+    }
+};
 const mooncakeWarehouseDisconnectCurrentEquipmentObserver = () => {};
 const mooncakeWarehouseClearCurrentEquipmentLease = () => {};
 const mooncakeWarehouseResetInventoryEntries = () => {};
@@ -67,7 +114,15 @@ const result = document.getElementById('result');
 const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 const assert = (condition, message) => { if (!condition) throw new Error(message); };
 const current = () => document.querySelector('.Inventory_inventory__17CH2');
-function mount(width = 630, height = 840, count = 13) {
+let owner, model, scheduled = false;
+function syncQueue() { mooncakeWarehouseSyncQueueDock(stage.querySelector('.Inventory_items__6SXv0'), model); }
+function mooncakeScheduleWarehouseRender() {
+    if (!scheduled) { scheduled = true; requestAnimationFrame(() => { scheduled = false; syncQueue(); }); }
+}
+function updateProps(next) {
+    const previous = owner.props; owner.props = {...previous, ...next}; owner.componentDidUpdate(previous);
+}
+function mount(width = 630, height = 840, count = 13, emptyInventory = false) {
     mooncakeWarehouseRestorePresentation();
     stage.style.width = width + 'px'; stage.style.height = height + 'px';
     stage.innerHTML = '<div class="Inventory_inventory__17CH2"><div class="assets">物品排序 · 战斗着装评分 · 总资产<article><h2>今日盈亏：-1.19B</h2>近7天日均 · 最近记录</article></div><div class="Inventory_items__6SXv0"><div class="TabsComponent_tabsComponent__3PqGp"><div class="TabsComponent_tabsContainer__3BDUp"><div class="MuiTabs-root"><div class="MuiTabs-scroller"><div class="MuiTabs-flexContainer"></div></div></div></div><div class="TabsComponent_tabPanelsContainer__26mzo"><div class="TabPanel_tabPanel__tXMJF"><div class="Inventory_itemGrid__20YAH"></div></div><div class="TabPanel_tabPanel__tXMJF TabPanel_hidden__26UM3" id="category-panel"><div class="Inventory_itemGrid__20YAH"></div></div></div></div></div></div>';
@@ -80,7 +135,7 @@ function mount(width = 630, height = 840, count = 13) {
         list.appendChild(button);
     }
     for (const grid of stage.querySelectorAll('.Inventory_itemGrid__20YAH')) {
-        for (let i = 1; i <= 84; i++) {
+        for (let i = 1; i <= (emptyInventory ? 0 : 84); i++) {
             const card = document.createElement('button');
             card.className = 'Item_itemContainer__fixture';
             card.innerHTML = '<span class="card-icon">' + ['⚒','◆','▣','✦'][i % 4] + '</span><span class="card-quantity">' + i + '</span>';
@@ -90,16 +145,25 @@ function mount(width = 630, height = 840, count = 13) {
     }
     const root = stage.querySelector('.Inventory_items__6SXv0');
     mooncakeWarehouseSyncInventoryScroll(root);
-    const cards = [...stage.querySelector('.Inventory_itemGrid__20YAH').children];
-    const records = cards.slice(0, count).map((node, i) => ({node, key:String(i), itemHrid:'魔术师帽（精）', enhancementLevel:3, group:i < 4 ? 'equipment' : 'material'}));
-    mooncakeWarehouseSyncQueueDock(root, {queueSection:{title:'当前强化队列', actionCount:count ? 4 : 0, records}}, {itemWidth:90, itemHeight:90, rowGap:4, columnGap:4, baseLeft:0});
+    const records = Array.from({length:count}, (_, i) => ({itemHrid:'/items/' + (i < 4 ? 'equipment_' : 'material_') + i,
+        enhancementLevel:i < 4 ? 3 : 0, group:i < 4 ? 'equipment' : 'material', actionKey:'action_' + i}));
+    characterInventoryItems = new Map(records.map((record, i) => {
+        const item = {id:i + 1, hash:record.itemHrid + ':' + record.enhancementLevel, itemHrid:record.itemHrid,
+            enhancementLevel:record.enhancementLevel, count:i < 4 ? 1 : 100, itemLocationHrid:'/item_locations/inventory'};
+        return [item.hash, item];
+    }));
+    owner = new FixtureInventory(characterInventoryItems);
+    current().__reactFiber$fixture = {return:{stateNode:owner}};
+    model = {queueSection:{title:'当前强化队列', actionCount:count ? 4 : 0,
+        sourceQueue:{equipment:records.filter(record => record.group === 'equipment'), protection:[], materials:records.filter(record => record.group === 'material')}}};
+    syncQueue();
 }
 function switchCategory(category) {
-    mooncakeWarehouseRemoveQueueDock();
     const panels = [...stage.querySelectorAll('.TabPanel_tabPanel__tXMJF')];
     panels[0].classList.toggle('TabPanel_hidden__26UM3', category);
     panels[1].classList.toggle('TabPanel_hidden__26UM3', !category);
     mooncakeWarehouseSyncInventoryScroll(stage.querySelector('.Inventory_items__6SXv0'));
+    syncQueue();
 }
 function scrollToInventory() {
     const inventory = current();
@@ -111,6 +175,21 @@ document.getElementById('top').onclick = () => current().scrollTop = 0;
 document.getElementById('native').onclick = () => switchCategory(true);
 document.getElementById('queue').onclick = () => mount(630, 620, 36);
 document.getElementById('disable').onclick = () => mooncakeWarehouseRestorePresentation();
+document.getElementById('empty').onclick = () => {
+    stage.querySelectorAll('.Inventory_itemGrid__20YAH').forEach(grid => grid.replaceChildren()); syncQueue();
+};
+function upgrade() {
+    const equipment = model.queueSection.sourceQueue.equipment[0];
+    const previousKey = equipment.itemHrid + ':' + equipment.enhancementLevel;
+    equipment.enhancementLevel++;
+    const item = {...owner.props.characterItemMap.get(previousKey), enhancementLevel:equipment.enhancementLevel,
+        hash:equipment.itemHrid + ':' + equipment.enhancementLevel};
+    const items = new Map(owner.props.characterItemMap); items.delete(previousKey); items.set(item.hash, item);
+    updateProps({characterItemMap:items});
+}
+document.getElementById('upgrade').onclick = upgrade;
+document.getElementById('combat').onclick = () => updateProps({isInCombat:!owner.props.isInCombat});
+document.getElementById('lock').onclick = () => updateProps({characterItemMarkDict:{'/items/equipment_0':{lock:[model.queueSection.sourceQueue.equipment[0].enhancementLevel]}}});
 document.getElementById('run').onclick = async () => {
     try {
         const checks = [];
@@ -140,6 +219,7 @@ document.getElementById('run').onclick = async () => {
             const last = panel.querySelector('.Inventory_itemGrid__20YAH').lastElementChild.getBoundingClientRect();
             assert(last.bottom <= inventoryRect.bottom + 1 && last.top > inventoryRect.top, '末尾物品无法完整显示');
             switchCategory(true); await frame();
+            assert(stage.querySelectorAll('[data-mooncake-warehouse-queue-preview-item]').length === count, '原生分类导致队列消失');
             assert(getComputedStyle(panel).display === 'none', '隐藏页签意外展开');
             assert(inventory.hasAttribute(MOONCAKE_WAREHOUSE_SCROLL_ROOT_ATTR), '切换分类恢复了嵌套滚动');
             mooncakeWarehouseRestorePresentation();
@@ -150,10 +230,46 @@ document.getElementById('run').onclick = async () => {
         result.textContent = 'PASS\n' + checks.join('\n');
     } catch (error) { result.textContent = 'FAIL: ' + error.message; console.error(error); }
 };
+document.getElementById('behavior').onclick = async () => {
+    try {
+        mount(630,840,13,true); await frame();
+        const cards = () => [...stage.querySelectorAll('[data-mooncake-warehouse-queue-preview-item] .Item_item__fixture')];
+        assert(cards().length === 13, '没有任何库存 DOM 时队列不完整');
+        const first = cards()[0];
+        const click = options => first.dispatchEvent(new MouseEvent(options?.type || 'click', {bubbles:true, cancelable:true, ...options}));
+        click(); await frame();
+        assert(document.querySelector('[role=dialog]')?.textContent.includes('最爱 / 锁定'), '未打开原生菜单');
+        switchCategory(true); upgrade(); await frame();
+        assert(cards()[0] === first, '切换分类/强化结果重建了图标');
+        assert(document.querySelector('[role=dialog]')?.textContent.includes('+4'), '已打开的菜单未保留或未更新等级');
+        click({type:'contextmenu', button:2});
+        assert(actionLog.at(-1)?.name === 'equipItemHandler' && actionLog.at(-1).args[1] === '/items/equipment_0:4', '右键未使用最新物品 hash');
+        const count = actionLog.length;
+        updateProps({isInCombat:true}); await frame(); click({type:'contextmenu', button:2});
+        assert(actionLog.length === count, '战斗限制失效');
+        updateProps({isInCombat:false, characterSkillMap:new Map([['allowed',false]])}); await frame();
+        click({type:'contextmenu', button:2}); assert(actionLog.length === count, '装备等级限制失效');
+        updateProps({characterSkillMap:new Map(), characterItemMarkDict:{'/items/equipment_0':{lock:[4],favorite:[4]}}}); await frame();
+        const sell = [...document.querySelectorAll('[role=dialog] button')].find(button => button.textContent === '卖出');
+        assert(sell?.disabled && first.textContent.includes('🔒'), '锁定限制/标识未更新');
+        click({shiftKey:true}); assert(actionLog.at(-1)?.name === 'goToMarketplaceHandler', 'Shift 点击失效');
+        click({ctrlKey:true}); assert(actionLog.at(-1)?.name === 'itemLinkHandler', 'Ctrl 点击失效');
+        const items = new Map(owner.props.characterItemMap); items.delete('/items/equipment_0:4');
+        updateProps({characterItemMap:items}); await frame();
+        const before = actionLog.length; click({type:'contextmenu', button:2});
+        assert(actionLog.length === before && first.textContent.includes('0'), '缺货时仍可装备');
+        assert(first === cards()[0], '缺货时重建了图标');
+        mooncakeWarehouseRestorePresentation();
+        assert(!document.querySelector('[role=dialog]') && mooncakeWarehouseNativeQueueRoots.size === 0 && mooncakeWarehouseNativeInventoryOwners.size === 0, '菜单/生命周期钩子未清理');
+        mount(); await frame();
+        result.textContent = 'PASS：无库存 DOM、分类切换、菜单保留、强化更新、右键最新 hash、战斗/等级/锁定限制、快捷键、缺货保护和卸载清理';
+    } catch (error) { result.textContent = 'FAIL: ' + error.message; console.error(error); }
+};
 mooncakeWarehouseEnsureStyles(); mount();
 </script></html>`;
 
 const server = createServer((request, response) => {
+    if (assets.has(request.url)) { response.writeHead(200, {'content-type':'text/javascript; charset=utf-8'}).end(assets.get(request.url)); return; }
     if (request.url !== '/') { response.writeHead(404).end(); return; }
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
     response.end(html);

@@ -291,20 +291,23 @@ assert.equal(activeQueueModel.activeSectionId, null, 'the queue must never repla
 assert.equal(activeQueueModel.queueHeader, null, 'the standalone queue preview must not render an in-panel heading');
 assert.equal(activeQueueModel.placements.size, 0, 'queue cards must not be pinned into the native inventory layout');
 
-const previewSandbox = {};
+const previewSandbox = {
+    mooncakeInventoryCharacterItems: values => values,
+    mooncakeWarehouseIdentityKey: (hrid, level) => hrid + ':' + (level || 0),
+    mooncakeWarehouseNormalizeLevel: value => Number(value) || 0
+};
 vm.runInNewContext(`${queuePreviewRecords}; globalThis.queuePreviewRecords = mooncakeWarehouseGetQueuePreviewRecords;`, previewSandbox);
 const previewRecords = previewSandbox.queuePreviewRecords({
-    records: [
-        { key: 'material', group: 'material', node: { isConnected: true } },
-        { key: 'equipment', group: 'equipment', node: { isConnected: true } },
-        { key: 'protection', group: 'protection', node: { isConnected: true } },
-        { key: 'missing', group: 'equipment', node: { isConnected: false } }
-    ]
-});
+    sourceQueue: {
+        equipment: [{ itemHrid: 'equipment', group: 'equipment' }],
+        protection: [{ itemHrid: 'protection', group: 'protection' }],
+        materials: [{ itemHrid: 'material', group: 'material' }]
+    }
+}, ['equipment', 'protection', 'material'].map(itemHrid => ({itemHrid, count: 10})));
 assert.deepEqual(
     JSON.parse(JSON.stringify(previewRecords.map(record => record.key))),
-    ['equipment', 'protection', 'material'],
-    'the standalone preview must keep equipment first and omit unavailable source cards'
+    ['equipment:0', 'protection:0', 'material:0'],
+    'the standalone queue must use inventory data even without a single source DOM card'
 );
 
 const nativeMeasureSandbox = { Math };
@@ -382,8 +385,8 @@ assert.match(
 );
 assert.match(
     source,
-    /function mooncakeWarehouseCloneQueuePreviewItem\(node\)[\s\S]{0,900}cloneNode\(true\)/,
-    'the queue preview must use display-only copies instead of moving React-owned inventory cards'
+    /owner\.renderItem\(record\.previewKey, record\.item\)/,
+    'queue cards must use the native inventory component and its own click handlers'
 );
 assert.doesNotMatch(
     source,
@@ -397,7 +400,7 @@ assert.match(
 );
 assert.match(
     renderPresentation,
-    /mooncakeWarehouseSyncQueueDock\(inventoryRoot, model, metrics\)/,
+    /mooncakeWarehouseSyncQueueDock\(inventoryRoot, model\)/,
     'the current queue preview must be rendered independently from the active warehouse section'
 );
 assert.match(
@@ -407,7 +410,7 @@ assert.match(
 );
 assert.match(
     renderWarehouse,
-    /mooncakeWarehouseRenderNativeNavigation\(\s*inventoryRoot\s*\);[\s\S]{0,420}mooncakeWarehouseRestorePresentation\(\{ keepExternal: true \}\);/,
+    /mooncakeWarehouseRestorePresentation\(\{ keepExternal: true \}\);[\s\S]{0,150}mooncakeWarehouseRenderNativeNavigation\(\s*inventoryRoot\s*\);/,
     'native Favorites, category, and filtered views must retain the toolbar while restoring Mooncake card placement'
 );
 assert.match(
@@ -415,11 +418,11 @@ assert.match(
     /mooncakeWarehouseSyncNativeSectionTools\(\s*inventoryRoot\s*,\s*model\s*\)/,
     'native-only rendering must keep custom section tools available'
 );
-assert.doesNotMatch(renderNativeNavigation, /mooncakeWarehouseSyncQueueDock/, 'native views must not recreate an external queue dock');
-assert.match(
+assert.match(renderNativeNavigation, /mooncakeWarehouseSyncQueueDock/, 'native views must retain the independent queue');
+assert.doesNotMatch(
     renderNativeNavigation,
-    /model\.activeSectionId = null;[\s\S]{0,160}mooncakeWarehouseRemoveQueueDock\(\)/,
-    'native filtered views must remove the standalone preview rather than alter inventory ordering'
+    /mooncakeWarehouseRemoveQueueDock\(\)/,
+    'switching native tabs must not remove the independent queue'
 );
 assert.match(
     source,
