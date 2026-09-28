@@ -15,6 +15,7 @@ function extractFunction(name) {
 const constants = [...source.matchAll(/^    const MOONCAKE_WAREHOUSE_\w+_ATTR = '[^']+';/gm)].map(match => match[0]).join('\n');
 const functions = [
     'mooncakeWarehouseEnsureStyles', 'mooncakeWarehouseClearLegacyQueueLayout',
+    'mooncakeWarehouseGetLayoutMetrics',
     'mooncakeWarehouseSyncInventoryScroll', 'mooncakeWarehouseGetNativeTabsComponent',
     'mooncakeWarehouseGetQueuePreviewRecords', 'mooncakeWarehouseGetNativeInventoryOwner',
     'mooncakeWarehouseGetNativeItemRuntime', 'mooncakeWarehouseRenderNativeQueueItems',
@@ -78,7 +79,7 @@ header { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 <script>
 ${constants}
 ${functions}
-const mooncakeWarehouseText = key => ({queue:'当前强化队列', emptyCustom:'暂无物品'}[key] || key);
+const mooncakeWarehouseText = key => ({queue:'当前强化队列', emptyCustom:'暂无物品', categories:'分区管理'}[key] || key);
 const getItemName = hrid => hrid;
 const mooncakeWarehouseNormalizeLevel = value => Number(value) || 0;
 const mooncakeWarehouseIdentityKey = (hrid, level) => hrid + ':' + (Number(level) || 0);
@@ -92,6 +93,7 @@ function recordAction(name, args) {
     actionLog.push({name, args});
     document.getElementById('action').textContent = JSON.stringify(actionLog.at(-1));
 }
+const mooncakeWarehouseOpenManager = () => recordAction('warehouse-manager', []);
 ${nativeFixture}
 const requireGame = {c:{react:{exports:React}, renderer:{exports:ReactDOM}}, m:{}};
 window.webpackJsonprpg_web = [];
@@ -203,9 +205,19 @@ document.getElementById('run').onclick = async () => {
             assert(inventory.scrollHeight > inventory.clientHeight, '库存内容无法向下滚动');
             assert(getComputedStyle(items).overflowY === 'visible' && getComputedStyle(panel).overflowY === 'visible', '库存仍有嵌套小滚动区');
             assert(panel.scrollHeight <= panel.clientHeight + 1, '原生库存仍被限制高度');
+            const nativeGrid = panel.querySelector('.Inventory_itemGrid__20YAH');
+            const nativeCards = [...nativeGrid.children];
+            // Favorites/deduplication may return column two before column one.
+            const entries = [nativeCards[1], nativeCards[0], ...nativeCards.slice(2)].map(node => ({node,grid:nativeGrid}));
+            const metrics = mooncakeWarehouseGetLayoutMetrics(panel,entries);
+            const firstRect = nativeCards[0].getBoundingClientRect();
+            const nativeColumns = nativeCards.filter(card => Math.abs(card.getBoundingClientRect().top - firstRect.top) < 1).length;
+            assert(metrics.columns === nativeColumns, '分区未使用全部可用列');
+            assert(Math.abs(metrics.baseLeft - (firstRect.left - panel.getBoundingClientRect().left)) < 1, '分区左侧多出空列');
             if (count) {
                 assert(dock.getBoundingClientRect().bottom <= items.querySelector('.TabsComponent_tabsComponent__3PqGp').getBoundingClientRect().top + 1, '队列和分类栏重叠');
                 assert(dock.querySelectorAll('[data-mooncake-warehouse-queue-preview-item]').length === count, '长队列物品被截断');
+                assert(Math.abs(dock.querySelector('[data-mooncake-warehouse-queue-preview-item]').getBoundingClientRect().left - firstRect.left) < 1, '分区与队列的左右边距未对齐');
             }
             scrollToInventory(); await frame();
             const inventoryRect = inventory.getBoundingClientRect();

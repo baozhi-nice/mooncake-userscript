@@ -179,6 +179,23 @@ assert.equal(
 );
 
 const nativeTabsFlexContainer = extractFunction('mooncakeWarehouseGetNativeTabsFlexContainer');
+const layoutMetrics = extractFunction('mooncakeWarehouseGetLayoutMetrics');
+const metricRootStyle = {paddingLeft:'2px', paddingRight:'2px', paddingTop:'4px', getPropertyValue:() => '90px'};
+const metricGrid = {columnGap:'6px', rowGap:'6px', gridTemplateColumns:'90px 90px 90px 90px 90px'};
+const metricRoot = {clientWidth:594, querySelector:() => metricGrid, getBoundingClientRect:() => ({left:80})};
+const metricsSandbox = {getComputedStyle: node => node === metricRoot ? metricRootStyle : node};
+vm.runInNewContext(`${layoutMetrics}; globalThis.measure = mooncakeWarehouseGetLayoutMetrics;`,metricsSandbox);
+const displacedEntries = [186,90,282].map(left => ({grid:metricGrid, node:{getBoundingClientRect:() => ({left,top:325,width:90,height:90})}}));
+const measured = metricsSandbox.measure(metricRoot,displacedEntries);
+assert.equal(measured.columns,6, 'a section must use all six available columns regardless of its source category');
+assert.equal(measured.baseLeft,12, 'the first source card being in column two must not leave a blank column');
+assert.equal(measured.columnStep,96, 'source entry order must not change the column spacing');
+assert.equal(measured.signature,metricsSandbox.measure(metricRoot,[...displacedEntries].reverse()).signature, 'card order must not affect layout');
+metricRoot.clientWidth = 354;
+const narrowMetrics = metricsSandbox.measure(metricRoot,displacedEntries);
+assert.equal(narrowMetrics.columns,3, 'a resized container must recalculate its available columns');
+assert.equal(narrowMetrics.baseLeft,36, 'narrow layouts must retain balanced margins');
+assert.equal(metricsSandbox.measure(metricRoot,[],4).paddingTop,4, 'empty-inventory fallback must retain the native top padding');
 const measureNativeTab = extractFunction('mooncakeWarehouseMeasureNativeTab');
 const nativeTabSelectionBinding = extractFunction('mooncakeWarehouseBindNativeTabSelection');
 const nativeToolsSync = extractFunction('mooncakeWarehouseSyncNativeSectionTools');

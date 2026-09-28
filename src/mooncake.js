@@ -2645,6 +2645,7 @@
         config.features.marketHourlyWage = value !== false;
         saveConfig();
         mooncakeUpdateMarketplaceHourlyWageControls();
+        mooncakeScheduleMyListingsHourlyWages();
         if (config.features.marketHourlyWage) {
             scheduleMarketplaceHourlyWageRefresh();
         } else {
@@ -3156,6 +3157,7 @@
         try { localStorage.removeItem(OWN_CACHE_KEY); } catch (_) {}
         try { localStorage.removeItem(MOONCAKE_MARKET_HISTORY_V1_CACHE_KEY); } catch (_) {}
         try { localStorage.removeItem(MOONCAKE_MARKET_HISTORY_V2_CACHE_KEY); } catch (_) {}
+        try { localStorage.removeItem(MOONCAKE_MARKET_HISTORY_V3_CACHE_KEY); } catch (_) {}
     }
 
     function mooncakeGetOrderBookBestPrice(orderBook, side) {
@@ -7425,7 +7427,8 @@
         '.mooncake-order-economics-row',
         '.mooncake-chat-labor-bubble',
         '.mooncake-market-history-price-cell',
-        '.mooncake-market-history-hourly-cell'
+        '.mooncake-market-history-hourly-cell',
+        '.mooncake-market-history-volume-rate'
     ].join(', ');
 
     // Hover remains convenient on desktop, while these non-command value
@@ -7439,7 +7442,8 @@
         '.mooncake-order-economics-row',
         '.mooncake-chat-labor-bubble',
         '.mooncake-market-history-price-cell',
-        '.mooncake-market-history-hourly-cell'
+        '.mooncake-market-history-hourly-cell',
+        '.mooncake-market-history-volume-rate'
     ].join(', ');
 
     let _tooltipShownAt = 0;
@@ -14069,6 +14073,10 @@
         mooncakeEnhancementRoutePairCache.clear();
         mooncakeClearTraditionalEnhancementRiskPriceCaches();
         try { mooncakeVirtualRivalHourlyCache.clear(); } catch (_) {}
+        try {
+            mooncakeMyListingsHourlyRevision += 1;
+            mooncakeScheduleMyListingsHourlyWages();
+        } catch (_) {}
     }
 
     function mooncakeClearEnhancementRoutePrewarmState() {
@@ -15853,6 +15861,177 @@
         return Number.isInteger(level) && level >= 0 && level <= 20 ? level : 0;
     }
 
+    let mooncakeLootItemMenu = null;
+    let mooncakeLootItemClicksBound = false;
+
+    function mooncakeGetLootNativeItem(container) {
+        const key = mooncakeGetFiberKey(container);
+        let fiber = key ? container[key] : null;
+        for (let depth = 0; fiber && depth < 20; depth += 1, fiber = fiber.return) {
+            const item = fiber.stateNode;
+            if (typeof item?.renderActionMenu === 'function' &&
+                typeof item?.handleItemClicked === 'function' &&
+                typeof item?.handleItemRightClicked === 'function') return item;
+        }
+        return null;
+    }
+
+    function mooncakeGetLootItemActionProps(nativeItem) {
+        const { itemHrid, enhancementLevel = 0 } = nativeItem.props;
+        const owner = [...document.querySelectorAll('[class*="Inventory_inventory"]')]
+            .filter(root => !mooncakeIsExternalProfitPanelNode(root))
+            .map(mooncakeWarehouseGetNativeInventoryOwner).find(Boolean);
+        // A historical drop is not an inventory stack. In particular, never
+        // substitute a different enhancement level or the recorded drop count.
+        const stock = owner && mooncakeInventoryCharacterItems(owner.props.characterItemMap)
+            .find(item => item.itemHrid === itemHrid && Number(item.enhancementLevel || 0) === enhancementLevel);
+        const item = stock || { itemHrid, enhancementLevel, count: 0, itemLocationHrid: '/item_locations/inventory' };
+        let props = { ...nativeItem.props, count: 0, hash: undefined, itemClickedHandler: null };
+        if (owner) {
+            props = { ...props, ...owner.renderItem('mooncake-loot-action', item).props };
+        } else {
+            const game = mooncakeFindGameStateNode();
+            props.goToMarketplaceHandler = mooncakeCanOpenMarketplaceForInventoryItem(itemHrid) &&
+                typeof game?.handleGoToMarketplace === 'function'
+                ? game.handleGoToMarketplace.bind(game) : undefined;
+            props.openItemDictionaryHandler = typeof game?.handleOpenItemDictionary === 'function'
+                ? game.handleOpenItemDictionary.bind(game) : undefined;
+        }
+        if (!stock) {
+            for (const key of ['equipItemHandler', 'learnAbilityBookHandler', 'openLootHandler',
+                'sellToShopHandler', 'addEnhancingItemHandler', 'addAlchemyItemHandler',
+                'itemLinkHandler', 'openItemMarkMenuHandler']) props[key] = null;
+        }
+        return props;
+    }
+
+    function mooncakeGuardLootItemActions(nativeItem, props) {
+        const guarded = { ...props };
+        for (const name of ['equipItemHandler', 'learnAbilityBookHandler', 'openLootHandler',
+            'sellToShopHandler', 'addEnhancingItemHandler', 'addAlchemyItemHandler', 'itemLinkHandler']) {
+            if (typeof props[name] !== 'function') continue;
+            guarded[name] = (...args) => {
+                const current = mooncakeGetLootItemActionProps(nativeItem);
+                const hashIndex = name === 'equipItemHandler' ? 1 : 0;
+                if (!current.hash || current.hash !== args[hashIndex] || typeof current[name] !== 'function') return;
+                const quantityIndex = name === 'equipItemHandler' ? 2
+                    : ['learnAbilityBookHandler', 'openLootHandler', 'sellToShopHandler'].includes(name) ? 1 : -1;
+                if (quantityIndex >= 0 && (!Number.isInteger(args[quantityIndex]) ||
+                    args[quantityIndex] < 1 || args[quantityIndex] > current.count)) return;
+                // Recheck native restrictions at activation time as inventory,
+                // combat state and locks can change while the menu stays open.
+                const probe = new nativeItem.constructor(current);
+                if (name === 'equipItemHandler' && !probe.canEquip()) return;
+                if (name === 'learnAbilityBookHandler' && !probe.canLearn()) return;
+                if (name === 'openLootHandler' && (!probe.canOpen() ||
+                    (current.openLootKeyCount != null && args[quantityIndex] > current.openLootKeyCount))) return;
+                if (name === 'sellToShopHandler' && probe.isMarked('lock')) return;
+                return current[name](...args);
+            };
+        }
+        return guarded;
+    }
+
+    function mooncakeCloseLootItemMenu() {
+        const menu = mooncakeLootItemMenu;
+        if (!menu) return;
+        mooncakeLootItemMenu = null;
+        clearInterval(menu.timer);
+        menu.renderer.unmountComponentAtNode(menu.host);
+        menu.host.remove();
+    }
+
+    function mooncakeOpenLootItemMenu(container, nativeItem, event) {
+        const runtime = mooncakeWarehouseGetNativeItemRuntime();
+        if (!runtime) return false;
+        mooncakeCloseLootItemMenu();
+        const { react, renderer } = runtime;
+        const bounds = container.getBoundingClientRect();
+        const host = document.createElement('div');
+        host.setAttribute('data-mooncake-loot-item-anchor', '1');
+        host.setAttribute('aria-hidden', 'true');
+        // Only one invisible anchor is mounted on demand. The native menu is
+        // portaled outside it; the original history card and tooltip stay intact.
+        host.style.cssText = `position:fixed;left:${bounds.left}px;top:${bounds.top}px;width:${bounds.width}px;height:${bounds.height}px;opacity:0;pointer-events:none;`;
+        document.body.appendChild(host);
+        const menu = { host, renderer, container, nativeItem, props: null, instance: null, timer: 0 };
+        mooncakeLootItemMenu = menu;
+        const render = props => {
+            menu.props = props;
+            renderer.render(react.createElement(nativeItem.constructor, {
+                ...mooncakeGuardLootItemActions(nativeItem, props), ref: instance => { menu.instance = instance; }
+            }), host);
+        };
+        try {
+            render(mooncakeGetLootItemActionProps(nativeItem));
+            if (!menu.instance) { mooncakeCloseLootItemMenu(); return false; }
+            if (event.type === 'contextmenu') menu.instance.handleItemRightClicked(event);
+            else menu.instance.handleItemClicked(event);
+            if (!menu.instance.state.isActionMenuOpen) { mooncakeCloseLootItemMenu(); return true; }
+            const itemHrid = nativeItem.props.itemHrid;
+            const level = nativeItem.props.enhancementLevel;
+            menu.timer = setInterval(() => {
+                if (!container.isConnected || !container.getClientRects().length || !menu.instance?.state.isActionMenuOpen ||
+                    nativeItem.props.itemHrid !== itemHrid || nativeItem.props.enhancementLevel !== level) {
+                    mooncakeCloseLootItemMenu();
+                    return;
+                }
+                const props = mooncakeGetLootItemActionProps(nativeItem);
+                if (Object.keys(props).some(key => props[key] !== menu.props[key])) render(props);
+            }, 250);
+            return true;
+        } catch (error) {
+            mooncakeCloseLootItemMenu();
+            console.warn('[MoonCake] 掉落物品菜单打开失败:', error);
+            return false;
+        }
+    }
+
+    function hookMooncakeLootItemClicks() {
+        if (mooncakeLootItemClicksBound) return;
+        mooncakeLootItemClicksBound = true;
+        const style = document.createElement('style');
+        style.textContent = '[class*="LootLogPanel_itemDrops"] [class*="Item_itemContainer"] { cursor: pointer; }';
+        document.head.appendChild(style);
+        const handle = event => {
+            if (event.defaultPrevented || (event.type === 'click' && event.button !== 0)) return;
+            const container = event.target?.closest?.('[class*="Item_itemContainer"]');
+            if (!container?.closest('[class*="LootLogPanel_itemDrops"]') ||
+                !container.closest(LOOT_LOG_ITEM_SELECTOR)) return;
+            const nativeItem = mooncakeGetLootNativeItem(container);
+            if (!nativeItem) return;
+            const { itemHrid, enhancementLevel = 0 } = nativeItem.props;
+            if (event.type === 'click' && !event.shiftKey && !event.ctrlKey && !event.metaKey &&
+                mooncakeLootItemMenu?.container === container) {
+                event.preventDefault();
+                event.stopPropagation();
+                mooncakeCloseLootItemMenu();
+                return;
+            }
+            if (event.type === 'contextmenu' && mooncakeCanOpenMarketplaceForInventoryItem(itemHrid)) {
+                event.preventDefault();
+                event.stopPropagation();
+                mooncakeCloseLootItemMenu();
+                mooncakeOpenMarketplaceForHrid(itemHrid, enhancementLevel).catch(error => {
+                    console.warn('[MoonCake] 掉落物品跳转市场失败:', error);
+                });
+            } else if (mooncakeOpenLootItemMenu(container, nativeItem, event)) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+        };
+        document.addEventListener('click', handle, true);
+        document.addEventListener('contextmenu', handle, true);
+        document.addEventListener('keydown', event => { if (event.key === 'Escape') mooncakeCloseLootItemMenu(); });
+        window.addEventListener('resize', mooncakeCloseLootItemMenu);
+        window.addEventListener('scroll', event => {
+            // Scrolling inside the native popup must not close it.
+            if (event.target?.closest?.('[class*="MuiTooltip-popper"], [class*="Item_actionMenu"]')) return;
+            mooncakeCloseLootItemMenu();
+        }, true);
+        document.addEventListener('visibilitychange', () => { if (document.hidden) mooncakeCloseLootItemMenu(); });
+    }
+
     function mooncakeNormalizeAlchemyActionKey(label) {
         const text = String(label || '').trim().toLowerCase();
         if (!text) return null;
@@ -16661,8 +16840,8 @@
             // 为整个记录行添加点击事件
             detachEnhancementSelectionHandler(lootElement);
             const rowSelectionHandler = (e) => {
-                // 避免点击按钮时触发
-                if (!e.target.closest('button')) {
+                // Item menus must not also select the historical record.
+                if (!e.target.closest('button, [class*="Item_itemContainer"]')) {
                     toggleSelection();
                 }
             };
@@ -16974,6 +17153,8 @@
     let _pendingOrderBookRaf = null;
     let _pendingOrderBookResizeTimer = 0;
     let _pendingSummaryRaf = null;
+    let mooncakeSummaryPriceObserver = null;
+    let mooncakeSummaryObservedTable = null;
     // `false` means the last verified state had no visible native market table.
     // Background market packets must not keep scheduling DOM work in that state;
     // market clicks and native table mutations force the next verification.
@@ -17821,7 +18002,8 @@
     const MOONCAKE_MARKET_HISTORY_API = 'https://q7.nainai.eu.org/api/market/histories';
     const MOONCAKE_MARKET_HISTORY_V1_CACHE_KEY = 'Mooncake_marketHistory_v1';
     const MOONCAKE_MARKET_HISTORY_V2_CACHE_KEY = 'Mooncake_marketHistory_v2';
-    const MOONCAKE_MARKET_HISTORY_CACHE_KEY = 'Mooncake_marketHistory_v3';
+    const MOONCAKE_MARKET_HISTORY_V3_CACHE_KEY = 'Mooncake_marketHistory_v3';
+    const MOONCAKE_MARKET_HISTORY_CACHE_KEY = 'Mooncake_marketHistory_v4';
     const MOONCAKE_MARKET_HISTORY_ENABLED_KEY = 'Mooncake_marketHistory_card_enabled_v1';
     const MOONCAKE_MARKET_HISTORY_CARD_SELL_FIRST_KEY = 'Mooncake_marketHistory_card_sell_first_v1';
     const MOONCAKE_MARKET_HISTORY_FLOAT_POSITION_KEY = 'Mooncake_marketHistory_relativePosition_v2';
@@ -18760,7 +18942,7 @@
 
     function mooncakeAttachMarketHistoryTimeline(windows, timeline) {
         if (!windows || !timeline) return windows;
-        const enriched = {};
+        const enriched = { ...windows };
         for (const days of MOONCAKE_MARKET_HISTORY_WINDOWS) {
             const row = windows[days] || {};
             // Older versions cached only an array of chart buckets. Keep
@@ -19202,11 +19384,41 @@
         };
     }
 
+    function mooncakeGetMarketHistoryHourlyVolume(history, now = Date.now()) {
+        const hours = 120;
+        const hourMs = 60 * 60 * 1000;
+        const startTime = now - hours * hourMs;
+        const points = new Map();
+        for (const item of Array.isArray(history) ? history : []) {
+            const timestamp = Number(item?.time) * 1000;
+            if (!Number.isFinite(timestamp) || timestamp <= startTime || timestamp > now) continue;
+            // The API supplies hourly volume snapshots (including zero-volume
+            // hours), not separate buyer/seller executions. Count each once.
+            const hour = Math.floor((now - timestamp) / hourMs);
+            if (!points.has(hour) || timestamp >= points.get(hour).timestamp) {
+                points.set(hour, { timestamp, volume: item?.v == null || item.v === '' ? NaN : Number(item.v) });
+            }
+        }
+        let coveredHours = 0;
+        let total = 0;
+        for (const { volume } of points.values()) {
+            if (!Number.isFinite(volume) || volume < 0) continue;
+            coveredHours += 1;
+            total += volume;
+        }
+        const complete = coveredHours === hours && Number.isFinite(total);
+        return {
+            hours, startTime, endTime: now, coveredHours, complete,
+            volume: complete ? total : null,
+            hourlyVolume: complete ? total / hours : null
+        };
+    }
+
     function processMarketHistory(history, options = {}) {
         const includeTimeline = options.includeTimeline === true;
         const enhancementLevel = Math.max(0, Math.floor(Number(options.enhancementLevel) || 0));
         const now = Date.now();
-        const windows = {};
+        const windows = { hourlyVolume5d: mooncakeGetMarketHistoryHourlyVolume(history, now) };
         const timeline = includeTimeline ? {} : null;
         for (const days of MOONCAKE_MARKET_HISTORY_WINDOWS) {
             const minTime = now - days * 24 * 60 * 60 * 1000;
@@ -20050,6 +20262,28 @@
         return !!(itemHrid && mooncakeIsEnhanceableItem(itemHrid));
     }
 
+    function mooncakeFormatMarketHistoryHourlyVolume(value) {
+        if (value == null || !Number.isFinite(Number(value)) || Number(value) < 0) return '—';
+        const number = Number(value);
+        if (number >= 1000) return mooncakeFormatCompactNumber(number);
+        if (number > 0 && number < 0.001) return '<0.001';
+        return number.toFixed(number < 1 ? 3 : 2).replace(/\.?0+$/, '') || '0';
+    }
+
+    function mooncakeBuildMarketHistoryHourlyVolumeTooltip(windows) {
+        const rate = windows?.hourlyVolume5d;
+        const formula = isZH
+            ? '最近 5 天成交总数量 ÷ 120 小时，单位：个/小时。'
+            : 'Total quantity traded in the last 5 days ÷ 120 hours, in items/hour.';
+        const detail = rate?.complete
+            ? (isZH ? `累计成交：${Number(rate.volume).toLocaleString('zh-CN')} 个`
+                : `Total traded: ${Number(rate.volume).toLocaleString('en-US')} items`)
+            : (isZH ? '数据不足或尚未加载，暂不计算。' : 'History is incomplete or has not loaded yet.');
+        const scope = isZH ? '统计全市场成交量，不代表个人挂单的成交速度。'
+            : 'Market-wide volume; not the fill speed of your own listing.';
+        return `<div style="max-width:280px;line-height:1.6;"><b>${isZH ? '5d 时均量' : '5d avg/h'}</b><br>${detail}<br>${formula}<br>${scope}</div>`;
+    }
+
     function mooncakeBuildMarketHistoryOrderValue(sellFirstValue, buyFirstValue, sellFirst) {
         return `<span data-mooncake-history-order-value="sell-first"${sellFirst ? '' : ' hidden'}>${sellFirstValue}</span>`
             + `<span data-mooncake-history-order-value="buy-first"${sellFirst ? ' hidden' : ''}>${buyFirstValue}</span>`;
@@ -20063,6 +20297,7 @@
         if (visibleColumns.buySell) columns.push({ weight: 20 });
         if (visibleColumns.range) columns.push({ weight: 26 });
         if (showHourly && visibleColumns.hourly) columns.push({ weight: 30 });
+        if (!showHourly) columns.push({ weight: 24 });
         const totalWeight = columns.reduce((total, column) => total + column.weight, 0) || 1;
         return `<colgroup>${columns.map(column => `<col style="width:${(column.weight / totalWeight * 100).toFixed(3)}%;">`).join('')}</colgroup>`;
     }
@@ -20093,6 +20328,7 @@
                     ${visibleColumns.buySell ? `<td style="padding:${cellPad};text-align:center;color:#90EE90;font-weight:700;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeFormatHistoryPrice(row.buyVolume)}/${mooncakeFormatHistoryPrice(row.sellVolume)}</td>` : ''}
                     ${visibleColumns.range ? `<td class="mooncake-market-history-price-cell" data-mooncake-history-detail-trigger="range" data-mooncake-history-price-window="${days}" style="padding:${cellPad};text-align:center;color:#FFFF00;font-weight:700;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeBuildMarketHistoryOrderValue(`${mooncakeFormatMarketHistoryPrice(row.maxPrice)}/${mooncakeFormatMarketHistoryPrice(row.minPrice)}`, `${mooncakeFormatMarketHistoryPrice(row.minPrice)}/${mooncakeFormatMarketHistoryPrice(row.maxPrice)}`, sellFirst)}</td>` : ''}
                     ${showHourly && visibleColumns.hourly ? `<td class="mooncake-market-history-hourly-cell" data-mooncake-history-detail-trigger="hourly" data-mooncake-history-price-window="${days}" title="${medianTitle}" style="padding:${hourlyCellPad};text-align:center;font-variant-numeric:tabular-nums;${compactCellStyle}">${mooncakeBuildMarketHistoryOrderValue(hourlyRange.sellFirst, hourlyRange.buyFirst, sellFirst)}</td>` : ''}
+                    ${!showHourly && days === MOONCAKE_MARKET_HISTORY_WINDOWS[0] ? `<td rowspan="${MOONCAKE_MARKET_HISTORY_WINDOWS.length}" class="mooncake-market-history-volume-rate" data-mooncake-history-detail-trigger="volume-rate" style="padding:2px 4px;text-align:center;vertical-align:middle;color:#87CEEB;font-weight:800;font-size:${compact ? '12px' : '14px'};font-variant-numeric:tabular-nums;cursor:help;">${mooncakeEscapeHtml(mooncakeFormatMarketHistoryHourlyVolume(windows?.hourlyVolume5d?.hourlyVolume))}</td>` : ''}
                 </tr>
             `;
         }).join('');
@@ -20106,6 +20342,9 @@
             const itemHrid = String(card.dataset.itemHrid || '');
             const level = Number(card.dataset.level) || 0;
             bindTooltip(cell, () => mooncakeBuildMarketHistoryTimelineTooltip(days, row, itemHrid, level), { interactive: true });
+        });
+        card.querySelectorAll('.mooncake-market-history-volume-rate').forEach(cell => {
+            bindTooltip(cell, () => mooncakeBuildMarketHistoryHourlyVolumeTooltip(windows));
         });
     }
 
@@ -20141,11 +20380,15 @@
                                 ${visibleColumns.buySell ? `<th title="${sideVolumeTitle}" style="padding:${headPad};text-align:center;font-weight:700;${compactHeadStyle}">${isZH ? '买/卖' : 'Buy/Sell'}</th>` : ''}
                                 ${visibleColumns.range ? `<th data-mooncake-history-order-label="1" data-sell-first-label="max/min" data-buy-first-label="min/max" style="padding:${headPad};text-align:center;font-weight:700;${compactHeadStyle}">${orderPresentation.priceHeader}</th>` : ''}
                                 ${showHourly && visibleColumns.hourly ? `<th data-mooncake-history-order-label="1" data-sell-first-label="${isZH ? '工时' : 'Hourly'}" data-buy-first-label="${isZH ? '工时' : 'Hourly'}" style="padding:${headPad};text-align:center;font-weight:700;${compactHeadStyle}">${orderPresentation.hourlyHeader}</th>` : ''}
+                                ${!showHourly ? `<th scope="col" class="mooncake-market-history-volume-rate" data-mooncake-history-detail-trigger="volume-rate" style="padding:${headPad};text-align:center;font-weight:700;white-space:nowrap;cursor:help;">${isZH ? '5d 时均量' : '5d avg/h'}</th>` : ''}
                             </tr>
                         </thead>
                         <tbody>${mooncakeBuildMarketHistoryRows(itemHrid, level, windows, sellFirst, { compact })}</tbody>
                     </table>
                </div>`;
+        if (stateText && !showHourly) {
+            return `<div style="display:flex;align-items:center;gap:12px;">${body}<div class="mooncake-market-history-volume-rate" data-mooncake-history-detail-trigger="volume-rate" style="text-align:center;white-space:nowrap;cursor:help;"><div style="color:#AAA;font-size:${tableFontSize};font-weight:700;">${isZH ? '5d 时均量' : '5d avg/h'}</div><div style="color:#87CEEB;font-weight:800;font-size:${compact ? '12px' : '14px'};">${mooncakeEscapeHtml(mooncakeFormatMarketHistoryHourlyVolume(windows?.hourlyVolume5d?.hourlyVolume))}</div></div></div>`;
+        }
         return body;
     }
 
@@ -20172,6 +20415,7 @@
         if (columns.buySell) width += 62;
         if (columns.range) width += 78;
         if (columns.hourly && mooncakeIsMarketHistoryEquipmentTarget(itemHrid)) width += 82;
+        if (!mooncakeIsMarketHistoryEquipmentTarget(itemHrid)) width += 62;
         return Math.max(168, Math.min(420, width + 18));
     }
 
@@ -24889,17 +25133,15 @@
     }
 
     function mooncakeWarehouseGetLayoutMetrics(root, entries, originalPaddingTop = null) {
-        // This path runs only for a new root or a real width change. Geometry is
-        // read before any item style is changed, and only enough native items are
-        // measured to recover the grid step.
-        const measuredEntries = [];
+        // A native card provides its size, but its position is not a grid origin:
+        // favorite aliases and filtering can make the first entry a later column.
+        let first = null;
         for (const entry of entries) {
             const rect = entry.node.getBoundingClientRect();
             if (!(rect.width > 0) || !(rect.height > 0)) continue;
-            measuredEntries.push({ ...entry, rect });
-            if (measuredEntries.length >= 12) break;
+            first = { ...entry, rect };
+            break;
         }
-        const first = measuredEntries[0] || null;
         const rootStyle = getComputedStyle(root);
         const fallbackGrid = root.querySelector('[class*="Inventory_itemGrid"]');
         const gridStyle = getComputedStyle(first?.grid || fallbackGrid || root);
@@ -24917,23 +25159,13 @@
         const paddingTop = Number.isFinite(originalPaddingTop)
             ? Math.max(0, originalPaddingTop)
             : computedPaddingTop;
-        const columnsFromTemplate = String(gridStyle.gridTemplateColumns || '')
-            .trim().split(/\s+/).filter(value => /(?:px|rem|%|fr)$/.test(value)).length;
         const availableWidth = Math.max(itemWidth, root.clientWidth - paddingLeft - paddingRight);
-        const columns = Math.max(1, columnsFromTemplate || Math.floor((availableWidth + columnGap) / (itemWidth + columnGap)));
-        // 与默认网格保持一致：以第一个物品相对容器的实际偏移作为左基准，
-        // 用同一行相邻物品的实际间距作为列距，避免物品整体偏左贴边。
-        const rootRect = root.getBoundingClientRect();
-        const firstRow = first
-            ? measuredEntries
-                .filter(entry => entry.rect.width > 0 && entry.rect.height > 0 && Math.abs(entry.rect.top - first.rect.top) < 2)
-                .sort((a, b) => a.rect.left - b.rect.left)
-            : [];
-        const second = firstRow[1];
-        const baseLeft = first ? Math.max(0, first.rect.left - rootRect.left) : paddingLeft;
-        const columnStep = second && second.rect.left > first.rect.left
-            ? second.rect.left - first.rect.left
-            : itemWidth + columnGap;
+        const columnStep = itemWidth + columnGap;
+        const columns = Math.max(1, Math.floor((availableWidth + columnGap) / columnStep));
+        const gridWidth = columns * itemWidth + (columns - 1) * columnGap;
+        // Match the centered native/queue grid, using the full section width.
+        // Never inherit a source card's column or a category's narrower grid.
+        const baseLeft = paddingLeft + Math.max(0, (availableWidth - gridWidth) / 2);
         const signature = [
             Math.round(root.clientWidth), itemWidth, itemHeight, columnGap, rowGap,
             paddingLeft, paddingTop, columns, Math.round(baseLeft), Math.round(columnStep)
@@ -24943,11 +25175,11 @@
 
     function mooncakeWarehouseEnsureStyles() {
         const existing = document.getElementById('mooncake-inventory-warehouse-style');
-        if (existing?.dataset.mooncakeWarehouseStyleVersion === '5') return;
+        if (existing?.dataset.mooncakeWarehouseStyleVersion === '6') return;
         existing?.remove();
         const style = document.createElement('style');
         style.id = 'mooncake-inventory-warehouse-style';
-        style.dataset.mooncakeWarehouseStyleVersion = '5';
+        style.dataset.mooncakeWarehouseStyleVersion = '6';
         style.textContent = `
             [${MOONCAKE_WAREHOUSE_PANEL_ATTR}] {
                 position: absolute; left: 0; right: 0; top: 0; z-index: 4; pointer-events: none;
@@ -24986,7 +25218,6 @@
                 position: absolute; right: 1px; bottom: 1px; min-width: 11px; height: 11px; padding: 0 2px; border-radius: 6px;
                 background: #3f7ab9; color: #fff; font-size: 8px; font-weight: 800; line-height: 11px; text-align: center;
             }
-            [${MOONCAKE_WAREHOUSE_NATIVE_TOOLS_ATTR}] .mooncake-warehouse-native-settings { color: #afc0e8; }
             /* Assets, queue and inventory share one scrollport. Native panels
                must grow with their contents instead of taking the space left
                after the queue and creating a second, tiny scrollport. */
@@ -25028,8 +25259,8 @@
                 flex: 0 0 auto; min-width: 17px; padding: 0 4px; border: 1px solid rgba(129,157,211,.62); border-radius: 3px;
                 color: #bcd1f8; font-size: 10px; line-height: 15px; text-align: center;
             }
-            [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] .mooncake-warehouse-queue-preview-summary {
-                min-width: 0; overflow: hidden; color: #a9b7d3; text-overflow: ellipsis; white-space: nowrap;
+            [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] .mooncake-warehouse-queue-settings {
+                flex: 0 0 auto; margin-left: auto; color: #afc0e8;
             }
             [${MOONCAKE_WAREHOUSE_QUEUE_DOCK_ATTR}] .mooncake-warehouse-queue-preview-grid {
                 display: grid; flex: 0 0 auto; grid-template-columns: repeat(auto-fill, var(--item-size-normal, 52px));
@@ -25048,9 +25279,6 @@
             [${MOONCAKE_WAREHOUSE_QUEUE_HEADER_ATTR}] .mooncake-warehouse-queue-count {
                 flex: 0 0 auto; min-width: 17px; padding: 0 4px; border: 1px solid rgba(129,157,211,.62); border-radius: 3px;
                 color: #bcd1f8; font-size: 10px; line-height: 15px; text-align: center;
-            }
-            [${MOONCAKE_WAREHOUSE_QUEUE_HEADER_ATTR}] .mooncake-warehouse-queue-summary {
-                min-width: 0; overflow: hidden; color: #a9b7d3; text-overflow: ellipsis; white-space: nowrap;
             }
             .mooncake-warehouse-section {
                 position: absolute; left: 5px; right: 5px; height: 28px; display: flex;
@@ -25360,14 +25588,18 @@
         const count = document.createElement('span');
         count.className = 'mooncake-warehouse-queue-preview-count';
         count.textContent = String(queueSection.actionCount);
-        const summary = document.createElement('span');
-        summary.className = 'mooncake-warehouse-queue-preview-summary';
-        const first = queueSection.records.find(record => record.group === 'equipment') ||
-            queueSection.sourceEquipment?.[0] || null;
-        summary.textContent = first
-            ? `${getItemName(first.itemHrid)} +${mooncakeWarehouseNormalizeLevel(first.enhancementLevel)}`
-            : mooncakeWarehouseText('emptyCustom');
-        header.append(title, count, summary);
+        const settings = document.createElement('button');
+        settings.type = 'button';
+        settings.className = 'mooncake-warehouse-button mooncake-warehouse-icon-button mooncake-warehouse-queue-settings';
+        settings.textContent = '\u2699';
+        settings.title = mooncakeWarehouseText('categories');
+        settings.setAttribute('aria-label', settings.title);
+        settings.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            mooncakeWarehouseOpenManager({ trigger: settings });
+        });
+        header.append(title, count, settings);
         return header;
     }
 
@@ -25402,7 +25634,7 @@
         const records = mooncakeWarehouseGetQueuePreviewRecords(queueSection,
             owner?.props.characterItemMap ?? characterInventoryItems);
         const headerModel = { ...queueSection, records };
-        const headerSignature = JSON.stringify([queueSection.actionCount, records[0]?.key]);
+        const headerSignature = JSON.stringify([queueSection.actionCount, queueSection.title]);
         let grid = dock.querySelector(':scope > .mooncake-warehouse-queue-preview-grid');
         if (!grid) {
             grid = document.createElement('div');
@@ -25554,21 +25786,6 @@
             });
             fragment.appendChild(button);
         }
-        const settings = document.createElement('button');
-        settings.type = 'button';
-        settings.className = 'mooncake-warehouse-native-button mooncake-warehouse-native-settings';
-        const settingsIcon = document.createElement('span');
-        settingsIcon.className = 'mooncake-warehouse-native-icon';
-        settingsIcon.textContent = '\u2699';
-        settings.title = mooncakeWarehouseText('categories');
-        settings.setAttribute('aria-label', settings.title);
-        settings.addEventListener('click', event => {
-            event.preventDefault();
-            event.stopPropagation();
-            mooncakeWarehouseOpenManager({ trigger: settings });
-        });
-        settings.appendChild(settingsIcon);
-        fragment.appendChild(settings);
         tools.replaceChildren(fragment);
     }
 
@@ -25636,10 +25853,7 @@
         const count = document.createElement('span');
         count.className = 'mooncake-warehouse-queue-count';
         count.textContent = String(header.count);
-        const summary = document.createElement('span');
-        summary.className = 'mooncake-warehouse-queue-summary';
-        summary.textContent = header.summary;
-        element.append(title, count, summary);
+        element.append(title, count);
         panel.appendChild(element);
     }
 
@@ -40174,7 +40388,8 @@
                 const listing = props?.listing || props?.marketListing || null;
                 if (listing && typeof listing === 'object') {
                     const level = Number(listing.enhancementLevel ?? listing.enhanceLevel);
-                    const price = Number(listing.price ?? listing.orderPrice ?? listing.listingPrice ?? listing.marketListingPrice ?? listing.unitPrice);
+                    const price = Number(listing.workingPrice > 0 ? listing.workingPrice :
+                        (listing.price ?? listing.orderPrice ?? listing.listingPrice ?? listing.marketListingPrice ?? listing.unitPrice));
                     const orderQuantity = Number(listing.orderQuantity ?? listing.quantity ?? listing.totalQuantity);
                     const filledQuantity = Number(listing.filledQuantity ?? listing.filled ?? listing.completedQuantity);
                     return {
@@ -40213,7 +40428,7 @@
         const itemHrid = itemHrids.find(hrid => mooncakeIsEnhanceableItem(hrid)) ||
             itemHrids.find(hrid => !!mooncakeGetItemDetailOfHrid(hrid)) || null;
         const levelText = row.querySelector('[class*="enhancementLevel"], [class*="Item_enhancementLevel"]')?.textContent ||
-            row.textContent || '';
+            row.children?.[2]?.textContent || '';
         const levelMatch = levelText.match(/[+＋]\s*(\d{1,2})/);
         const enhancementLevel = levelMatch ? Number(levelMatch[1]) : 0;
 
@@ -40267,7 +40482,7 @@
         }
 
         const priceNode = row.querySelector('[class*="MarketplacePanel_price"], [class*="price"]') || row.children?.[3] || null;
-        const priceText = priceNode?.firstChild?.textContent || priceNode?.textContent || '';
+        const priceText = mooncakeGetMyListingNativePriceText(priceNode);
         const price = parsePriceText(priceText);
         const progressNodes = [
             row.children?.[2] || null,
@@ -40312,6 +40527,183 @@
             orderQuantity: pickNumber(fromFiber?.orderQuantity, fromDom?.orderQuantity),
             filledQuantity: pickNumber(fromFiber?.filledQuantity, fromDom?.filledQuantity)
         };
+    }
+
+    // Keep the game's price node untouched: React may update it independently,
+    // and the existing listing filters must never parse our wage as a price.
+    function mooncakeGetMyListingNativePriceText(priceNode) {
+        if (!priceNode) return '';
+        const copy = priceNode.cloneNode(true);
+        copy.querySelectorAll('[data-mooncake-my-listing-hourly]').forEach(node => node.remove());
+        return copy.textContent || '';
+    }
+
+    let mooncakeMyListingsHourlyRevision = 0;
+    let mooncakeMyListingsHourlyTimer = 0;
+    let mooncakeMyListingsHourlyRendering = false;
+    let mooncakeMyListingsHourlyPending = false;
+    let mooncakeMyListingsHourlyHooked = false;
+    let mooncakeMyListingsHourlyObserver = null;
+    let mooncakeMyListingsHourlyTable = null;
+
+    function mooncakeObserveMyListingsHourlyTable(table) {
+        if (table === mooncakeMyListingsHourlyTable) return;
+        mooncakeMyListingsHourlyObserver?.disconnect();
+        mooncakeMyListingsHourlyObserver = null;
+        mooncakeMyListingsHourlyTable = table || null;
+        if (!table) return;
+        // React updates existing price/level text nodes in place. The shared
+        // document observer only sees childList changes, so watch text here.
+        mooncakeMyListingsHourlyObserver = new MutationObserver(mutations => {
+            if (mutations.some(mooncakeMyListingsTargetFilterMutationNeedsRefresh)) {
+                mooncakeScheduleMyListingsHourlyWages();
+            }
+        });
+        mooncakeMyListingsHourlyObserver.observe(table, { childList: true, characterData: true, subtree: true });
+    }
+
+    function mooncakeEnsureMyListingsHourlyStyle() {
+        if (document.getElementById('MooncakeMyListingsHourlyStyle')) return;
+        const style = document.createElement('style');
+        style.id = 'MooncakeMyListingsHourlyStyle';
+        style.textContent = `
+            .mooncake-market-inline-hourly-wage[data-mooncake-my-listing-hourly] {
+                display:inline-block; width:auto; margin:0 0 0 8px;
+                vertical-align:middle; font-size:12px; line-height:1.4;
+            }
+            [data-mooncake-my-listing-hourly] .mooncake-market-inline-hourly-label { font-size:11px; }
+        `;
+        document.head?.appendChild(style);
+    }
+
+    function mooncakeRenderMyListingHourlyWage(row, marketData, contextKey) {
+        const selector = '[data-mooncake-my-listing-hourly]';
+        const listing = mooncakeGetMyListingRowDescriptor(row);
+        const level = Number(listing?.enhancementLevel);
+        const price = Number(listing?.price);
+        const priceNode = row.querySelector('[class*="MarketplacePanel_price"]') || row.children?.[3];
+        const priceCell = priceNode?.closest('td');
+        if (!isMarketplaceHourlyWageEnabled() || !priceCell || !Number.isInteger(level) || level <= 0 ||
+            !Number.isFinite(price) || price <= 0 || !mooncakeIsEnhanceableItem(listing?.itemHrid)) {
+            row.querySelectorAll(selector).forEach(node => node.remove());
+            row._mooncakeMyListingHourly = null;
+            return;
+        }
+
+        let metric = priceCell.querySelector(selector);
+        row.querySelectorAll(selector).forEach(node => { if (node !== metric) node.remove(); });
+        if (!metric) {
+            metric = document.createElement('span');
+            metric.className = 'mooncake-market-inline-hourly-wage';
+            metric.setAttribute('data-mooncake-my-listing-hourly', '1');
+            priceCell.appendChild(metric);
+        }
+        const signature = `${contextKey}|${listing.itemHrid}|${level}|${price}|${listing.isSell}`;
+        const previous = row._mooncakeMyListingHourly;
+        if (previous?.signature === signature && previous.metric === metric) return;
+        const state = { signature, metric };
+        row._mooncakeMyListingHourly = state;
+        const label = isZH ? '工时' : 'Hourly';
+        const unavailable = (loading = false) => {
+            mooncakeSetMarketplaceInlineHourlyWage(metric, { label, value: loading ? '…' : '—' });
+            metric._mooncakeTooltipHtml = '';
+            metric.title = isZH ? (loading ? '正在计算工时费' : '数据不足，暂无法计算工时费')
+                : (loading ? 'Calculating hourly wage' : 'Hourly wage unavailable');
+        };
+        if (!marketData?.marketData) {
+            unavailable();
+            return;
+        }
+        const prewarm = mooncakeEnsureEnhancementRoutePrewarm(listing.itemHrid, level);
+        if (!prewarm.ready) {
+            unavailable(true);
+            prewarm.promise.then(() => {
+                // A price change, a recycled React row, or a closed table must
+                // not receive the result of an earlier asynchronous request.
+                if (!row.isConnected || row._mooncakeMyListingHourly !== state) return;
+                state.signature = '';
+                mooncakeScheduleMyListingsHourlyWages();
+            });
+            return;
+        }
+        const result = calcHourlyWageAndMetrics(listing.itemHrid, level, marketData, price, { includeRoutePair: false });
+        if (!result || !Number.isFinite(result.hourlyWage)) {
+            unavailable();
+            return;
+        }
+        mooncakeSetMarketplaceInlineHourlyWage(metric, {
+            label,
+            value: `${mooncakeFormatSignedHourlyWage(result.hourlyWage)}/h`,
+            color: result.evaluation?.combinedColor
+        });
+        metric.title = isZH ? '按当前显示价格、强化配置和路线策略计算税后工时费'
+            : 'After-tax hourly wage at the displayed price, using your enhancement settings and route strategy';
+        bindTooltip(metric, () => {
+            const detailed = calcHourlyWageAndMetrics(listing.itemHrid, level, getMarketData(), price);
+            return detailed ? buildTooltipHtml(level, detailed.metrics, price, {
+                itemHrid: listing.itemHrid, marketData: getMarketData(), evaluation: detailed.evaluation,
+                includeRiskComparison: true, includeRivalHourly: true
+            }) : '';
+        });
+    }
+
+    function mooncakeScheduleMyListingsHourlyWages() {
+        if (!mooncakeMyListingsHourlyHooked) return;
+        if (mooncakeMyListingsHourlyRendering) {
+            mooncakeMyListingsHourlyPending = true;
+            return;
+        }
+        if (mooncakeMyListingsHourlyTimer) return;
+        mooncakeMyListingsHourlyTimer = setTimeout(() => {
+            mooncakeMyListingsHourlyTimer = 0;
+            const candidate = mooncakeGetVisibleMyListingsTable();
+            const table = candidate?.matches('table') ? candidate : candidate?.querySelector('table');
+            mooncakeObserveMyListingsHourlyTable(table);
+            if (!table?.isConnected || !mooncakeIsVisibleElement(table)) return;
+            mooncakeEnsureMyListingsHourlyStyle();
+            const marketData = getMarketData();
+            const contextKey = [mooncakeMyListingsHourlyRevision, mooncakeMarketPricingRevision,
+                mooncakeHourlyWageColorProfileRevision, getEnhancementRouteObjective(),
+                mooncakeGetEnhancementStandardHourlyWage(), JSON.stringify(getPlayerEnhanceParams()),
+                isMarketplaceHourlyWageEnabled(), !!marketData?.marketData].join('|');
+            const rows = Array.from(table.querySelectorAll('tbody tr'));
+            let index = 0;
+            mooncakeMyListingsHourlyRendering = true;
+            const processBatch = () => {
+                const startedAt = performance.now();
+                let processed = 0;
+                while (table.isConnected && index < rows.length && processed < 3) {
+                    const row = rows[index++];
+                    processed++;
+                    if (row.isConnected) {
+                        try { mooncakeRenderMyListingHourlyWage(row, marketData, contextKey); }
+                        catch (error) { console.warn('[MoonCake] Listing hourly wage unavailable:', error); }
+                    }
+                    if (performance.now() - startedAt >= 8) break;
+                }
+                if (table.isConnected && index < rows.length) {
+                    setTimeout(processBatch, 0);
+                    return;
+                }
+                mooncakeMyListingsHourlyRendering = false;
+                if (mooncakeMyListingsHourlyPending) {
+                    mooncakeMyListingsHourlyPending = false;
+                    mooncakeScheduleMyListingsHourlyWages();
+                }
+            };
+            processBatch();
+        }, 60);
+    }
+
+    function hookMooncakeMyListingsHourlyWages() {
+        if (mooncakeMyListingsHourlyHooked) return;
+        mooncakeMyListingsHourlyHooked = true;
+        subscribeDocumentMutations('my-listings-hourly', mutations => {
+            if (mutations.some(mooncakeMyListingsTargetFilterMutationNeedsRefresh)) {
+                mooncakeScheduleMyListingsHourlyWages();
+            }
+        });
+        mooncakeScheduleMyListingsHourlyWages();
     }
 
     // Native marketplace rows do not consistently expose their listing ID. The
@@ -41062,7 +41454,8 @@
         if (!element) return false;
         const selector = [
             `[${MOONCAKE_MY_LISTINGS_TARGET_FILTER_ATTR}="1"]`,
-            `[${MOONCAKE_MY_LISTINGS_MARKET_UPDATE_ATTR}="1"]`
+            `[${MOONCAKE_MY_LISTINGS_MARKET_UPDATE_ATTR}="1"]`,
+            '[data-mooncake-my-listing-hourly]'
         ].join(',');
         return element.matches?.(selector) || !!element.closest?.(selector);
     }
@@ -41674,7 +42067,8 @@
         if (!element) return false;
         const selector = [
             `[${MOONCAKE_MY_LISTINGS_MANAGEMENT_ATTR}="1"]`,
-            `[${MOONCAKE_MY_LISTINGS_MARKET_UPDATE_ATTR}="1"]`
+            `[${MOONCAKE_MY_LISTINGS_MARKET_UPDATE_ATTR}="1"]`,
+            '[data-mooncake-my-listing-hourly]'
         ].join(',');
         return element.matches?.(selector) || !!element.closest?.(selector);
     }
@@ -41818,7 +42212,8 @@
         _pendingSummaryRaf = requestAnimationFrame(() => {
             _pendingSummaryRaf = null;
             try {
-                const itemSummaryTable = document.querySelector('[class*="MarketplacePanel_itemSummaryTable"]');
+                const itemSummaryTable = mooncakeGetVisibleMarketplaceSummaryTable();
+                mooncakeObserveMarketplaceSummaryPrices(itemSummaryTable);
                 const hasVisiblePricingSurface = mooncakeHasVisibleMarketplacePricingSurface();
                 mooncakeMarketplacePricingSurfaceState = hasVisiblePricingSurface;
                 if (itemSummaryTable && hasVisiblePricingSurface && mooncakeIsVisibleElement(itemSummaryTable)) {
@@ -41835,7 +42230,59 @@
         });
     }
 
+    function mooncakeGetVisibleMarketplaceSummaryTable() {
+        const candidates = [...document.querySelectorAll('[class*="MarketplacePanel_itemSummaryTable"]')]
+            .map(node => node.matches('table') ? node : node.querySelector('table'))
+            .filter(table => table && mooncakeIsVisibleElement(table));
+        return candidates.find(mooncakeIsMarketplaceModalDescendant) || candidates[0] || null;
+    }
+
+    function mooncakeGetMarketplaceSummaryItemHrid(table) {
+        // The level rows identify their own item even before the preview is
+        // mounted, or after scrolling the preview out of its panel bounds.
+        for (const row of table?.querySelectorAll('tbody tr') || []) {
+            const itemCell = mooncakeGetMarketplaceSummaryNativeCell(row, 'item', 0);
+            const itemHrid = itemCell && extractItemHridFromElement(itemCell);
+            if (itemHrid) return itemHrid;
+        }
+        return null;
+    }
+
+    function mooncakeMarketplaceSummaryMutationNeedsRefresh(mutation) {
+        const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
+        if (target?.closest(MOONCAKE_MARKET_INJECTED_SELECTOR)) return false;
+        const selector = '[class*="MarketplacePanel_itemSummaryTable"]';
+        const touchesSummary = node => node instanceof Element &&
+            (node.matches(selector) || !!node.closest(selector) || !!node.querySelector(selector));
+        const changed = [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])];
+        const nativeChanges = changed.filter(node => !(node instanceof Element && node.matches(MOONCAKE_MARKET_INJECTED_SELECTOR)));
+        // Ignore our own headers/cells, but not a native parent containing a
+        // new table. React often inserts the whole panel in one mutation.
+        if (changed.length && !nativeChanges.length) return false;
+        return !!target?.closest(selector) || nativeChanges.some(touchesSummary);
+    }
+
+    function mooncakeObserveMarketplaceSummaryPrices(table) {
+        if (mooncakeSummaryObservedTable === table) return;
+        mooncakeSummaryPriceObserver?.disconnect();
+        mooncakeSummaryPriceObserver = null;
+        mooncakeSummaryObservedTable = table;
+        if (!table) return;
+        mooncakeSummaryPriceObserver = new MutationObserver(mutations => {
+            if (mutations.some(mooncakeMarketplaceSummaryMutationNeedsRefresh)) {
+                scheduleMarketplaceSummaryHourlyWageRefresh({ force: true });
+            }
+        });
+        // Observe only the selected table; price text and SVG item references
+        // may change in place without a document-level childList mutation.
+        mooncakeSummaryPriceObserver.observe(table, {
+            childList: true, characterData: true, subtree: true,
+            attributes: true, attributeFilter: ['href', 'xlink:href']
+        });
+    }
+
     function scheduleMarketplaceHourlyWageRefresh(options = {}) {
+        mooncakeScheduleMyListingsHourlyWages();
         scheduleMarketplaceOrderBookHourlyWageRefresh(options);
         scheduleMarketplaceSummaryHourlyWageRefresh(options);
         scheduleMooncakeMarketJumpHelpers();
@@ -41849,7 +42296,7 @@
         try {
             const handleMutations = (mutations) => {
                 let needOrderBook = false;
-                let needSummary = false;
+                let needSummary = mutations.some(mooncakeMarketplaceSummaryMutationNeedsRefresh);
                 let needMarketJumpHelpers = false;
                 let needEnhancementTabEnsure = false;
                 let infoContainerFound = null;
@@ -42025,6 +42472,7 @@
 
             enhancementDetailTableObserver = subscribeDocumentMutations('market-detail', handleMutations);
             scheduleMarketplaceOrderBookHourlyWageRefresh({ force: true });
+            scheduleMarketplaceSummaryHourlyWageRefresh({ force: true });
         } catch (err) {
             console.error('[Better Loot Tracker] hookEnhancementDetailTable 设置失败:', err);
         }
@@ -42568,8 +43016,7 @@
         state.timer = setTimeout(() => {
             state.timer = 0;
             if (!itemSummaryTable.isConnected || !mooncakeIsVisibleElement(itemSummaryTable)) return;
-            const currentItem = mooncakeFindCurrentMarketItemNode();
-            const currentItemHrid = currentItem ? extractItemHridFromElement(currentItem) : null;
+            const currentItemHrid = mooncakeGetMarketplaceSummaryItemHrid(itemSummaryTable);
             if (currentItemHrid !== itemHrid) return;
             scheduleMarketplaceSummaryHourlyWageRefresh({ force: true });
         }, delay);
@@ -42982,7 +43429,8 @@
 
         let rowIndex = 0;
         const processSummaryBatch = () => {
-            if (renderGeneration !== _summaryRenderGeneration || !table.isConnected) return;
+            if (renderGeneration !== _summaryRenderGeneration || !table.isConnected ||
+                mooncakeGetMarketplaceSummaryItemHrid(table) !== itemHrid) return;
             const startedAt = performance.now();
             let processed = 0;
             while (rowIndex < rows.length && processed < 2) {
@@ -43017,8 +43465,7 @@
                     processSummaryBatch();
                     return;
                 }
-                const currentItem = mooncakeFindCurrentMarketItemNode();
-                const currentItemHrid = currentItem ? extractItemHridFromElement(currentItem) : null;
+                const currentItemHrid = mooncakeGetMarketplaceSummaryItemHrid(table);
                 if (currentItemHrid === itemHrid && mooncakeIsVisibleElement(table)) {
                     scheduleMarketplaceSummaryHourlyWageRefresh({ force: true });
                 }
@@ -43036,17 +43483,8 @@
             return;
         }
 
-        const itemNode = mooncakeFindCurrentMarketItemNode();
-        const itemHrid = itemNode ? extractItemHridFromElement(itemNode) : null;
-        if (!itemNode || !itemHrid || !mooncakeIsEnhanceableItem(itemHrid)) {
-            // React can mount the summary rows one paint before the current
-            // item preview. Keep one bounded retry for an enhanceable summary
-            // rather than treating that transient state as a user-disabled
-            // hourly column.
-            const summaryItemHrid = extractItemHridFromElement(itemSummaryTable);
-            if (summaryItemHrid && mooncakeIsEnhanceableItem(summaryItemHrid)) {
-                mooncakeScheduleMarketplaceSummaryHourlyWageDataRetry(itemSummaryTable, summaryItemHrid);
-            }
+        const itemHrid = mooncakeGetMarketplaceSummaryItemHrid(itemSummaryTable);
+        if (!itemHrid || !mooncakeIsEnhanceableItem(itemHrid)) {
             clearMarketplaceSummaryHourlyWageColumns(itemSummaryTable);
             mooncakeApplyMarketplaceResponsiveTableLayout({ itemSummaryTable });
             return;
@@ -43226,7 +43664,8 @@
         // 并在表格重新刷新后取消旧批次，避免单个 80ms+ 的主线程任务。
         let rowIndex = 0;
         const processSummaryBatch = () => {
-            if (renderGeneration !== _summaryRenderGeneration || !itemSummaryTable.isConnected) return;
+            if (renderGeneration !== _summaryRenderGeneration || !itemSummaryTable.isConnected ||
+                mooncakeGetMarketplaceSummaryItemHrid(itemSummaryTable) !== itemHrid) return;
             const startedAt = performance.now();
             let processed = 0;
             while (rowIndex < rows.length && processed < 2) {
@@ -43266,8 +43705,7 @@
                 // worker is busy. Its finished cache is still valuable: wake
                 // the latest pass for the same item instead of silently
                 // abandoning it and leaving placeholders forever.
-                const currentItem = mooncakeFindCurrentMarketItemNode();
-                const currentItemHrid = currentItem ? extractItemHridFromElement(currentItem) : null;
+                const currentItemHrid = mooncakeGetMarketplaceSummaryItemHrid(itemSummaryTable);
                 if (currentItemHrid === itemHrid && mooncakeIsVisibleElement(itemSummaryTable)) {
                     scheduleMarketplaceSummaryHourlyWageRefresh({ force: true });
                 }
@@ -43468,6 +43906,7 @@
             _pendingOrderBookResizeTimer = setTimeout(() => {
                 _pendingOrderBookResizeTimer = 0;
                 scheduleMarketplaceOrderBookHourlyWageRefresh();
+                scheduleMarketplaceSummaryHourlyWageRefresh({ force: true });
             }, 120);
         }, { passive: true });
 
@@ -43479,6 +43918,7 @@
         hookMooncakeOrderModalEconomics();
         hookMooncakeCompactMarketplaceBuyActionRecovery();
         hookMooncakeInventoryRightClickMarket();
+        hookMooncakeLootItemClicks();
         startMooncakeInventoryWarehouse();
         hookMooncakeProtectionAssistant();
         hookMooncakeAntiSuicideSystem();
@@ -43488,6 +43928,7 @@
 
         setTimeout(hookMooncakeMyListingsTargetFilter, 1000);
         setTimeout(hookMooncakeMyListingsManagement, 1000);
+        setTimeout(hookMooncakeMyListingsHourlyWages, 1000);
 
         // 创建强化标签页
         setTimeout(createEnhancementTab, 2000);
@@ -43517,6 +43958,7 @@
                 itemDetailMap = initData.itemDetailMap;
 
                 buildItemMaps();
+                mooncakeScheduleMyListingsHourlyWages();
                 mooncakeScheduleMyListingsTargetFilter(0);
                 if (mooncakeMyListingsManagementState?.undercut) mooncakeScheduleMyListingsManagement();
                 setupObserver();
