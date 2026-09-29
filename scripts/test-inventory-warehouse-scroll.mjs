@@ -73,7 +73,8 @@ header { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 <button id="behavior">运行队列交互检查</button><button id="empty">筛选无结果</button>
 <button id="upgrade">强化结果更新</button><button id="combat">切换战斗</button>
 <button id="lock">锁定装备</button>
-</header><div id="stage"></div><pre id="result" role="status">等待检查</pre>
+<button id="handoff">运行强化异步更新检查</button>
+</header><pre id="result" role="status">等待检查</pre><div id="stage"></div>
 <pre id="action" role="log">尚未操作物品</pre>
 <script src="/react.js"></script><script src="/react-dom.js"></script>
 <script>
@@ -276,6 +277,46 @@ document.getElementById('behavior').onclick = async () => {
         mount(); await frame();
         result.textContent = 'PASS：无库存 DOM、分类切换、菜单保留、强化更新、右键最新 hash、战斗/等级/锁定限制、快捷键、缺货保护和卸载清理';
     } catch (error) { result.textContent = 'FAIL: ' + error.message; console.error(error); }
+};
+document.getElementById('handoff').onclick = async () => {
+    try {
+        mount(630,840,13,true); await frame();
+        const record = model.queueSection.sourceQueue.equipment[0];
+        const card = stage.querySelector('[data-mooncake-warehouse-queue-preview-item] .Item_item__fixture');
+        const icon = card.querySelector('[role="img"]');
+        const secondStack = {id:99,itemHrid:record.itemHrid,enhancementLevel:12,count:2,
+            hash:record.itemHrid + ':12',itemLocationHrid:'/item_locations/inventory'};
+        const initialItems = new Map(owner.props.characterItemMap); initialItems.set(secondStack.hash,secondStack);
+        updateProps({characterItemMap:initialItems}); await frame();
+        const checks = [];
+        for (const level of [4,0,1,7,6,0]) {
+            const previousHash = record.itemHrid + ':' + record.enhancementLevel;
+            const nextHash = record.itemHrid + ':' + level;
+            const nextItem = {...owner.props.characterItemMap.get(previousHash),enhancementLevel:level,hash:nextHash};
+            const nextItems = new Map(owner.props.characterItemMap);nextItems.delete(previousHash);nextItems.set(nextHash,nextItem);
+            // The WebSocket result updates Mooncake before React has supplied
+            // the Inventory owner with the replacement stack. Raw packets do
+            // not necessarily include the game's derived item.hash property.
+            characterInventoryItems = new Map([...nextItems].map(([key,item])=>{
+                const raw={...item};delete raw.hash;return [key,raw];
+            }));
+            record.enhancementLevel=level;record.itemHash=nextHash;record.allowLevelReconcile=true;
+            syncQueue();await frame();
+            assert(card.isConnected&&card.querySelector('[role="img"]')===icon,'结果到达时重建了当前装备图标');
+            assert(!card.classList.contains('Item_empty__fixture')&&getComputedStyle(card).opacity==='1',
+                '结果已到达、原生背包仍是旧数据时，图标被按缺货变暗');
+            assert(card.querySelector('.Item_count__fixture')?.textContent==='1','强化更新中数量闪成 0');
+            assert((card.querySelector('.Item_enhancementLevel__fixture')?.textContent||'')===(level?'+'+level:''),'未显示已确认的新等级');
+            card.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,button:2}));
+            assert(actionLog.at(-1)?.args[1]===nextHash,'结果更新时右键使用了旧等级');
+            updateProps({characterItemMap:nextItems});await frame();
+            delete record.allowLevelReconcile;syncQueue();await frame();
+            assert(card.isConnected&&card.querySelector('[role="img"]')===icon&&!card.classList.contains('Item_empty__fixture'),
+                '原生背包跟进后图标再次重建或变暗');
+            checks.push('+'+level+'：两阶段更新期间图标、数量、点击均正常');
+        }
+        result.textContent='PASS '+checks.length+' 项\n'+checks.join('\n');
+    } catch(error) {result.textContent='FAIL: '+error.message;console.error(error);}
 };
 mooncakeWarehouseEnsureStyles(); mount();
 </script></html>`;

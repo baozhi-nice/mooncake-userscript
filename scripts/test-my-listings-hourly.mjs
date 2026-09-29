@@ -89,11 +89,11 @@ if (process.argv.includes('--serve')) {
     async function run(){
       try {
         await settled();
-        expect(metric(1)?.textContent.includes('+65.04M/h'),'incorrect tax-adjusted wage');
-        expect(metric(2)?.textContent.includes('-143.76M/h'),'negative wage hidden');
+        expect(metric(1)?.textContent==='工时:+65.04M','incorrect tax-adjusted wage');
+        expect(metric(2)?.textContent==='工时:-143.76M','negative wage hidden');
         expect(!metric(4)&&!metric(5),'materials or +0 show a wage');
-        expect(metric(6)?.textContent.includes('+42.00M/h'),'buy-side quote mismatch');
-        expect(metric(7)?.textContent.includes('+68.88M/h'),'pegged displayed price mismatch');
+        expect(metric(6)?.textContent==='工时:+42.00M','buy-side quote mismatch');
+        expect(metric(7)?.textContent==='工时:+68.88M','pegged displayed price mismatch');
         expect(getRow(7).querySelector('sup')?.textContent==='*','native peg marker removed');
         expect(mooncakeReadMyListingFromDom(getRow(7)).price===2280e6,'native price parser was polluted');
         pass('普通、购买及区间挂牌价格；材料和 +0 排除；税后工时含负值');
@@ -102,15 +102,15 @@ if (process.argv.includes('--serve')) {
         expect(metric(1)===old&&calls===before,'unchanged rows recalculated or rebuilt');
         data[0].price=2400e6;render();await settled();
         expect(getRow(1).querySelector('.native-price')===native,'native price node was replaced');
-        expect(metric(1)?.textContent.includes('+80.40M/h'),'React text-only price update ignored');
+        expect(metric(1)?.textContent==='工时:+80.40M','React text-only price update ignored');
         expect(getRow(1).querySelectorAll('[data-mooncake-my-listing-hourly]').length===1,'duplicate wage');
         pass('价格原地更新自动重算，无重复标记；未变更行复用结果');
         data[0].enhancementLevel=0;render();await settled();expect(!metric(1),'stale wage made +0 look enhanced');
         data[0].enhancementLevel=12;data[0].price=0;render();await settled();expect(!metric(1),'invalid price retained wage');
-        data[0].price=1562.5e6;render();await settled();expect(metric(1)?.textContent.includes('0.00M/h'),'zero wage missing');
+        data[0].price=1562.5e6;render();await settled();expect(metric(1)?.textContent==='工时:0.00M','zero wage missing');
         data[0].price=2240e6;render();await settled();
-        profile=2;mooncakeScheduleMyListingsHourlyWages();await settled();expect(metric(1)?.textContent.includes('+130.08M/h'),'profile change did not refresh');
-        cost=1600e6;mooncakeMarketPricingRevision++;mooncakeScheduleMyListingsHourlyWages();await settled();expect(metric(1)?.textContent.includes('+110.08M/h'),'material quote change did not refresh');
+        profile=2;mooncakeScheduleMyListingsHourlyWages();await settled();expect(metric(1)?.textContent==='工时:+130.08M','profile change did not refresh');
+        cost=1600e6;mooncakeMarketPricingRevision++;mooncakeScheduleMyListingsHourlyWages();await settled();expect(metric(1)?.textContent==='工时:+110.08M','material quote change did not refresh');
         pass('等级、无效价格、零工时、强化配置及成本行情更新');
         available=false;mooncakeScheduleMyListingsHourlyWages();await settled();expect(metric(1)?.textContent.includes('—'),'missing data presented as zero');
         available=true;mooncakeScheduleMyListingsHourlyWages();await settled();expect(!metric(1)?.textContent.includes('—'),'data recovery failed');

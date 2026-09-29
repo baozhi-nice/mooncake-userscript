@@ -8,7 +8,7 @@ const source = await readFile(resolve(projectRoot, 'src', 'mooncake.js'), 'utf8'
 assert.match(source, /@media \(min-width:1320px\)/, 'wide settings layout must have a dedicated breakpoint');
 assert.match(
     source,
-    /grid-template-areas:"market market listings chat" "enhance enhance enhance enhance" "quote quote quote quote"/,
+    /grid-template-areas:"transfer transfer transfer transfer" "market market listings chat" "enhance enhance enhance enhance" "quote quote quote quote"/,
     'wide settings must keep the quote after the compacted sections'
 );
 assert.match(

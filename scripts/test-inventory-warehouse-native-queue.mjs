@@ -50,6 +50,30 @@ const reconciling = {sourceQueue:{equipment:[{...equipment,allowLevelReconcile:t
 assert.equal(collect(reconciling,[upgraded])[0].item,upgraded, 'brief action-result handoff resolves the unique changed level');
 assert.equal(collect(reconciling,[upgraded,item('/items/hat',8)])[0].available,false, 'ambiguous levels must not select the wrong equipment');
 assert.equal(collect(section,[upgraded])[0].available,false, 'outside the handoff window do not guess another level');
+
+// The result and the native Inventory owner may reach a render in different
+// frames, especially when multiple levels of the same equipment are owned.
+const handoffEquipment = {...equipment,enhancementLevel:4,itemHash:upgraded.hash,allowLevelReconcile:true};
+const handoffSection = {sourceQueue:{equipment:[handoffEquipment],protection:[],materials:[]}};
+const rawResult = {...upgraded};delete rawResult.hash;
+const pending = collect(handoffSection,fullInventory,[rawResult])[0];
+assert.equal(pending.available,true,'confirmed enhancement result must not briefly become a zero-count card');
+assert.equal(pending.item.count,1);
+assert.equal(pending.item.enhancementLevel,4);
+assert.equal(pending.item.hash,upgraded.hash,'raw packets must use the updated action hash for native clicks');
+assert.equal(pending.previewKey,records[0].previewKey,'result/native-data handoff must retain the component');
+const combined = collect(handoffSection,[{...upgraded,count:5}],[{...rawResult,count:6}])[0];
+assert.equal(combined.item.count,6,'a result joining an existing stack must use the confirmed count');
+assert.equal(collect({...handoffSection,sourceQueue:{...handoffSection.sourceQueue,
+    equipment:[{...handoffEquipment,allowLevelReconcile:false}]}},fullInventory,[rawResult])[0].available,false,
+    'after handoff use native availability rather than an old result snapshot');
+assert.equal(collect(handoffSection,fullInventory,[{...rawResult,count:0}])[0].available,false,
+    'a depleted result must not fabricate availability');
+assert.equal(collect(handoffSection,fullInventory,[{...rawResult,itemLocationHrid:'/item_locations/head'}])[0].available,false,
+    'an equipped item must not be treated as inventory');
+assert.equal(collect({...handoffSection,sourceQueue:{...handoffSection.sourceQueue,
+    equipment:[{...handoffEquipment,itemHash:undefined}]}},fullInventory,[rawResult])[0].available,false,
+    'without an action hash do not enable native actions using a guessed identity');
 assert.equal(collect(null,fullInventory).length,0);
 assert.equal(collect({sourceQueue:{equipment:[],protection:[],materials:[]}},fullInventory).length,0);
 
