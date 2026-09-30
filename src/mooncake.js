@@ -27421,21 +27421,29 @@
         const redemptionLineRawUnitPrice = bestOtherBid
             ? bestOtherBid.bidPerToken * selected.tokenCount / selected.outputCount
             : 0;
-        // This is the first valid price that ties the best *other* redemption
-        // in the group. Excluding the selected item makes it a real threshold
-        // for increasing the current material's collection price.
+        // The first valid price that matches or beats the best *other*
+        // redemption. Check the lower tick using the same tie tolerance so
+        // floating-point noise cannot raise an exact tie by one whole tick.
+        const lowerLinePrice = redemptionLineRawUnitPrice > 0
+            ? mooncakeSnapMarketPrice(redemptionLineRawUnitPrice, 'down')
+            : 0;
+        const lowerLineRate = lowerLinePrice * selected.outputCount / selected.tokenCount;
         const redemptionLineUnitPrice = redemptionLineRawUnitPrice > 0
-            ? mooncakeSnapMarketPrice(redemptionLineRawUnitPrice, 'up')
+            ? (lowerLineRate >= bestOtherBid.bidPerToken || mooncakeDungeonTokenRatesEqual(lowerLineRate, bestOtherBid.bidPerToken)
+                ? lowerLinePrice
+                // The shared price helper truncates fractional coins first.
+                : mooncakeSnapMarketPrice(Math.ceil(redemptionLineRawUnitPrice), 'up'))
             : 0;
         const mirrorAsk = mooncakeGetMarketAskPrice('/items/mirror_of_protection', marketData);
         const mirrorCapUnitPrice = mirrorAsk > 0
             ? mooncakeSnapMarketPrice(mirrorAsk, 'down')
             : 0;
-        // A token line cannot be tied: one coin below it is the highest
-        // strictly non-optimal price. The mirror's ask is an ordinary ceiling
-        // and may be matched, so it is kept separate before combining them.
-        const tokenSafeBidUnitPrice = Number.isSafeInteger(Math.ceil(redemptionLineRawUnitPrice)) && redemptionLineRawUnitPrice > 1
-            ? mooncakeSnapMarketPrice(Math.ceil(redemptionLineRawUnitPrice) - 1, 'down')
+        // The tick below the first best price is the highest price that loses
+        // to another redemption. Use the corrected tick instead of the raw
+        // ratio so floating-point noise cannot make an exact tie look worse.
+        // The mirror's ask is a separate ceiling and may be matched.
+        const tokenSafeBidUnitPrice = redemptionLineUnitPrice > 2
+            ? mooncakeSnapMarketPrice(redemptionLineUnitPrice - 1, 'down')
             : 0;
         const safeBidUnitPrice = tokenSafeBidUnitPrice > 0 && mirrorCapUnitPrice > 0
             ? Math.min(tokenSafeBidUnitPrice, mirrorCapUnitPrice)
@@ -27493,11 +27501,26 @@
         if (!badge?.isConnected || !itemIcon?.isConnected) return;
         const iconRect = itemIcon.getBoundingClientRect();
         badge.style.visibility = 'hidden';
-        const badgeRect = badge.getBoundingClientRect();
         const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
         const viewportHeight = document.documentElement.clientHeight || window.innerHeight;
-        const left = Math.max(8, Math.min(iconRect.right + 6, viewportWidth - badgeRect.width - 8));
-        const top = Math.max(8, Math.min(iconRect.top - 2, viewportHeight - badgeRect.height - 8));
+        const owner = badge._mooncakeDungeonTokenListingModal;
+        const content = owner?.querySelector?.(MOONCAKE_ORDER_MODAL_CONTENT_SELECTOR) || owner;
+        const contentRect = content?.getBoundingClientRect();
+        const minLeft = Math.max(8, (contentRect?.left ?? 0) + 4);
+        const maxRight = Math.min(viewportWidth - 8, (contentRect?.right ?? viewportWidth) - 4);
+        const rightSpace = maxRight - iconRect.right - 8;
+        const leftSpace = iconRect.left - minLeft - 8;
+        const placeLeft = rightSpace < 100 && leftSpace > rightSpace;
+        const availableWidth = Math.max(1, Math.min(160, placeLeft ? leftSpace : rightSpace));
+        badge.style.maxWidth = `${availableWidth}px`;
+        badge.style.setProperty('--mooncake-token-badge-image-size', availableWidth < 100 ? '24px' : '34px');
+        badge.style.setProperty('--mooncake-token-badge-font-size', availableWidth < 100 ? '10px' : '11px');
+        const badgeRect = badge.getBoundingClientRect();
+        const left = placeLeft ? iconRect.left - 8 - badgeRect.width : iconRect.right + 8;
+        const minTop = Math.max(8, (contentRect?.top ?? 0) + 4);
+        const maxBottom = Math.min(viewportHeight - 8, (contentRect?.bottom ?? viewportHeight) - 4);
+        const top = Math.max(minTop, Math.min(iconRect.top + (iconRect.height - badgeRect.height) / 2,
+            maxBottom - badgeRect.height));
         badge.style.left = `${Math.round(left)}px`;
         badge.style.top = `${Math.round(top)}px`;
         badge.style.visibility = 'visible';
@@ -27524,11 +27547,19 @@
                 display: 'flex',
                 flexDirection: 'column',
                 alignItems: 'center',
-                gap: '3px',
-                maxWidth: 'calc(100vw - 16px)',
+                gap: '2px',
+                width: 'max-content',
+                maxWidth: '160px',
+                padding: '5px 4px',
                 boxSizing: 'border-box',
-                pointerEvents: 'none',
-                whiteSpace: 'nowrap',
+                border: '1px solid rgba(255,100,130,.76)',
+                borderTopColor: 'rgba(93,235,255,.8)',
+                borderRadius: '6px',
+                background: 'rgba(11,16,30,.94)',
+                boxShadow: 'inset 0 0 0 1px rgba(71,224,255,.1), 0 0 8px rgba(255,65,105,.3), 0 0 12px rgba(72,221,255,.18)',
+                textAlign: 'center',
+                pointerEvents: 'auto',
+                cursor: 'help',
                 zIndex: '2147483646',
                 visibility: 'hidden'
             });
@@ -27536,11 +27567,11 @@
             Object.assign(image.style, {
                 display: 'block',
                 flex: '0 0 auto',
-                width: '42px',
-                height: '42px',
+                width: 'var(--mooncake-token-badge-image-size, 34px)',
+                height: 'var(--mooncake-token-badge-image-size, 34px)',
+                maxWidth: '100%',
                 objectFit: 'contain',
-                background: 'transparent',
-                filter: 'drop-shadow(0 0 4px rgba(255,77,96,.72)) drop-shadow(0 0 8px rgba(78,226,255,.22))'
+                filter: 'drop-shadow(0 0 3px rgba(255,77,96,.5))'
             });
             image.src = MOONCAKE_DUNGEON_TOKEN_LISTING_BADGE_IMAGE_SRC;
             image.alt = '';
@@ -27550,45 +27581,51 @@
             Object.assign(label.style, {
                 display: 'flex',
                 flexDirection: 'column',
-                alignItems: 'center',
-                justifyContent: 'center',
-                minWidth: '64px',
-                padding: '4px 7px 5px',
+                gap: '2px',
+                width: '100%',
+                minWidth: '0',
                 boxSizing: 'border-box',
-                border: '1px solid rgba(255,100,130,.82)',
-                borderTopColor: 'rgba(93,235,255,.88)',
-                borderRadius: '6px',
-                background: 'rgba(11,16,30,.94)',
-                boxShadow: 'inset 0 0 0 1px rgba(71,224,255,.11), 0 0 11px rgba(255,65,105,.27), 0 0 17px rgba(72,221,255,.12)',
-                color: '#ffe8ee',
-                textAlign: 'center',
-                textShadow: '0 1px 2px rgba(0,0,0,.82)'
+                lineHeight: '1.3'
             });
             const labelTitle = document.createElement('span');
             Object.assign(labelTitle.style, {
                 display: 'block',
-                fontSize: '11px',
-                fontWeight: '900',
-                lineHeight: '1.1',
-                color: '#ffe7ed'
+                fontSize: 'calc(var(--mooncake-token-badge-font-size, 11px) + 1px)',
+                fontWeight: '800',
+                color: '#ffe7ed',
+                maxWidth: '100%',
+                whiteSpace: 'normal',
+                overflowWrap: 'anywhere'
             });
             const labelValue = document.createElement('span');
             Object.assign(labelValue.style, {
                 display: 'none',
-                marginTop: '2px',
-                fontSize: '13px',
-                fontWeight: '900',
-                lineHeight: '1',
+                marginTop: '4px',
+                fontSize: 'var(--mooncake-token-badge-font-size, 11px)',
+                fontWeight: '800',
                 color: '#74efff',
                 fontVariantNumeric: 'tabular-nums',
-                textShadow: '0 0 7px rgba(93,235,255,.38)'
+                whiteSpace: 'normal',
+                overflowWrap: 'anywhere'
             });
-            label.append(labelTitle, labelValue);
+            const labelHint = document.createElement('span');
+            Object.assign(labelHint.style, {
+                display: 'none',
+                fontSize: 'var(--mooncake-token-badge-font-size, 11px)',
+                color: '#c4d0df',
+                whiteSpace: 'normal',
+                overflowWrap: 'anywhere',
+                WebkitBoxOrient: 'vertical',
+                WebkitLineClamp: '2',
+                overflow: 'hidden'
+            });
+            label.append(labelTitle, labelValue, labelHint);
             badge.append(image, label);
             badge._mooncakeDungeonTokenListingImage = image;
             badge._mooncakeDungeonTokenListingLabel = label;
             badge._mooncakeDungeonTokenListingLabelTitle = labelTitle;
             badge._mooncakeDungeonTokenListingLabelValue = labelValue;
+            badge._mooncakeDungeonTokenListingLabelHint = labelHint;
             badge._mooncakeDungeonTokenListingModal = modal;
             document.body.appendChild(badge);
             mooncakeDungeonTokenListingBadges.set(modal, badge);
@@ -27600,32 +27637,59 @@
         const isMirrorBound = mirrorCapPrice > 0 && (
             !summary?.isWithinMirrorCap || !(redemptionLinePrice > 0) || mirrorCapPrice < redemptionLinePrice
         );
-        const linePrice = isMirrorBound ? mirrorCapPrice : redemptionLinePrice;
+        // Losing the best-redemption status depends only on the other items
+        // for this token. The mirror cap is a separate collection-price rule.
+        const linePrice = isBest ? (Number(summary?.tokenSafeBidUnitPrice) || 0)
+            : (isMirrorBound ? mirrorCapPrice : redemptionLinePrice);
+        const replacement = summary?.bestOtherBid;
+        const hasThreshold = linePrice > 0 && !!replacement;
+        const replacementName = replacement
+            ? (isZH ? getItemName(replacement.itemHrid)
+                : (mooncakeGetItemDetailOfHrid(replacement.itemHrid)?.name || getItemName(replacement.itemHrid)))
+            : '';
+        const hasTiedReplacements = replacement && summary.entries.some(entry =>
+            entry.itemHrid !== summary.selected.itemHrid && entry.itemHrid !== replacement.itemHrid &&
+            mooncakeDungeonTokenRatesEqual(entry.bidPerToken, replacement.bidPerToken));
+        const replacementLabel = hasTiedReplacements
+            ? (isZH ? `【${replacementName}】等材料` : `${replacementName} and other items`)
+            : (isZH ? `【${replacementName}】` : replacementName);
         const image = badge._mooncakeDungeonTokenListingImage;
-        const label = badge._mooncakeDungeonTokenListingLabel;
         const labelTitle = badge._mooncakeDungeonTokenListingLabelTitle;
         const labelValue = badge._mooncakeDungeonTokenListingLabelValue;
+        const labelHint = badge._mooncakeDungeonTokenListingLabelHint;
         if (image) image.style.display = isBest ? 'block' : 'none';
         if (labelTitle) labelTitle.textContent = isBest
             ? (isZH ? '最优兑换' : 'Best redemption')
             : (isZH ? '兑换线' : 'Redemption line');
         if (labelValue) {
-            labelValue.textContent = isBest ? '' : mooncakeFormatMarketPrice(linePrice);
-            labelValue.style.display = isBest ? 'none' : 'block';
+            labelValue.textContent = isBest
+                ? (hasThreshold ? `${isZH ? '临界值' : 'Threshold'} ≤ ${mooncakeFormatMarketPrice(linePrice)}` : '')
+                : mooncakeFormatMarketPrice(linePrice);
+            labelValue.style.display = !isBest || hasThreshold ? 'block' : 'none';
+            labelValue.style.marginTop = isBest ? '4px' : '0';
         }
-        if (label) {
-            label.style.borderColor = isBest ? 'rgba(255,100,130,.82)' : 'rgba(83,226,255,.8)';
-            label.style.borderTopColor = isBest ? 'rgba(93,235,255,.88)' : 'rgba(255,125,150,.86)';
-            label.style.boxShadow = isBest
-                ? 'inset 0 0 0 1px rgba(71,224,255,.11), 0 0 11px rgba(255,65,105,.27), 0 0 17px rgba(72,221,255,.12)'
-                : 'inset 0 0 0 1px rgba(255,124,151,.10), 0 0 10px rgba(70,222,255,.24), 0 0 16px rgba(255,94,127,.10)';
+        if (labelHint) {
+            labelHint.textContent = isBest
+                ? (hasThreshold
+                    ? (isZH ? `由${replacementLabel}取代` : `Replaced by ${replacementLabel}`)
+                    : (replacement
+                        ? (isZH ? '最低价仍为最优' : 'Best even at minimum price')
+                        : (isZH ? '暂无其他材料报价' : 'No other item quotes available')))
+                : '';
+            labelHint.style.display = isBest ? '-webkit-box' : 'none';
         }
         if (labelTitle) labelTitle.style.color = isBest ? '#ffe7ed' : '#d8faff';
         badge.title = isBest
-            ? (isZH ? '当前收购价为该地下城代币的最优兑换价值' : 'This item has the best bid value for its dungeon token')
+            ? (hasThreshold
+                ? (isZH
+                    ? `当前为同代币最优兑换；市场买一降至 ${mooncakeFormatMarketPrice(linePrice)} 或更低时，由${replacementLabel}取代。该值是失去最优的最高有效挂牌价，并列仍算最优。`
+                    : `Currently the best redemption for this token. At a best bid of ${mooncakeFormatMarketPrice(linePrice)} or below, ${replacementLabel} takes over. This is the highest valid price that loses best status; ties still count as best.`)
+                : (replacement
+                    ? (isZH ? '最低有效挂牌价仍为同代币最优兑换。' : 'The minimum valid price still qualifies as best for this token.')
+                    : (isZH ? '当前为同代币最优兑换；缺少其他材料的收购报价，暂无法计算临界价。' : 'Currently the best redemption; other item bids are unavailable, so the threshold cannot be calculated.')))
             : (isMirrorBound
                 ? (isZH ? '保护之镜最低卖价限制了当前收购上限' : 'Mirror of Protection limits this collection price')
-                : (isZH ? '达到此价即与同代币组的最优兑换并列' : 'This price ties the best redemption in the token group'));
+                : (isZH ? '达到此价即可追平或超过同代币组的最优兑换' : 'This price matches or beats the best redemption in the token group'));
         mooncakePositionDungeonTokenListingBadge(badge, itemIcon);
         return badge;
     }

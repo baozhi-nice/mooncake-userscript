@@ -15,6 +15,7 @@
     "test:personal-trades": "node scripts/test-market-personal-trade-history.mjs",
     "test:market-trades": "node scripts/test-market-trade-log.mjs",
     "test:market-rules": "node scripts/test-market-rules-2026.mjs",
+    "test:dungeon-token-guide": "node scripts/test-dungeon-token-guide.mjs",
     "test:sunny-market": "node scripts/test-sunny-market-card-avoidance.mjs",
     "test:warehouse-queue": "node scripts/test-inventory-warehouse-queue.mjs",
     "test:warehouse-performance": "node scripts/test-inventory-warehouse-performance.mjs",
