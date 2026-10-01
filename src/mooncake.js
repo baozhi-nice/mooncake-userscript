@@ -22660,12 +22660,12 @@
     }
 
     function mooncakeFormatKouKouHourly(value, color = '#7DFFB3') {
-        if (!Number.isFinite(Number(value))) return '<span style="color:rgba(230,238,255,.38);">-</span>';
+        if (value == null || value === '' || !Number.isFinite(Number(value))) return '<span style="color:rgba(230,238,255,.38);">-</span>';
         return `<span style="color:${color};font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap;">${mooncakeFormatSignedHourlyWage(value)}/h</span>`;
     }
 
     function mooncakeFormatKouKouProfit(value) {
-        if (!Number.isFinite(Number(value))) return '<span style="color:rgba(230,238,255,.38);">-</span>';
+        if (value == null || value === '' || !Number.isFinite(Number(value))) return '<span style="color:rgba(230,238,255,.38);">-</span>';
         const color = Number(value) >= 0 ? '#6DF6CB' : '#FF9A9A';
         return `<span style="color:${color};font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap;">${mooncakeFormatSignedMoney(value)}</span>`;
     }
@@ -23151,8 +23151,13 @@
                 }
             }
 
-            const sortKey = mooncakeMarketHistoryRankingSort;
+            const sortKey = {
+                koukouHourly: 'hourlyWage',
+                bidHourly: 'bidHourlyWage',
+                undercutHourly: 'undercutHourlyWage'
+            }[mooncakeMarketHistoryRankingSort] || mooncakeMarketHistoryRankingSort;
             const sortValue = (row, key) => {
+                if (row[key] == null || row[key] === '') return -Infinity;
                 const value = Number(row[key]);
                 return Number.isFinite(value) ? value : -Infinity;
             };
@@ -25037,8 +25042,14 @@
 
     function mooncakeWarehouseGetLayoutRoot(root) {
         if (!root?.querySelector) return root;
-        const panels = [...root.querySelectorAll('[class*="TabPanel_tabPanel"]')];
-        return panels.find(panel => !panel.matches('[class*="TabPanel_hidden"]') && mooncakeIsVisibleElement(panel)) || root;
+        const component = mooncakeWarehouseGetNativeTabsComponent(root);
+        if (!component) return root;
+        const container = component.querySelector(':scope > [class*="TabsComponent_tabPanelsContainer"]');
+        if (!container) return null;
+        // A mounted tab strip can briefly have no visible content panel. Do
+        // not project cards into Inventory_items, above the independent queue.
+        return [...container.children].find(panel => panel.matches('[class*="TabPanel_tabPanel"]') &&
+            !panel.hidden && !panel.matches('[class*="TabPanel_hidden"]') && mooncakeIsVisibleElement(panel)) || null;
     }
 
     function mooncakeWarehouseGetActiveRootForMutations() {
@@ -26329,7 +26340,12 @@
                 return;
             }
             const root = mooncakeWarehouseGetLayoutRoot(inventoryRoot);
-            if (!root) return;
+            if (!root) {
+                mooncakeWarehouseRestorePresentation({ keepExternal: true });
+                mooncakeWarehouseRenderNativeNavigation(inventoryRoot);
+                mooncakeWarehousePendingVisibleRender = true;
+                return;
+            }
 
             // Only a root replacement or real responsive-width change needs a
             // native-layout restore. Normal queue/item updates retain the panel,
@@ -27762,8 +27778,8 @@
         return transactionKind === 'buy-listing' ? 'before-tax' : 'after-tax';
     }
 
-    function mooncakeIsCreateOrderModal(modal) {
-        if (!modal || !mooncakeIsVisibleElement(modal)) return false;
+    function mooncakeIsCreateOrderModal(modal, includeHidden = false) {
+        if (!modal || (!includeHidden && !mooncakeIsVisibleElement(modal))) return false;
         const orderType = mooncakeGetOrderModalType(modal);
         if (!orderType) return false;
         const headerText = mooncakeGetOrderModalHeaderText(modal);
@@ -28586,6 +28602,12 @@
     }
 
     function mooncakeEnsureOrderModalEconomics(modal) {
+        // Material listings need the same lifecycle as enhanced equipment.
+        // Bind even while a compact market is hidden or still filling its form;
+        // showing an existing dialog or updating an SVG may not add DOM nodes.
+        if (modal?.matches?.(MOONCAKE_ORDER_MODAL_CONTENT_SELECTOR) || mooncakeIsCreateOrderModal(modal, true)) {
+            mooncakeObserveOrderModal(modal);
+        }
         if (!mooncakeIsCreateOrderModal(modal)) {
             mooncakeRemoveOrderModalEconomicsRows(modal);
             mooncakeRemoveDungeonTokenListingGuide(modal);
@@ -28655,7 +28677,11 @@
         }
         const targetHourlyRow = mooncakeEnsureOrderModalTargetHourlyRow(modal, row);
         mooncakePlaceOrderModalEconomicsRows(modal, row, targetHourlyRow);
+        mooncakeScheduleOrderModalEconomics(modal, true);
+    }
 
+    function mooncakeObserveOrderModal(modal) {
+        if (!modal?.isConnected) return;
         if (!modal.hasAttribute(MOONCAKE_ORDER_MODAL_ATTR)) {
             modal.setAttribute(MOONCAKE_ORDER_MODAL_ATTR, '1');
             const scheduleFromInput = event => {
@@ -28689,26 +28715,35 @@
                 });
                 if (externalChange) mooncakeScheduleOrderModalEconomics(modal);
             });
-            observer.observe(modal, { childList: true, subtree: true, characterData: true });
+            observer.observe(modal, {
+                childList: true, subtree: true, characterData: true, attributes: true,
+                attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'href', 'xlink:href']
+            });
+            // Native compact markets stay mounted when navigation hides them.
+            // Watch only their ancestor visibility, not document-wide attributes.
+            for (let parent = modal.parentElement; parent instanceof Element; parent = parent.parentElement) {
+                observer.observe(parent, {
+                    attributes: true, attributeFilter: ['class', 'style', 'hidden', 'aria-hidden']
+                });
+            }
             mooncakeOrderModalObservers.set(modal, observer);
         }
-        mooncakeScheduleOrderModalEconomics(modal, true);
     }
 
-    function mooncakeFindOrderModalRoots() {
+    function mooncakeFindOrderModalRoots(includeHidden = false) {
         // The compact marketplace can sit inside another dialog. Bind each
         // listing's own content so the outer market's title, item and cleanup
         // cannot suppress or overwrite the inner listing's economics.
         const contents = [...document.querySelectorAll(MOONCAKE_ORDER_MODAL_CONTENT_SELECTOR)]
-            .filter(mooncakeIsVisibleElement);
+            .filter(modal => includeHidden || mooncakeIsVisibleElement(modal));
         const fallbackModals = [...document.querySelectorAll(MOONCAKE_ORDER_MODAL_SELECTOR)]
             .filter(modal => !modal.querySelector(MOONCAKE_ORDER_MODAL_CONTENT_SELECTOR) &&
-                !modal.querySelector(MOONCAKE_ORDER_MODAL_SELECTOR) && mooncakeIsVisibleElement(modal));
+                !modal.querySelector(MOONCAKE_ORDER_MODAL_SELECTOR) && (includeHidden || mooncakeIsVisibleElement(modal)));
         return [...contents, ...fallbackModals];
     }
 
     function mooncakeEnsureVisibleOrderModalEconomics() {
-        for (const modal of mooncakeFindOrderModalRoots()) mooncakeEnsureOrderModalEconomics(modal);
+        for (const modal of mooncakeFindOrderModalRoots(true)) mooncakeEnsureOrderModalEconomics(modal);
     }
 
     function mooncakeScheduleOrderModalScan(delay = 0) {
@@ -39071,7 +39106,10 @@
         if (existingPanel && !existingButton) existingPanel.remove();
 
         const oldTabButtons = tabsContainer.querySelectorAll("button");
-        const oldTabPanels = tabPanelsContainer.querySelectorAll('[class*="TabPanel_tabPanel"]');
+        // Inventory and equipment now contain their own nested native tabs.
+        // Hiding those descendants leaves their `hidden` attributes stuck when
+        // React restores the outer page by changing only its tab-panel class.
+        const oldTabPanels = tabPanelsContainer.querySelectorAll(':scope > [class*="TabPanel_tabPanel"]');
         if (!oldTabButtons.length || !oldTabPanels.length) {
             scheduleEnhancementTabEnsure(500);
             return false;
@@ -44388,7 +44426,7 @@
     function mooncakeCreateSettingsTransferSection() {
         const section = document.createElement('section');
         section.setAttribute('data-mooncake-settings-transfer', '1');
-        Object.assign(section.style, { gridArea: 'transfer', padding: '12px 0', borderBottom: '1px solid rgba(151,166,217,.13)' });
+        Object.assign(section.style, { gridArea: 'transfer', minWidth: '0', padding: '12px 0', borderBottom: '1px solid rgba(151,166,217,.13)' });
         const row = document.createElement('div');
         Object.assign(row.style, { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px 16px' });
         const copy = document.createElement('div');
@@ -45483,7 +45521,7 @@
 
         const style = document.createElement('style');
         style.textContent = `
-            #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-dialog] { width:min(940px,100%); height:min(760px,100%); max-height:100%; display:flex; flex-direction:column; overflow:hidden; box-sizing:border-box; border:1px solid rgba(143,161,222,.34); border-radius:8px; background:#151923; box-shadow:0 24px 76px rgba(0,0,0,.58); }
+            #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-dialog] { width:min(940px,100%); min-width:0; max-width:100%; height:min(760px,100%); max-height:100%; display:flex; flex-direction:column; overflow:hidden; box-sizing:border-box; border:1px solid rgba(143,161,222,.34); border-radius:8px; background:#151923; box-shadow:0 24px 76px rgba(0,0,0,.58); }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-chrome] { flex:0 0 auto; min-width:0; display:grid; grid-template-columns:minmax(0,1fr) 44px; align-items:stretch; padding-left:18px; border-bottom:1px solid rgba(151,166,217,.16); background:#151923; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tablist] { min-width:0; display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:0; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tab] { min-width:0; min-height:44px; cursor:pointer; border:0; border-bottom:2px solid transparent; background:transparent; color:rgba(220,228,248,.62); padding:8px 6px; font:inherit; font-size:12px; font-weight:800; line-height:1.3; letter-spacing:0; overflow-wrap:anywhere; }
@@ -45507,9 +45545,9 @@
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-group] > [data-mooncake-enhancement-settings-section-heading] h3 { flex:0 0 auto; white-space:nowrap; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-group] > [data-mooncake-enhancement-settings-section-heading] p { min-width:0; margin:0; font-size:11px; line-height:1.3; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-rows] { min-width:0; }
-            #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row] { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:12px; min-height:48px; padding:8px 0; border-top:1px solid rgba(151,166,217,.10); box-sizing:border-box; }
+            #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row] { display:grid; min-width:0; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:12px; min-height:48px; padding:8px 0; border-top:1px solid rgba(151,166,217,.10); box-sizing:border-box; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row]:first-child { border-top:0; }
-            #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-copy] { min-width:0; display:grid; gap:2px; }
+            #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-copy] { min-width:0; display:grid; gap:2px; overflow-wrap:anywhere; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-copy] strong { color:rgba(242,246,255,.96); font-size:13px; line-height:1.25; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-copy] small { color:rgba(220,228,248,.60); font-size:11px; line-height:1.36; }
             #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-control] { display:inline-flex; align-items:center; gap:8px; flex:0 0 auto; }
@@ -45765,9 +45803,10 @@
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-easter-egg] { margin:6px 0 0; padding:6px 9px 0; font-size:11px; line-height:1.4; }
             }
             @media (max-width:860px) {
-                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="settings"] { grid-template-columns:1fr; grid-template-areas:"transfer" "market" "listings" "chat" "enhance" "quote"; }
+                /* A bare 1fr track inherits the transfer row's intrinsic width. */
+                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="settings"] { grid-template-columns:minmax(0,1fr); grid-template-areas:"transfer" "market" "listings" "chat" "enhance" "quote"; }
             }
-            @media (max-width:680px) { #better-loot-tracker-config-panel { padding:max(8px,env(safe-area-inset-top)) max(8px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left)) !important; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-dialog] { height:100%; max-height:100%; border-radius:6px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-chrome] { padding-left:8px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tablist] { display:flex; overflow-x:auto; overscroll-behavior-x:contain; scrollbar-width:thin; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tab] { flex:0 0 auto; min-width:104px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel] { padding:0 14px 14px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="archive"] { padding:0; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="settings"] { grid-template-columns:1fr; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-section="wide"] { grid-column:auto; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-field-grid], #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-donation-grid] { grid-template-columns:1fr; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-column-grid] { grid-template-columns:repeat(2,minmax(0,1fr)); } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-virtual-grid] { grid-template-columns:1fr !important; } #better-loot-tracker-config-panel [data-mooncake-order-archive-page-body] { grid-template-columns:1fr; grid-template-rows:minmax(96px,28%) minmax(0,1fr); } #better-loot-tracker-config-panel [data-mooncake-order-archive-page-body][data-mooncake-market-trade-log-page] { grid-template-rows:auto minmax(0,1fr); } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-toolbar] { gap:6px; padding:6px 8px; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-toolbar] strong { display:none; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-stats] { flex:1 1 120px; margin-right:0; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-search] { flex:1 1 150px; width:auto; min-width:0; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-side] { flex:0 0 64px; min-width:64px; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-results] { padding:7px; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-table] { min-width:640px; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-row] { grid-template-columns:112px 48px minmax(130px,1.35fr) 46px 82px 94px; gap:6px; min-height:31px; padding:5px 7px; font-size:11px; } #better-loot-tracker-config-panel [data-mooncake-order-archive-list] { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(136px,42vw); align-content:start; overflow-x:auto; overflow-y:hidden; padding:7px; border-right:0; border-bottom:1px solid rgba(125,151,219,.22); } #better-loot-tracker-config-panel [data-mooncake-order-archive-record] { margin:0 4px 0 0; } }
+            @media (max-width:680px) { #better-loot-tracker-config-panel { padding:max(8px,env(safe-area-inset-top)) max(8px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left)) !important; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-dialog] { height:100%; max-height:100%; border-radius:6px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-chrome] { padding-left:8px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tablist] { display:flex; overflow-x:auto; overscroll-behavior-x:contain; scrollbar-width:thin; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tab] { flex:0 0 auto; min-width:104px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel] { padding:0 14px 14px; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="archive"] { padding:0; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-tabpanel="settings"] { grid-template-columns:minmax(0,1fr); } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-section="wide"] { grid-column:auto; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-field-grid], #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-donation-grid] { grid-template-columns:1fr; } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-column-grid] { grid-template-columns:repeat(2,minmax(0,1fr)); } #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-virtual-grid] { grid-template-columns:1fr !important; } #better-loot-tracker-config-panel [data-mooncake-order-archive-page-body] { grid-template-columns:1fr; grid-template-rows:minmax(96px,28%) minmax(0,1fr); } #better-loot-tracker-config-panel [data-mooncake-order-archive-page-body][data-mooncake-market-trade-log-page] { grid-template-rows:auto minmax(0,1fr); } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-toolbar] { gap:6px; padding:6px 8px; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-toolbar] strong { display:none; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-stats] { flex:1 1 120px; margin-right:0; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-search] { flex:1 1 150px; width:auto; min-width:0; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-side] { flex:0 0 64px; min-width:64px; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-results] { padding:7px; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-table] { min-width:640px; } #better-loot-tracker-config-panel [data-mooncake-market-trade-log-row] { grid-template-columns:112px 48px minmax(130px,1.35fr) 46px 82px 94px; gap:6px; min-height:31px; padding:5px 7px; font-size:11px; } #better-loot-tracker-config-panel [data-mooncake-order-archive-list] { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(136px,42vw); align-content:start; overflow-x:auto; overflow-y:hidden; padding:7px; border-right:0; border-bottom:1px solid rgba(125,151,219,.22); } #better-loot-tracker-config-panel [data-mooncake-order-archive-record] { margin:0 4px 0 0; } }
             @media (max-width:680px) {
                 #better-loot-tracker-config-panel [data-mooncake-market-trade-log-toolbar] { align-items:stretch; }
                 #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter="name"] { flex:1 1 100%; }
@@ -45790,7 +45829,7 @@
                 #better-loot-tracker-config-panel [data-mooncake-order-archive-side-title] { margin-bottom:0 !important; font-size:10px !important; line-height:15px !important; }
                 #better-loot-tracker-config-panel [data-mooncake-order-archive-side-header], #better-loot-tracker-config-panel [data-mooncake-order-archive-side-row] { grid-template-columns:minmax(28px,.64fr) minmax(46px,1fr) minmax(45px,1.02fr) !important; gap:3px !important; min-height:18px !important; padding:2px 0 !important; font-size:10px !important; line-height:14px !important; }
             }
-            @media (max-width:520px) { #better-loot-tracker-config-panel [data-mooncake-hourly-wage-color-profile-popover] { right:auto; left:0; width:min(292px,calc(100vw - 42px)); } }
+            @media (max-width:520px) { #better-loot-tracker-config-panel [data-mooncake-hourly-wage-color-profile-popover] { right:0; left:auto; width:min(292px,calc(100vw - 52px)); } }
             @media (max-width:480px) {
                 #better-loot-tracker-config-panel { padding:max(4px,env(safe-area-inset-top)) max(4px,env(safe-area-inset-right)) max(4px,env(safe-area-inset-bottom)) max(4px,env(safe-area-inset-left)) !important; }
                 #better-loot-tracker-config-panel [data-mooncake-market-trade-log-filter="date-range"] { flex-direction:column; align-items:stretch; }
@@ -45811,7 +45850,8 @@
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-donation-thanks-item] { font-size:11px; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-section] { padding:12px 0; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-easter-egg] { margin-top:12px; padding:8px 6px 2px; font-size:11px; }
-                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-kind="command"], #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-kind="select"] { grid-template-columns:1fr; align-items:stretch; gap:8px; }
+                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-kind="command"], #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-kind="select"], #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-kind="text-input"] { grid-template-columns:minmax(0,1fr); align-items:stretch; gap:8px; }
+                #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-kind="text-input"] [data-mooncake-enhancement-settings-field] { width:100% !important; min-height:42px; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-kind="command"] [data-mooncake-enhancement-settings-command], #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-row-kind="select"] [data-mooncake-enhancement-settings-select] { width:100%; min-height:42px; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-toggle-state] { display:none; }
                 #better-loot-tracker-config-panel [data-mooncake-enhancement-settings-debug] { overflow-x:auto; overscroll-behavior-x:contain; }

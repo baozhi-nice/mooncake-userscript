@@ -15,8 +15,9 @@ function extract(name) {
     do { if (source[position] === '{') depth++; if (source[position] === '}') depth--; position++; } while (depth);
     return source.slice(start, position);
 }
-const constants = source.slice(source.indexOf('    const MOONCAKE_ORDER_MODAL_ATTR ='), source.indexOf('    function mooncakeGetDungeonTokenShopOutputHrid('))
-    .replace(/^.*MOONCAKE_DUNGEON_TOKEN_LISTING_BADGE_IMAGE_SRC.*$/m, '');
+const constants = source.slice(source.indexOf('    const MOONCAKE_ORDER_MODAL_ATTR ='), source.indexOf('    function mooncakeGetDungeonTokenShopOutputHrid('));
+const priceRules = source.slice(source.indexOf('    const MOONCAKE_MARKET_BIN_GAP_UNIT_TIERS'),
+    source.indexOf('    function mooncakeEstimateMarketHistorySideVolumes'));
 const names = [
     'mooncakeIsVisibleElement', 'mooncakeHridFromUseNode', 'mooncakeNormalizeItemIdToHrid', 'parsePriceText',
     'mooncakeGetOrderModalHeaderText', 'mooncakeGetOrderModalTransactionKind', 'mooncakeGetOrderModalType',
@@ -27,12 +28,19 @@ const names = [
     'mooncakeGetOrderModalUnitPrice', 'mooncakeCalculateOrderModalEconomicsAtTaxMode',
     'mooncakeEnsureOrderModalTargetHourlyRow', 'mooncakePlaceOrderModalEconomicsRows', 'mooncakeFormatSignedMoney',
     'mooncakeGetOrderModalEconomicsColor', 'mooncakeSetOrderModalEconomicsUnavailable', 'mooncakeRemoveOrderModalEconomicsRows',
-    'mooncakeRemoveDungeonTokenListingGuide',
+    'mooncakeGetPositivePrice', 'mooncakeIsTraineeCharm', 'mooncakeGetMarketPriceObject',
+    'mooncakeGetMarketAskPrice', 'mooncakeGetMarketBidPrice', 'mooncakeGetDungeonTokenShopOutputHrid',
+    'mooncakeGetDungeonTokenShopOutputCount', 'mooncakeBuildDungeonTokenRedemptionIndex',
+    'mooncakeDungeonTokenRatesEqual', 'mooncakeGetDungeonTokenListingSummary',
+    'mooncakeRemoveDungeonTokenListingGuide', 'mooncakeGetOrderModalItemBadgeTarget',
+    'mooncakePositionDungeonTokenListingBadge', 'mooncakeEnsureDungeonTokenListingBadge',
+    'mooncakeEnsureDungeonTokenListingGuide',
     'mooncakeUpdateOrderModalEconomics', 'mooncakeScheduleOrderModalEconomics', 'mooncakeCleanupOrderModalEconomics',
     'mooncakeCreateOrderModalEconomicsMetric', 'mooncakeEnsureOrderModalEconomics', 'mooncakeFindOrderModalRoots',
     'mooncakeEnsureVisibleOrderModalEconomics', 'mooncakeScheduleOrderModalScan', 'mooncakeRefreshOrderModalEconomics',
     'hookMooncakeOrderModalEconomics'
 ];
+if (source.includes('function mooncakeObserveOrderModal(')) names.push('mooncakeObserveOrderModal');
 const functions = names.map(extract).join('\n');
 if (!process.argv.includes('--serve')) {
     console.log('Use --serve to run the order-modal DOM checks in the browser; --baseline=HEAD compares the published implementation.');
@@ -47,7 +55,17 @@ const isZH=true, currentMarketItem={itemHrid:'/items/background'};
 let mooncakeMarketPricingRevision=1,mooncakeHourlyWageColorProfileRevision=1,calculations=0,posts=0;
 const MOONCAKE_MARKET_SELL_TAX_PERCENT=4,MOONCAKE_MARKET_SELL_NET_FACTOR=.96;
 const MOONCAKE_ORDER_TARGET_HOURLY_MIN_M=0,MOONCAKE_ORDER_TARGET_HOURLY_MAX_M=1000000;
-const getMarketData=()=>({marketData:{}}),getEnhancementRouteObjective=()=>'standard';
+let shopItems,marketQuotes;
+function resetQuotes(){
+ shopItems={
+  '/shop_items/material':{category:'/shop_categories/dungeon',costs:[{itemHrid:'/items/token',count:10}]},
+  '/shop_items/rival':{category:'/shop_categories/dungeon',costs:[{itemHrid:'/items/token',count:5}]}
+ };
+ marketQuotes={'/items/material':{0:{a:10e6,b:9.68e6}},'/items/rival':{0:{a:5e6,b:4.5e6}}};
+}
+resetQuotes();
+const getInitClientData=()=>({shopItemDetailMap:shopItems}),getMarketData=()=>({marketData:marketQuotes}),getEnhancementRouteObjective=()=>'standard';
+const mooncakeIsDungeonTokenListingGuideEnabled=()=>true,getItemName=hrid=>hrid==='/items/rival'?'同系列材料':'地牢材料';
 const mooncakeGetItemDetailOfHrid=hrid=>hrid?.startsWith('/items/')?{}:null;
 const mooncakeIsEnhanceableItem=hrid=>hrid!='/items/material'&&!!hrid;
 const mooncakeParseItemHridFromPanel=()=>'/items/background',mooncakeGetCurrentMarketEnhanceLevel=()=>15;
@@ -56,16 +74,12 @@ function mooncakeCalculateEnhancementRouteAtPrice(hrid,level,data,price){calcula
 const mooncakeEvaluateEnhancementEconomics=()=>({combinedColor:'#a0e0c8'}),mooncakeResolveObjectiveRoutePair=()=>null;
 const mooncakeGetOrderModalTradeOffProtectSuffix=()=>'',mooncakeBuildOrderModalEconomicsTooltip=()=>'<b>测试工时明细</b>';
 const hideTooltip=()=>{};
-function mooncakeEnsureDungeonTokenListingGuide(modal){
- if(mooncakeGetOrderModalItemHrid(modal)!=='/items/material'||mooncakeDungeonTokenListingBadges.has(modal))return;
- const badge=document.createElement('div');badge.setAttribute(MOONCAKE_DUNGEON_TOKEN_LISTING_BADGE_ATTR,'1');
- badge._mooncakeDungeonTokenListingModal=modal;badge.textContent='兑换线';document.body.append(badge);mooncakeDungeonTokenListingBadges.set(modal,badge);
-}
 const bindTooltip=(node,html)=>{node.title=html.replace(/<[^>]+>/g,'')};
 const formatMoney=value=>(value/1e6).toFixed(2)+'M',mooncakeFormatSignedHourlyWage=value=>(value>0?'+':'')+formatMoney(value);
 const mooncakeBindNonNegativeHourlyInput=()=>{},mooncakeGetOrderTargetHourlyM=()=>12;
 function subscribeDocumentMutations(name,callback){const observer=new MutationObserver(callback);observer.observe(document.body,{childList:true,subtree:true});}
 ${constants}
+${priceRules}
 ${functions}
 const host=document.getElementById('fixture'),result=document.getElementById('results');
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -90,7 +104,16 @@ function verify(content,count=2){
  expect(content.querySelectorAll('.mooncake-order-economics-row').length===1,'重复插入工时');
  return economics;
 }
-async function check(name,fn){host.replaceChildren();await pause(100);try{await fn();passed++;result.textContent+='PASS '+name+'\n';}catch(error){failures.push(name+': '+error.message);result.textContent+='FAIL '+name+': '+error.message+'\n';}}
+function verifyGuide(content,label='最优兑换'){
+ const badge=mooncakeDungeonTokenListingBadges.get(content);
+ expect(badge?.isConnected&&mooncakeIsVisibleElement(badge),'地牢材料提示未显示');
+ expect(badge.textContent.includes(label),'兑换状态不正确');
+ const rect=badge.getBoundingClientRect(),bounds=content.getBoundingClientRect();
+ expect(rect.left>=bounds.left&&rect.right<=bounds.right,'提示超出挂牌弹窗');
+ expect(document.querySelectorAll('[data-mooncake-dungeon-token-listing-badge]').length===1,'重复提示');
+ return badge;
+}
+async function check(name,fn){host.replaceChildren();await pause(100);resetQuotes();try{await fn();passed++;result.textContent+='PASS '+name+'\n';}catch(error){failures.push(name+': '+error.message);result.textContent+='FAIL '+name+': '+error.message+'\n';}}
 async function run(){document.getElementById('run').disabled=true;result.textContent='';passed=0;failures.length=0;
  await check('普通市场购买挂牌',async()=>{const content=listing();host.append(wrap(content));await pause(350);verify(content);expect(content.querySelector('[data-mooncake-order-hourly]').textContent==='+1.16M','价格或物品错误');});
  await check('原生双层市场与出售挂牌',async()=>{const content=listing({title:'出售挂牌'});host.append(market(content));await pause(350);verify(content,1);});
@@ -105,7 +128,39 @@ async function run(){document.getElementById('run').disabled=true;result.textCon
  await check('立即买卖弹窗仍显示对应工时',async()=>{const buy=listing({title:'立即购买'}),sell=listing({title:'立即出售'});host.append(market(buy),wrap(sell));await pause(350);verify(buy);verify(sell,1);});
  await check('旧版无独立内容容器的挂牌兼容',async()=>{const content=listing();content.className='order';host.append(wrap(content));await pause(350);verify(content);});
  await check('材料不显示强化信息，关闭时清理兑换线',async()=>{const content=listing({hrid:'material',level:0});host.append(market(content));await pause(350);expect(!content.querySelector('.mooncake-order-economics-row'),'给材料显示强化工时');expect(document.querySelector('[data-mooncake-dungeon-token-listing-badge]'),'兑换线未创建');content.parentElement.remove();await pause(200);expect(!document.querySelector('[data-mooncake-dungeon-token-listing-badge]'),'关闭后残留兑换线');expect(posts===0,'插件触发了发布操作');});
- host.replaceChildren(market(listing()));await pause(350);document.getElementById('run').disabled=false;
+ await check('仓库打开的嵌套市场延迟显示后补上最优兑换',async()=>{
+  const content=listing({hrid:'material',level:0}),warehouse=wrap(market(content));warehouse.style.display='none';
+  host.append(warehouse);await pause(350);expect(!document.querySelector('[data-mooncake-dungeon-token-listing-badge]'),'隐藏窗口出现提示');
+  warehouse.style.removeProperty('display');await pause(350);verifyGuide(content);
+ });
+ await check('材料图标异步更新后重新识别物品',async()=>{
+  const content=listing({hrid:'unrelated',level:0});host.append(market(content));await pause(350);
+  content.querySelector('use').setAttribute('href','/items.svg#material');await pause(350);verifyGuide(content);
+ });
+ await check('材料挂牌标题文字晚到时补上提示',async()=>{
+  const content=listing({title:'正在打开',hrid:'material',level:0});host.append(market(content));await pause(350);
+  content.querySelector('[class*="MarketplacePanel_header"]').firstChild.nodeValue='购买挂牌';await pause(350);verifyGuide(content);
+ });
+ await check('材料弹窗隐藏、复用和更换物品后正确清理与恢复',async()=>{
+  const content=listing({hrid:'material',level:0}),warehouse=wrap(market(content));host.append(warehouse);await pause(350);verifyGuide(content);
+  warehouse.hidden=true;await pause(350);expect(!document.querySelector('[data-mooncake-dungeon-token-listing-badge]'),'隐藏后残留提示');
+  warehouse.hidden=false;await pause(350);verifyGuide(content);
+  content.querySelector('use').setAttribute('href','/items.svg#unrelated');await pause(350);expect(!document.querySelector('[data-mooncake-dungeon-token-listing-badge]'),'更换普通材料后残留提示');
+  content.querySelector('use').setAttribute('href','/items.svg#material');await pause(350);verifyGuide(content);
+ });
+ await check('兑换数据和报价延迟到达后更新最优状态',async()=>{
+  const content=listing({hrid:'material',level:0});shopItems=null;marketQuotes={};host.append(market(content));await pause(350);
+  expect(!document.querySelector('[data-mooncake-dungeon-token-listing-badge]'),'缺数据时显示了虚构提示');
+  resetQuotes();mooncakeRefreshOrderModalEconomics();await pause(350);const badge=verifyGuide(content);
+  marketQuotes['/items/rival'][0].b=5e6;mooncakeRefreshOrderModalEconomics();await pause(350);verifyGuide(content,'兑换线');
+  marketQuotes['/items/rival'][0].b=4.5e6;mooncakeRefreshOrderModalEconomics();await pause(350);expect(verifyGuide(content)===badge,'行情更新反复重建提示');
+ });
+ await check('材料提示不会触发重复扫描或提交挂牌',async()=>{
+  const content=listing({hrid:'material',level:0});host.append(market(content));await pause(350);const badge=verifyGuide(content);
+  let mutations=0;const observer=new MutationObserver(records=>mutations+=records.length);observer.observe(badge,{childList:true,subtree:true,attributes:true});
+  await pause(600);observer.disconnect();expect(mutations===0,'提示自身变化触发更新循环');expect(posts===0,'触发了挂牌提交');
+ });
+ host.replaceChildren(market(listing({hrid:'material',level:0})));await pause(350);document.getElementById('run').disabled=false;
  result.textContent+='\n'+(failures.length?'FAIL '+failures.length:'PASS ALL '+passed);}
 document.getElementById('run').onclick=run;hookMooncakeOrderModalEconomics();host.append(market(listing()));
 })();</script></html>`;
