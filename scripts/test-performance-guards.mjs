@@ -33,6 +33,9 @@ function extractFunction(name) {
 
 const orderBookScheduler = extractFunction('scheduleMarketplaceOrderBookHourlyWageRefresh');
 const orderBookSandbox = {
+    document: { hidden: false, addEventListener() {} },
+    mooncakeVisibleRefreshes: new Map(),
+    mooncakeVisibleRefreshListenerStarted: false,
     mooncakeMarketplacePricingSurfaceState: false,
     _pendingOrderBookRaf: null,
     scheduledFrames: 0
@@ -42,6 +45,8 @@ vm.runInNewContext(`
         globalThis.scheduledFrames += 1;
         return 1;
     };
+    ${extractFunction('mooncakeDeferVisibleRefresh')}
+    ${extractFunction('mooncakeFlushVisibleRefreshes')}
     ${orderBookScheduler}
     globalThis.scheduleOrderBook = scheduleMarketplaceOrderBookHourlyWageRefresh;
 `, orderBookSandbox);
@@ -49,6 +54,13 @@ orderBookSandbox.scheduleOrderBook();
 assert.equal(orderBookSandbox.scheduledFrames, 0, 'a hidden marketplace must not enqueue background order-book work');
 orderBookSandbox.scheduleOrderBook({ force: true });
 assert.equal(orderBookSandbox.scheduledFrames, 1, 'a native market mutation must still force one order-book verification');
+orderBookSandbox._pendingOrderBookRaf = null;
+orderBookSandbox.document.hidden = true;
+orderBookSandbox.scheduleOrderBook({ force: true });
+assert.equal(orderBookSandbox.scheduledFrames, 1, 'hidden pages defer even forced presentation work');
+orderBookSandbox.document.hidden = false;
+orderBookSandbox.mooncakeFlushVisibleRefreshes();
+assert.equal(orderBookSandbox.scheduledFrames, 2, 'resume must recheck a market even when the old surface flag is false');
 
 const warehouseActiveRoot = extractFunction('mooncakeWarehouseGetActiveRootForMutations');
 const visibleRoot = { isConnected: true };

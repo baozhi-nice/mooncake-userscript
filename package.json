@@ -5,6 +5,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "check": "node scripts/build.mjs --check",
+    "test:performance-scheduling": "node scripts/test-performance-scheduling.mjs",
     "test:anti-suicide": "node scripts/test-anti-suicide-system.mjs",
     "test:my-listing-types": "node scripts/test-my-listing-types.mjs",
     "test:my-listings-hourly": "node scripts/test-my-listings-hourly.mjs",
@@ -12,6 +13,7 @@
     "test:settings-layout": "node scripts/test-settings-layout.mjs",
     "test:market-summary": "node scripts/test-market-summary-hourly-resilience.mjs",
     "test:market-volume-rate": "node scripts/test-market-history-volume-rate.mjs",
+    "test:market-listing-age": "node scripts/test-market-listing-age-resilience.mjs",
     "test:market-card-layout": "node scripts/test-market-history-card-layout.mjs",
     "test:personal-trades": "node scripts/test-market-personal-trade-history.mjs",
     "test:market-trades": "node scripts/test-market-trade-log.mjs",

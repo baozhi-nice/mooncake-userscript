@@ -66,10 +66,12 @@ if (process.argv.includes('--serve')) {
         return testedSource.slice(start, position);
     }
     const names = [
+        'mooncakeDeferVisibleRefresh', 'mooncakeFlushVisibleRefreshes',
         'mooncakeIsVisibleElement', 'mooncakeIsMarketplaceModalDescendant', 'extractItemHridFromElement', 'parsePriceText',
         'mooncakeGetVisibleMarketplaceSummaryTable', 'mooncakeGetMarketplaceSummaryItemHrid',
         'mooncakeMarketplaceSummaryMutationNeedsRefresh', 'mooncakeObserveMarketplaceSummaryPrices',
         'mooncakeHasVisibleMarketplacePricingSurface', 'scheduleMarketplaceSummaryHourlyWageRefresh', 'hookEnhancementDetailTable',
+        'mooncakeMarketplaceOrderBookMutationNeedsRefresh',
         'mooncakeGetMarketplaceSummaryCellKind', 'mooncakeGetMarketplaceSummaryNativeCell',
         'mooncakeCreateMarketplaceSummaryHourlyWageCell', 'mooncakeEnsureMarketplaceSummaryHourlyWageHeaders',
         'mooncakeRenderMarketplaceSummaryHourlyWagePlaceholders', 'mooncakeClearMarketplaceSummaryHourlyWageDataRetry',
@@ -114,6 +116,9 @@ if (process.argv.includes('--serve')) {
     const bindTooltip=(node,content)=>{node._mooncakeTooltipHtml=content},buildTooltipHtml=()=>'';
     const mooncakeRenderLevelZeroMarketComparisonCell=node=>node.textContent='0',mooncakeRenderMarketplaceInlineLevelZeroMetric=noop;
     const subscriptions=new Map();
+    const mooncakeVisibleRefreshes=new Map();let mooncakeVisibleRefreshListenerStarted=false;
+    let fixtureHidden=false;Object.defineProperty(document,'hidden',{configurable:true,get:()=>fixtureHidden});
+    function setHidden(value){fixtureHidden=value;document.dispatchEvent(new Event('visibilitychange'))}
     new MutationObserver(mutations=>{for(const callback of subscriptions.values())callback(mutations)}).observe(document.body,{childList:true,subtree:true});
     function subscribeDocumentMutations(name,callback){subscriptions.set(name,callback);return ()=>subscriptions.delete(name)}
     ${names.map(extract).join('\n')}
@@ -130,6 +135,7 @@ if (process.argv.includes('--serve')) {
       await check('隐藏旧表格不能挡住当前表格',async()=>{const hidden=panel('equipment_b');hidden.id='hidden';stage.append(hidden);mount();await wait(180);complete();expect(!hidden.querySelector('[data-mooncake-summary-hourly-cell]'),'修改了隐藏表格')});
       await check('顶部预览滞后；用表格自己的装备计算',async()=>{const root=mount().parentElement;const preview=document.createElement('div');preview.className='MarketplacePanel_currentItem__fixture';preview.innerHTML='<svg><use href="#equipment_b"></use></svg>';root.prepend(preview);await wait(180);complete();expect(table().querySelector('.sell-hourly-wage-cell').textContent==='17.60M/h','采用了别的装备成本')});
       await check('价格文本原地改变后自动重算',async()=>{mount();addPreview();await wait(180);complete();const price=table().querySelector('.MarketplacePanel_price__fixture');price.firstChild.nodeValue='200M';await wait(180);complete();expect(table().querySelector('.sell-hourly-wage-cell').textContent==='92.00M/h','没有观察到文本更新')});
+      await check('页面隐藏暂停重算，返回后恢复最新工时',async()=>{mount();addPreview();await wait(200);const count=calls;setHidden(true);table().querySelector('.MarketplacePanel_price__fixture').firstChild.nodeValue='200M';scheduleMarketplaceSummaryHourlyWageRefresh({force:true});await wait(160);expect(calls===count,'隐藏期间仍在计算');setHidden(false);await wait(200);complete();expect(table().querySelector('.sell-hourly-wage-cell').textContent==='92.00M/h','返回后没有使用最新价格')});
       await check('计算中切换物品且复用行',async()=>{warmDelay=100;mount();addPreview();await wait(40);for(const use of stage.querySelectorAll('use'))use.setAttribute('href','#equipment_b');await wait(320);complete();expect(table().querySelector('.sell-hourly-wage-cell').textContent==='37.60M/h','旧结果覆盖了新物品')});
       await check('行情延迟到达；保留表头并自动恢复',async()=>{available=false;mount();addPreview();await wait(90);expect(table().querySelectorAll('thead [data-mooncake-summary-hourly-cell]').length===2,'等待行情时表头消失');available=true;await wait(730);complete()});
       await check('原生表头和行重建',async()=>{mount();addPreview();await wait(180);complete();const replacement=panel().querySelector('table');table().replaceChildren(...replacement.childNodes);await wait(180);complete()});

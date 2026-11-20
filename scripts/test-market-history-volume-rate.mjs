@@ -13,7 +13,8 @@ const extract = name => {
 };
 const dataNames = ['mooncakeGetMarketHistoryHourlyVolume', 'processMarketHistory',
     'mooncakeAttachMarketHistoryTimeline', 'mooncakeFormatCompactNumber',
-    'mooncakeFormatMarketHistoryHourlyVolume', 'mooncakeBuildMarketHistoryHourlyVolumeTooltip'];
+    'mooncakeFormatMarketHistoryHourlyVolume', 'mooncakeBuildMarketHistoryHourlyVolumeTooltip',
+    'mooncakeIsMarketHistoryCacheFresh'];
 const uiNames = ['mooncakeIsMarketHistoryEquipmentTarget', 'mooncakeBuildMarketHistoryOrderValue',
     'mooncakeBuildCompactMarketHistoryColGroup', 'mooncakeBuildMarketHistoryRows',
     'mooncakeBuildMarketHistoryHourlyRange', 'mooncakeBuildMarketHistoryMedianTitle',
@@ -31,6 +32,7 @@ const context = vm.createContext({
     console, URLSearchParams, AbortController, setTimeout, clearTimeout,
     Date: class extends Date { static now() { return now; } },
     MOONCAKE_MARKET_HISTORY_WINDOWS: [1, 3, 7],
+    MOONCAKE_MARKET_HISTORY_TTL: 5 * 60 * 1000,
     MOONCAKE_MARKET_HISTORY_FLOAT_SELECTOR: '[data-mooncake-history-floating="1"]',
     isZH: true,
     mooncakeGetMarketHistoryPriceStats: () => ({ minPrice: 519, maxPrice: 521, medianPrice: 520, timeline: [] }),
@@ -58,7 +60,14 @@ assert.equal(format(rate(sparse).hourlyVolume), '0.008', 'rare trades must not r
 assert.equal(format(rate(hourlyRows(0)).hourlyVolume), '0');
 assert.equal(format(rate([]).hourlyVolume), '—', 'missing data is different from observed zero volume');
 assert.equal(rate(full.filter((_, i) => i !== 67)).complete, false, 'a missing middle hour is not silently counted as zero');
-assert.equal(rate(full.slice(1)).complete, false, 'stale data cannot claim a complete rolling window');
+assert.equal(rate(full.slice(1)).hourlyVolume, 8400, 'one late sample must not hide the last complete five-day window');
+assert.equal(rate(full.slice(1)).endTime, full[1].time * 1000, 'the displayed cutoff stays at the actual latest sample');
+assert.equal(rate(full.slice(3)).hourlyVolume, 8400, 'multiple delayed samples retain a dated complete window');
+assert.equal(rate(full.slice(1).filter((_, i) => i !== 67)).complete, false,
+    'a delayed endpoint must not conceal a genuine middle-hour gap');
+const jittered = full.map((row, i) => ({ ...row, time: row.time + (i % 2 ? -90 : 30) }));
+assert.equal(rate(jittered).hourlyVolume, 8400, 'sampling jitter within a calendar hour must not create missing hours');
+assert.equal(rate([...full].reverse()).hourlyVolume, 8400, 'the API need not return points in order');
 assert.equal(rate(full.slice(0, 24)).complete, false, 'one day cannot be projected into a five-day rate');
 assert.equal(rate([...full, ...full]).volume, 1008000, 'duplicate snapshots must not double volume');
 assert.equal(rate([...full, { ...full[0], time: full[0].time + 30, v: 8500 }]).volume, 1008100,
@@ -88,6 +97,19 @@ assert.match(context.mooncakeBuildMarketHistoryCardHtml('/items/milk', 0, null, 
 assert.match(context.mooncakeBuildMarketHistoryCardHtml('/items/milk', 0, context.processMarketHistory(hourlyRows(0)), '无交易记录'), />0</);
 assert.match(context.mooncakeBuildMarketHistoryHourlyVolumeTooltip(enriched), /1,008,000/);
 assert.match(context.mooncakeBuildMarketHistoryHourlyVolumeTooltip(enriched), /120 小时/);
+assert.match(context.mooncakeBuildMarketHistoryHourlyVolumeTooltip(enriched), /数据截至：/);
+assert.match(context.mooncakeBuildMarketHistoryHourlyVolumeTooltip({ hourlyVolume5d: rate(full.slice(3)) }), /行情更新延迟/);
+assert.match(context.mooncakeBuildMarketHistoryHourlyVolumeTooltip({ hourlyVolume5d: rate(full.filter((_, i) => i !== 67)) }), /119\/120/);
+const fresh = context.mooncakeIsMarketHistoryCacheFresh;
+assert.equal(fresh({ timestamp: now, windows: enriched }, now + 299999), true);
+assert.equal(fresh({ timestamp: now, windows: enriched }, now + 300000), false);
+const incomplete = { hourlyVolume5d: rate(full.slice(0, 24)) };
+assert.equal(fresh({ timestamp: now, windows: incomplete }, now + 29999), true);
+assert.equal(fresh({ timestamp: now, windows: incomplete }, now + 30000), false,
+    'incomplete history must not remain a five-minute cache hit');
+assert.equal(fresh({ timestamp: now, windows: { hourlyVolume5d: { complete: true } } }), false,
+    'cached browser-clock calculations must be invalidated after upgrade');
+assert.equal(fresh({ timestamp: now + 1, windows: enriched }), false, 'clock rollback must not extend cache lifetime');
 
 // Run the real fetch path against a local response and then its warm cache.
 let requests = 0;
@@ -122,12 +144,13 @@ if (process.argv.includes('--live')) {
         pako: { inflateRaw: inflateRawSync, inflate: inflateSync, ungzip: gunzipSync } });
     vm.runInContext(extract('mooncakeReadJsonResponse') + '\n' + extract('mooncakeGetMarketHistoryHourlyVolume'), live);
     const endpoint = source.match(/const MOONCAKE_MARKET_HISTORY_API = '([^']+)'/)[1];
-    const response = await fetch(endpoint + '?item_id=%2Fitems%2Fmilk&variant=0&days=7', { signal: AbortSignal.timeout(8000) });
+    const itemHrid = process.argv.find(arg => arg.startsWith('--item='))?.slice(7) || '/items/milk';
+    const response = await fetch(endpoint + '?item_id=' + encodeURIComponent(itemHrid) + '&variant=0&days=7', { signal: AbortSignal.timeout(8000) });
     assert(response.ok, `API status ${response.status}`);
     const json = await live.mooncakeReadJsonResponse(response);
-    const actual = live.mooncakeGetMarketHistoryHourlyVolume(json['/items/milk'][0]);
+    const actual = live.mooncakeGetMarketHistoryHourlyVolume(json[itemHrid][0]);
     assert(actual.complete, 'live response supplies all 120 hourly buckets');
-    console.log(`Live milk sample: ${actual.coveredHours} hours, ${actual.volume} units, ${format(actual.hourlyVolume)} /h.`);
+    console.log(`Live ${itemHrid} sample: ${actual.coveredHours} hours, ${actual.volume} units, ${format(actual.hourlyVolume)} /h; as of ${new Date(actual.endTime).toISOString()}.`);
 }
 
 if (process.argv.includes('--serve')) {

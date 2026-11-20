@@ -33,6 +33,7 @@ if (process.argv.includes('--serve')) {
     assert(start >= 0 && end > start, 'official listing price renderer must be available');
     const nativePriceRenderer = bundle.slice(start, end);
     const functions = [
+        'mooncakeDeferVisibleRefresh', 'mooncakeFlushVisibleRefreshes', 'hookMooncakeMyListingsDocumentObserver',
         'mooncakeResolveMyListingSideText', 'mooncakeResolveMyListingSellSide', 'mooncakeResolveMyListingBooleanText',
         'mooncakeResolveMyListingActiveStatus', 'mooncakeNormalizeMyListingId', 'mooncakeReadMyListingFromFiber',
         'mooncakeReadMyListingProgress', 'mooncakeReadMyListingFromDom', 'mooncakeGetMyListingRowDescriptor',
@@ -53,6 +54,10 @@ if (process.argv.includes('--serve')) {
     <script src="/react.js"></script><script src="/react-dom.js"></script><script>
     ${constants}
     ${globals}
+    const mooncakeVisibleRefreshes=new Map();let mooncakeVisibleRefreshListenerStarted=false;
+    let fixtureHidden=false;Object.defineProperty(document,'hidden',{configurable:true,get:()=>fixtureHidden});
+    function setHidden(value){fixtureHidden=value;document.dispatchEvent(new Event('visibilitychange'))}
+    let mooncakeMyListingsDocumentObserverStarted=false,mooncakeMyListingsTargetFilterHooked=false,mooncakeMyListingsManagementHooked=false;
     const isZH=true, h={jsx:(type,props)=>React.createElement(type,props),jsxs:(type,props)=>React.createElement(type,props,...props.children)};
     const im={a:{rangeLimitedPrice:'MarketplacePanel_rangeLimitedPrice__fixture',rangeLimitedMarker:'MarketplacePanel_rangeLimitedMarker__fixture'}};
     const br={getBookPrice:e=>e.workingPrice||e.price,isPegged:e=>e.workingPrice>0,MarketListingStatuses:{Active:'/market_listing_status/active'}};
@@ -129,6 +134,13 @@ if (process.argv.includes('--serve')) {
           expect(!predicate({type:'childList',target:own,addedNodes:[own.firstChild],removedNodes:[]}), 'wage update retriggered listing filters');
         }
         pass('异步切换、关闭重开、观察器清理；不触发挂牌筛选循环');
+        const visibleMetric=metric(1).textContent, visibleCalls=calls;
+        setHidden(true);data[0].price=2400e6;render();mooncakeScheduleMyListingsHourlyWages();await settled();
+        expect(calls===visibleCalls&&metric(1).textContent===visibleMetric,'hidden listing work was not paused');
+        setHidden(false);await settled();
+        expect(metric(1)?.textContent==='工时:+80.40M','resume did not use the latest native price');
+        expect(getRow(1).querySelectorAll('[data-mooncake-my-listing-hourly]').length===1,'resume duplicated the wage');
+        pass('页面隐藏期间暂停计算，返回后使用最新价格且不重复渲染');
         document.getElementById('result').textContent='PASS\n'+checks.join('\n');
       } catch(error){document.getElementById('result').textContent='FAIL: '+error.message;console.error(error)}
     }

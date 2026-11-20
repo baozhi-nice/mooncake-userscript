@@ -13,6 +13,7 @@
 `dist/mooncake.user.js` 必须提交到 `main`。其大小会在构建时校验，避免超过 Greasy Fork 的 2 MiB 发布上限。
 
 背包相关检查可运行 `pnpm test:warehouse-native-queue`、`pnpm test:warehouse-queue`、`pnpm test:warehouse-tabs`、`pnpm test:warehouse-performance` 和 `pnpm test:warehouse-relayout`。
+性能调度检查运行 `pnpm test:performance-scheduling`：验证相同强化参数的并发预热共享、部分重叠任务、超时和 Worker 失败后的回退，以及计算数值不变；同时检查挂牌页面变化的合并判断、隐藏时暂停显示任务和恢复时使用最新数据。后台 WebSocket、交易记录与行情缓存继续更新。
 浏览器交互检查使用 `pnpm test:warehouse-scroll <游戏官方 main.*.chunk.js 的本地路径>`，打开输出的本地地址，运行布局和队列交互检查。该页面提取官方物品组件，使用测试数据和操作回调，不连接游戏账号。React 开发依赖仅用于此测试页面，发布脚本复用游戏已加载的组件和渲染器。
 
 库存空格回归检查使用 `pnpm test:warehouse-visibility <游戏官方 main.*.chunk.js 的本地路径>`，覆盖连续强化、库存排序、分区归属与恢复原生布局；加 `--baseline=HEAD` 可与已提交版本对照。
@@ -22,6 +23,10 @@
 挂牌弹窗检查运行 `node scripts/test-order-modal-scope.mjs --serve`，打开输出地址后点击“运行弹窗检查”；覆盖嵌套市场、异步表单、改价、关闭重开，以及材料弹窗延迟显示、复用、图标更新和行情到达时的最优兑换提示。检查使用正式兑换计算与提示代码，同时验证隐藏或关闭时清理、无重复更新和不提交挂牌。加 `--baseline=HEAD` 可用已提交版本进行对照，测试不连接游戏账号。
 
 交易卡片布局检查运行 `pnpm test:market-card-layout`，打开输出地址并点击检查按钮；覆盖装备与材料、买/卖列开关、长数值、浮动卡片与窗口边界。可调整浏览器宽度检查窄屏滚动。
+
+材料的“5d 时均量”按行情最新采样所覆盖的连续 120 个小时计算，提示中显示数据截止时间；最新一小时延迟不会清空上一段完整统计。真正缺失的小时或无效成交量仍显示数据不足，并列出已覆盖小时数。旧算法缓存会失效，数据不完整时的缓存有效期缩短为 30 秒。运行 `pnpm test:market-volume-rate` 验证计算与缓存；可加 `--live --item=/items/kraken_fang` 核对克拉肯之牙的公开行情。
+
+挂单时长恢复检查运行 `pnpm test:market-listing-age --serve`，在输出地址点击检查按钮；覆盖整块市场挂载、隐藏面板切换、弹出市场优先、物品/等级复用、缺数据占位、窄屏、开关与观察器回收。使用正式刷新和列渲染代码及固定测试挂单，不连接游戏账号；加 `--baseline=HEAD` 可与已提交版本对照。
 
 地下城材料显示“最优兑换”时，图片与文字共用发光边框，按“临界值 ≤ 价格 / 由【接替材料】取代”提示降价后的变化，鼠标悬停可看完整说明。提示限制在挂牌弹窗内；临界值是失去最优的最高有效挂牌价，并列仍算最优，保护之镜上限不参与此临界值计算。比较依据为市场买一，其他材料没有收购报价时显示缺少报价。运行 `pnpm test:dungeon-token-guide` 检查兑换比例、并列和价格档位；加 `--serve` 可验证弹窗显示和报价更新。
 

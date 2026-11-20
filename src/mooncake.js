@@ -1081,6 +1081,35 @@
         return () => documentMutationSubscribers.delete(name);
     }
 
+    // Only presentation work opts in. WebSocket state, trade records, market
+    // caches and action/protection handling continue while the page is hidden.
+    const mooncakeVisibleRefreshes = new Map();
+    let mooncakeVisibleRefreshListenerStarted = false;
+
+    function mooncakeFlushVisibleRefreshes() {
+        if (document.hidden) return;
+        const pending = [...mooncakeVisibleRefreshes];
+        mooncakeVisibleRefreshes.clear();
+        for (const [key, refresh] of pending) {
+            if (mooncakeDeferVisibleRefresh(key, refresh)) continue;
+            try { refresh(); }
+            catch (error) { console.error(`[MoonCake] Visible refresh failed: ${key}`, error); }
+        }
+    }
+
+    function mooncakeDeferVisibleRefresh(key, refresh) {
+        if (!document.hidden) {
+            mooncakeVisibleRefreshes.delete(key);
+            return false;
+        }
+        mooncakeVisibleRefreshes.set(key, refresh);
+        if (!mooncakeVisibleRefreshListenerStarted) {
+            mooncakeVisibleRefreshListenerStarted = true;
+            document.addEventListener('visibilitychange', mooncakeFlushVisibleRefreshes);
+        }
+        return true;
+    }
+
     // ======================
     // 行动队列：设为下一次
     // ======================
@@ -12942,6 +12971,7 @@
     let enhancelateWorkerDisabled = false;
     let enhancelateWorkerRequestId = 0;
     const enhancelateWorkerPending = new Map();
+    const enhancelateWorkerInFlight = new Map();
 
     function enhancelateWorkerMain() {
         function invert(matrix) {
@@ -13104,34 +13134,57 @@
         const playerParams = getPlayerEnhanceParams();
         const includeExact = !!options.includeExact && !!playerParams.tea_blessed;
         const jobs = [];
+        const waiting = new Set();
+        const enqueue = job => {
+            const pending = enhancelateWorkerInFlight.get(job.key);
+            if (pending) waiting.add(pending);
+            else jobs.push(job);
+        };
         for (const stopAt of [...new Set(targetLevels)].filter(level => level > 0)) {
             const startProtect = stopAt === 1 ? 1 : 2;
             for (let protectAt = startProtect; protectAt <= stopAt; protectAt++) {
                 const key = buildEnhancelateCacheKey(itemHrid, stopAt, protectAt, itemLevel, totalSkillLevel, playerParams);
-                if (!enhancelateCache.has(key)) jobs.push({ key, stopAt, protectAt });
+                if (!enhancelateCache.has(key)) enqueue({ key, stopAt, protectAt });
                 const exactKey = `exact:${key}`;
                 if (includeExact && !mooncakeExactEnhancelateCache.has(exactKey)) {
-                    jobs.push({ key: exactKey, stopAt, protectAt, exact: true });
+                    enqueue({ key: exactKey, stopAt, protectAt, exact: true });
                 }
             }
         }
-        if (!jobs.length) return Promise.resolve(true);
-        return new Promise(resolve => {
+        if (jobs.length) {
+            let resolveBatch;
+            const batch = new Promise(resolve => { resolveBatch = resolve; });
+            waiting.add(batch);
+            // Register before posting so another surface can join this work,
+            // including partially overlapping sets of target/protection levels.
+            for (const job of jobs) enhancelateWorkerInFlight.set(job.key, batch);
             const requestId = ++enhancelateWorkerRequestId;
             const timeout = setTimeout(() => {
-                if (!enhancelateWorkerPending.delete(requestId)) return;
-                resolve(false);
+                const pending = enhancelateWorkerPending.get(requestId);
+                if (!pending) return;
+                enhancelateWorkerPending.delete(requestId);
+                pending(false);
             }, 5000);
             enhancelateWorkerPending.set(requestId, success => {
                 clearTimeout(timeout);
-                resolve(success);
+                for (const job of jobs) {
+                    if (enhancelateWorkerInFlight.get(job.key) === batch) enhancelateWorkerInFlight.delete(job.key);
+                }
+                resolveBatch(success);
             });
-            worker.postMessage({
-                requestId,
-                jobs,
-                context: { itemLevel, totalSkillLevel, playerParams, successRates: SUCCESS_RATE }
-            });
-        });
+            try {
+                worker.postMessage({
+                    requestId,
+                    jobs,
+                    context: { itemLevel, totalSkillLevel, playerParams, successRates: SUCCESS_RATE }
+                });
+            } catch (_) {
+                const pending = enhancelateWorkerPending.get(requestId);
+                enhancelateWorkerPending.delete(requestId);
+                pending?.(false);
+            }
+        }
+        return Promise.all([...waiting]).then(results => results.every(Boolean));
     }
 
     // 计算期望强化次数和保护次数
@@ -17013,6 +17066,7 @@
     }
 
     function processLootLogs(options = {}) {
+        if (mooncakeDeferVisibleRefresh('loot-log', () => processLootLogs({ force: true }))) return;
         const force = !!options.force;
 
         const marketData = getMarketData();
@@ -17152,6 +17206,9 @@
     // 用于去抖的变量
     let _pendingOrderBookRaf = null;
     let _pendingOrderBookResizeTimer = 0;
+    const mooncakeOrderBookObservers = new Map();
+    const mooncakeOrderBookRetryStates = new WeakMap();
+    const MOONCAKE_ORDER_BOOK_RETRY_DELAYS = [140, 480, 1400];
     let _pendingSummaryRaf = null;
     let mooncakeSummaryPriceObserver = null;
     let mooncakeSummaryObservedTable = null;
@@ -18861,7 +18918,7 @@
         try {
             const now = Date.now();
             const entries = Object.entries(cache || {})
-                .filter(([, entry]) => now - (entry?.timestamp || 0) < MOONCAKE_MARKET_HISTORY_TTL)
+                .filter(([, entry]) => mooncakeIsMarketHistoryCacheFresh(entry, now))
                 .sort((a, b) => (b[1]?.timestamp || 0) - (a[1]?.timestamp || 0))
                 .slice(0, MOONCAKE_MARKET_HISTORY_MAX_ENTRIES);
             localStorage.setItem(MOONCAKE_MARKET_HISTORY_CACHE_KEY, JSON.stringify(Object.fromEntries(entries)));
@@ -18872,10 +18929,20 @@
         return `${itemHrid}|${variant}`;
     }
 
+    function mooncakeIsMarketHistoryCacheFresh(entry, now = Date.now()) {
+        const rate = entry?.windows?.hourlyVolume5d;
+        // Discard the old browser-clock window after upgrading. A genuinely
+        // incomplete response should be retried sooner than a complete one.
+        if (rate?.windowMode !== 'latest-hour') return false;
+        const ttl = rate.complete ? MOONCAKE_MARKET_HISTORY_TTL : 30 * 1000;
+        const age = now - Number(entry.timestamp);
+        return Number.isFinite(age) && age >= 0 && age < ttl;
+    }
+
     function mooncakeGetCachedMarketHistory(itemHrid, variant, readPersistentCache = mooncakeReadMarketHistoryCache) {
         const key = mooncakeMarketHistoryCacheKey(itemHrid, variant);
         const memory = MOONCAKE_MARKET_HISTORY_MEMORY_CACHE.get(key);
-        if (memory && Date.now() - memory.timestamp < MOONCAKE_MARKET_HISTORY_TTL && memory.windows) {
+        if (mooncakeIsMarketHistoryCacheFresh(memory)) {
             mooncakeSetBoundedMapEntry(
                 MOONCAKE_MARKET_HISTORY_MEMORY_CACHE,
                 key,
@@ -18887,7 +18954,7 @@
         if (memory) MOONCAKE_MARKET_HISTORY_MEMORY_CACHE.delete(key);
         const cache = readPersistentCache();
         const stored = cache[key];
-        if (stored && Date.now() - stored.timestamp < MOONCAKE_MARKET_HISTORY_TTL && stored.windows) {
+        if (mooncakeIsMarketHistoryCacheFresh(stored)) {
             mooncakeSetBoundedMapEntry(
                 MOONCAKE_MARKET_HISTORY_MEMORY_CACHE,
                 key,
@@ -19395,28 +19462,35 @@
     function mooncakeGetMarketHistoryHourlyVolume(history, now = Date.now()) {
         const hours = 120;
         const hourMs = 60 * 60 * 1000;
-        const startTime = now - hours * hourMs;
         const points = new Map();
+        let endTime = 0;
         for (const item of Array.isArray(history) ? history : []) {
             const timestamp = Number(item?.time) * 1000;
-            if (!Number.isFinite(timestamp) || timestamp <= startTime || timestamp > now) continue;
+            if (!Number.isFinite(timestamp) || timestamp <= 0 || timestamp > now) continue;
             // The API supplies hourly volume snapshots (including zero-volume
-            // hours), not separate buyer/seller executions. Count each once.
-            const hour = Math.floor((now - timestamp) / hourMs);
+            // hours). Anchor to its latest sample, not the browser clock: a
+            // delayed next sample must not discard an otherwise complete day.
+            // Calendar-hour buckets also tolerate small sampling-time jitter.
+            const hour = Math.floor(timestamp / hourMs);
+            endTime = Math.max(endTime, timestamp);
             if (!points.has(hour) || timestamp >= points.get(hour).timestamp) {
                 points.set(hour, { timestamp, volume: item?.v == null || item.v === '' ? NaN : Number(item.v) });
             }
         }
+        const lastHour = Math.floor(endTime / hourMs);
         let coveredHours = 0;
         let total = 0;
-        for (const { volume } of points.values()) {
+        for (const [hour, { volume }] of points) {
+            if (hour <= lastHour - hours || hour > lastHour) continue;
             if (!Number.isFinite(volume) || volume < 0) continue;
             coveredHours += 1;
             total += volume;
         }
         const complete = coveredHours === hours && Number.isFinite(total);
         return {
-            hours, startTime, endTime: now, coveredHours, complete,
+            windowMode: 'latest-hour',
+            hours, startTime: (endTime || now) - hours * hourMs,
+            endTime: endTime || null, coveredHours, complete,
             volume: complete ? total : null,
             hourlyVolume: complete ? total / hours : null
         };
@@ -20281,15 +20355,22 @@
     function mooncakeBuildMarketHistoryHourlyVolumeTooltip(windows) {
         const rate = windows?.hourlyVolume5d;
         const formula = isZH
-            ? '最近 5 天成交总数量 ÷ 120 小时，单位：个/小时。'
-            : 'Total quantity traded in the last 5 days ÷ 120 hours, in items/hour.';
+            ? '截至最新采样的 5 天成交总数量 ÷ 120 小时，单位：个/小时。'
+            : '5 days of volume ending at the latest sample ÷ 120 hours, in items/hour.';
         const detail = rate?.complete
             ? (isZH ? `累计成交：${Number(rate.volume).toLocaleString('zh-CN')} 个`
                 : `Total traded: ${Number(rate.volume).toLocaleString('en-US')} items`)
-            : (isZH ? '数据不足或尚未加载，暂不计算。' : 'History is incomplete or has not loaded yet.');
+            : (isZH ? `数据不足（${Number(rate?.coveredHours) || 0}/120 小时），暂不计算。`
+                : `Incomplete history (${Number(rate?.coveredHours) || 0}/120 hours).`);
+        const endTime = Number(rate?.endTime);
+        const updated = endTime > 0 && Number.isFinite(endTime)
+            ? `<br>${isZH ? '数据截至：' : 'Data as of: '}${new Date(endTime).toLocaleString(isZH ? 'zh-CN' : 'en-US')}`
+                + (Date.now() - endTime > 2 * 60 * 60 * 1000
+                    ? `<br>${isZH ? '行情更新延迟，数值截至上述时间。' : 'History updates are delayed; values end at the time above.'}` : '')
+            : '';
         const scope = isZH ? '统计全市场成交量，不代表个人挂单的成交速度。'
             : 'Market-wide volume; not the fill speed of your own listing.';
-        return `<div style="max-width:280px;line-height:1.6;"><b>${isZH ? '5d 时均量' : '5d avg/h'}</b><br>${detail}<br>${formula}<br>${scope}</div>`;
+        return `<div style="max-width:280px;line-height:1.6;"><b>${isZH ? '5d 时均量' : '5d avg/h'}</b><br>${detail}${updated}<br>${formula}<br>${scope}</div>`;
     }
 
     function mooncakeBuildMarketHistoryOrderValue(sellFirstValue, buyFirstValue, sellFirst) {
@@ -21229,6 +21310,7 @@
 
     function scheduleMooncakeMarketHistoryCard(delay = 0, options = {}) {
         if (!mooncakeIsMarketHistoryCardEnabled()) return;
+        if (mooncakeDeferVisibleRefresh('market-history', () => scheduleMooncakeMarketHistoryCard(0, options))) return;
         if (options.force && mooncakeMarketHistoryScheduleTimer) {
             clearTimeout(mooncakeMarketHistoryScheduleTimer);
             mooncakeMarketHistoryScheduleTimer = 0;
@@ -21238,6 +21320,7 @@
         const wait = options.force ? 0 : (Number.isFinite(Number(delay)) && Number(delay) > 0 ? Number(delay) : 80);
         mooncakeMarketHistoryScheduleTimer = setTimeout(() => {
             mooncakeMarketHistoryScheduleTimer = 0;
+            if (mooncakeDeferVisibleRefresh('market-history', () => scheduleMooncakeMarketHistoryCard(0, options))) return;
             ensureMooncakeMarketHistoryCard(options);
         }, wait);
     }
@@ -23246,8 +23329,8 @@
         return mooncakeIsCurrentMarketItemDetailNode(currentItem) && !!extractItemHridFromElement(currentItem);
     }
 
-    function mooncakeParseEnhanceLevelFromPanel() {
-        const currentItemNode = mooncakeFindCurrentMarketItemNode();
+    function mooncakeParseEnhanceLevelFromPanel(currentItemNode = null) {
+        currentItemNode = currentItemNode || mooncakeFindCurrentMarketItemNode();
         if (!currentItemNode) return null;
         const levelEl = currentItemNode.querySelector('[class*="Item_enhancementLevel"], [class*="enhancementLevel"]');
         if (levelEl?.textContent) {
@@ -31424,6 +31507,7 @@
     }
 
     function enqueueMooncakeChatCompute(fn) {
+        if (mooncakeDeferVisibleRefresh('chat-labor', refreshMooncakeChatLabor)) return;
         mooncakeChatComputeQueue.push(fn);
         if (!mooncakeChatComputeTimer) {
             mooncakeChatComputeTimer = setTimeout(flushMooncakeChatCompute, MOONCAKE_CHAT_COMPUTE_GAP_MS);
@@ -31432,6 +31516,7 @@
 
     function flushMooncakeChatCompute() {
         mooncakeChatComputeTimer = 0;
+        if (mooncakeDeferVisibleRefresh('chat-labor', refreshMooncakeChatLabor)) return;
         const fn = mooncakeChatComputeQueue.shift();
         if (!fn) return;
         try { fn(); } catch (err) { console.error('[Better Loot Tracker] 聊天工时费计算失败:', err); }
@@ -31495,6 +31580,7 @@
     }
 
     function enqueueMooncakeChatMessage(el) {
+        if (mooncakeDeferVisibleRefresh('chat-labor', refreshMooncakeChatLabor)) return;
         if (!isTopLevelMooncakeChatMessage(el)) return;
         mooncakeChatQueue.push(el);
         if (!mooncakeChatQueueTimer) {
@@ -31504,6 +31590,7 @@
 
     function flushMooncakeChatQueue() {
         mooncakeChatQueueTimer = 0;
+        if (mooncakeDeferVisibleRefresh('chat-labor', refreshMooncakeChatLabor)) return;
         if (!isChatLaborEnabled()) {
             mooncakeChatQueue = [];
             return;
@@ -31580,8 +31667,13 @@
     }
 
     function startMooncakeChatBackfill(doc) {
+        if (mooncakeDeferVisibleRefresh('chat-labor', refreshMooncakeChatLabor)) return;
         if (!doc?.querySelectorAll || mooncakeChatBackfillTimers.has(doc) || !doc.querySelector(MOONCAKE_CHAT_MESSAGE_SELECTOR)) return;
         const timer = setInterval(() => {
+            if (document.hidden) {
+                mooncakePauseChatLabor();
+                return;
+            }
             if (!isChatLaborEnabled()) {
                 stopMooncakeChatBackfill(doc);
                 return;
@@ -31625,6 +31717,7 @@
         const fastSelector = "[class*='ChatHistory_'], [class*='ChatMessage_'], [class*='Chat_chatInput']";
         const handleMutations = (mutations) => {
             if (!isChatLaborEnabled()) return;
+            if (mooncakeDeferVisibleRefresh('chat-labor', refreshMooncakeChatLabor)) return;
             let relevant = false;
             for (const mutation of mutations) {
                 if (mutation.type !== "childList") continue;
@@ -31655,6 +31748,9 @@
     function startMooncakeChatLaborObserver() {
         if (mooncakeChatObserverStarted) return;
         mooncakeChatObserverStarted = true;
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) mooncakePauseChatLabor();
+        });
         observeMooncakeChatDoc(document);
         try {
             const iframe = document.querySelector("iframe[src*='milkywayidle']");
@@ -31668,8 +31764,26 @@
         } catch (_) {}
     }
 
+    function mooncakePauseChatLabor() {
+        if (mooncakeChatQueueTimer) clearTimeout(mooncakeChatQueueTimer);
+        if (mooncakeChatComputeTimer) clearTimeout(mooncakeChatComputeTimer);
+        mooncakeChatQueueTimer = 0;
+        mooncakeChatComputeTimer = 0;
+        forEachMooncakeChatDoc(doc => {
+            const timer = mooncakeChatBackfillTimers.get(doc);
+            if (timer) clearInterval(timer);
+            mooncakeChatBackfillTimers.delete(doc);
+        });
+        if (isChatLaborEnabled()) mooncakeDeferVisibleRefresh('chat-labor', refreshMooncakeChatLabor);
+    }
+
     function clearMooncakeChatLaborBubbles() {
         stopMooncakeChatBackfill();
+        if (mooncakeChatQueueTimer) clearTimeout(mooncakeChatQueueTimer);
+        if (mooncakeChatComputeTimer) clearTimeout(mooncakeChatComputeTimer);
+        mooncakeChatQueueTimer = 0;
+        mooncakeChatComputeTimer = 0;
+        mooncakeChatComputeQueue.length = 0;
         forEachMooncakeChatDoc((doc) => {
             if (!doc?.querySelectorAll) return;
             doc.querySelectorAll(`[${MOONCAKE_CHAT_BUBBLE_ATTR}="1"]`).forEach(el => el.remove());
@@ -31756,12 +31870,14 @@
     }
 
     function refreshMooncakeChatLabor() {
+        if (mooncakeDeferVisibleRefresh('chat-labor', refreshMooncakeChatLabor)) return;
         clearMooncakeChatLaborBubbles();
-        const doc = getMooncakeChatDoc();
-        processRecentMooncakeChatMessages(doc, 30);
-        if (isChatLaborEnabled() && doc?.querySelector?.(MOONCAKE_CHAT_HISTORY_SELECTOR)) {
-            startMooncakeChatBackfill(doc);
-        }
+        forEachMooncakeChatDoc(doc => {
+            processRecentMooncakeChatMessages(doc, 30);
+            if (isChatLaborEnabled() && doc?.querySelector?.(MOONCAKE_CHAT_HISTORY_SELECTOR)) {
+                startMooncakeChatBackfill(doc);
+            }
+        });
     }
 
     // ======================
@@ -40782,6 +40898,7 @@
 
     function mooncakeScheduleMyListingsHourlyWages() {
         if (!mooncakeMyListingsHourlyHooked) return;
+        if (mooncakeDeferVisibleRefresh('my-listings-hourly', mooncakeScheduleMyListingsHourlyWages)) return;
         if (mooncakeMyListingsHourlyRendering) {
             mooncakeMyListingsHourlyPending = true;
             return;
@@ -40803,6 +40920,11 @@
             let index = 0;
             mooncakeMyListingsHourlyRendering = true;
             const processBatch = () => {
+                if (mooncakeDeferVisibleRefresh('my-listings-hourly', mooncakeScheduleMyListingsHourlyWages)) {
+                    mooncakeMyListingsHourlyRendering = false;
+                    mooncakeMyListingsHourlyPending = false;
+                    return;
+                }
                 const startedAt = performance.now();
                 let processed = 0;
                 while (table.isConnected && index < rows.length && processed < 3) {
@@ -40831,11 +40953,7 @@
     function hookMooncakeMyListingsHourlyWages() {
         if (mooncakeMyListingsHourlyHooked) return;
         mooncakeMyListingsHourlyHooked = true;
-        subscribeDocumentMutations('my-listings-hourly', mutations => {
-            if (mutations.some(mooncakeMyListingsTargetFilterMutationNeedsRefresh)) {
-                mooncakeScheduleMyListingsHourlyWages();
-            }
-        });
+        hookMooncakeMyListingsDocumentObserver();
         mooncakeScheduleMyListingsHourlyWages();
     }
 
@@ -41575,11 +41693,14 @@
         else scheduleFrame();
     }
 
-    function mooncakeNodeTouchesMyListings(node) {
+    function mooncakeNodeTouchesMyListings(node, checkedNodes = null) {
         const element = node instanceof Element ? node : node?.parentElement;
         if (!element) return false;
+        if (checkedNodes?.has?.(element)) return checkedNodes.get(element);
         const selector = '[class*="MarketplacePanel_myListings"]';
-        return element.matches?.(selector) || !!element.closest?.(selector) || !!element.querySelector?.(selector);
+        const touches = !!(element.matches?.(selector) || element.closest?.(selector) || element.querySelector?.(selector));
+        checkedNodes?.set?.(element, touches);
+        return touches;
     }
 
     function mooncakeIsMyListingsTargetFilterInternalNode(node) {
@@ -41593,7 +41714,7 @@
         return element.matches?.(selector) || !!element.closest?.(selector);
     }
 
-    function mooncakeMyListingsTargetFilterMutationNeedsRefresh(mutation) {
+    function mooncakeMyListingsTargetFilterMutationNeedsRefresh(mutation, checkedNodes = null) {
         if (!mutation) return false;
         // Future-proof this subscriber if the shared document observer starts
         // observing attributes too: hiding rows is our own presentation
@@ -41611,8 +41732,8 @@
         ];
         const externalNodes = changedNodes.filter(node => !mooncakeIsMyListingsTargetFilterInternalNode(node));
         if (changedNodes.length && !externalNodes.length) return false;
-        return mooncakeNodeTouchesMyListings(mutation.target) ||
-            externalNodes.some(mooncakeNodeTouchesMyListings);
+        return mooncakeNodeTouchesMyListings(mutation.target, checkedNodes) ||
+            externalNodes.some(node => mooncakeNodeTouchesMyListings(node, checkedNodes));
     }
 
     function mooncakeRefreshMyListingsTargetFilterForTableLifecycle() {
@@ -41634,18 +41755,7 @@
     function hookMooncakeMyListingsTargetFilter() {
         if (mooncakeMyListingsTargetFilterHooked) return;
         mooncakeMyListingsTargetFilterHooked = true;
-        subscribeDocumentMutations('my-listings-target-filter', mutations => {
-            for (const mutation of mutations) {
-                if (mooncakeMyListingsTargetFilterMutationNeedsRefresh(mutation)) {
-                    // The old path re-ran the filter for every child update in
-                    // the panel, including harmless React refreshes. Only use
-                    // DOM mutations to discover a new/replaced table; quote
-                    // changes are handled by the market-data notification.
-                    mooncakeRefreshMyListingsTargetFilterForTableLifecycle();
-                    return;
-                }
-            }
-        });
+        hookMooncakeMyListingsDocumentObserver();
         mooncakeRefreshMyListingsTargetFilterForTableLifecycle();
         mooncakeScheduleMyListingsTargetFilter(0);
     }
@@ -42186,9 +42296,11 @@
     }
 
     function mooncakeScheduleMyListingsManagement() {
+        if (mooncakeDeferVisibleRefresh('my-listings-management', mooncakeScheduleMyListingsManagement)) return;
         if (!mooncakeIsMyListingsManagementEnabled() || mooncakeMyListingsManagementRaf) return;
         mooncakeMyListingsManagementRaf = requestAnimationFrame(() => {
             mooncakeMyListingsManagementRaf = null;
+            if (mooncakeDeferVisibleRefresh('my-listings-management', mooncakeScheduleMyListingsManagement)) return;
             const table = mooncakeGetVisibleMyListingsTable();
             if (!table) return;
             mooncakeApplyMyListingsManagement(table);
@@ -42206,7 +42318,7 @@
         return element.matches?.(selector) || !!element.closest?.(selector);
     }
 
-    function mooncakeMyListingsManagementMutationNeedsRefresh(mutation) {
+    function mooncakeMyListingsManagementMutationNeedsRefresh(mutation, checkedNodes = null) {
         if (!mutation || mutation.type !== 'childList') return false;
         if (mooncakeIsMyListingsManagementInternalNode(mutation.target)) return false;
         const changedNodes = [
@@ -42215,20 +42327,47 @@
         ];
         const externalNodes = changedNodes.filter(node => !mooncakeIsMyListingsManagementInternalNode(node));
         if (changedNodes.length && !externalNodes.length) return false;
-        return mooncakeNodeTouchesMyListings(mutation.target) || externalNodes.some(mooncakeNodeTouchesMyListings);
+        return mooncakeNodeTouchesMyListings(mutation.target, checkedNodes) ||
+            externalNodes.some(node => mooncakeNodeTouchesMyListings(node, checkedNodes));
+    }
+
+    let mooncakeMyListingsDocumentObserverStarted = false;
+
+    function hookMooncakeMyListingsDocumentObserver() {
+        if (mooncakeMyListingsDocumentObserverStarted) return;
+        mooncakeMyListingsDocumentObserverStarted = true;
+        subscribeDocumentMutations('my-listings', mutations => {
+            const checkRows = mooncakeMyListingsHourlyHooked || mooncakeMyListingsTargetFilterHooked;
+            const checkManagement = mooncakeMyListingsManagementHooked && mooncakeIsMyListingsManagementEnabled();
+            const checkedNodes = new Map();
+            let rowsChanged = false;
+            let managementChanged = false;
+            // Classify once before any subscriber mutates the DOM. The two
+            // internal-node filters intentionally differ; preserve both rules.
+            for (const mutation of mutations) {
+                if (checkRows && !rowsChanged) {
+                    rowsChanged = mooncakeMyListingsTargetFilterMutationNeedsRefresh(mutation, checkedNodes);
+                }
+                if (checkManagement && !managementChanged) {
+                    managementChanged = mooncakeMyListingsManagementMutationNeedsRefresh(mutation, checkedNodes);
+                }
+                if ((!checkRows || rowsChanged) && (!checkManagement || managementChanged)) break;
+            }
+            // Keep independent failure isolation from the shared observer.
+            const refresh = callback => {
+                try { callback(); }
+                catch (error) { console.error('[MoonCake] My-listings refresh failed:', error); }
+            };
+            if (rowsChanged && mooncakeMyListingsHourlyHooked) refresh(mooncakeScheduleMyListingsHourlyWages);
+            if (rowsChanged && mooncakeMyListingsTargetFilterHooked) refresh(mooncakeRefreshMyListingsTargetFilterForTableLifecycle);
+            if (managementChanged) refresh(mooncakeScheduleMyListingsManagement);
+        });
     }
 
     function hookMooncakeMyListingsManagement() {
         if (mooncakeMyListingsManagementHooked) return;
         mooncakeMyListingsManagementHooked = true;
-        subscribeDocumentMutations('my-listings-management', mutations => {
-            if (!mooncakeIsMyListingsManagementEnabled()) return;
-            for (const mutation of mutations) {
-                if (!mooncakeMyListingsManagementMutationNeedsRefresh(mutation)) continue;
-                mooncakeScheduleMyListingsManagement();
-                return;
-            }
-        });
+        hookMooncakeMyListingsDocumentObserver();
         mooncakeScheduleMyListingsManagement();
     }
 
@@ -42285,14 +42424,112 @@
         }
     }
 
+    function mooncakeGetVisibleMarketplaceOrderBooks() {
+        const candidates = [...document.querySelectorAll('[class*="MarketplacePanel_orderBooksContainer"]')]
+            .filter(mooncakeIsVisibleElement);
+        return candidates.find(mooncakeIsMarketplaceModalDescendant) || candidates[0] || null;
+    }
+
+    function mooncakeGetMarketplaceOrderBookRoot(container) {
+        return container.closest('[class*="MarketplacePanel_marketplacePanel"]') ||
+            container.closest('[class*="MainPanel_marketplaceModalContent"]') ||
+            (container.parentElement !== document.body ? container.parentElement : null) || container;
+    }
+
+    function mooncakeGetMarketplaceOrderBookTarget(container) {
+        const root = mooncakeGetMarketplaceOrderBookRoot(container);
+        // Read the preview belonging to this table. A background marketplace
+        // and a modal can show different items/levels at the same time.
+        const itemNode = [...root.querySelectorAll('[class*="MarketplacePanel_currentItem"]')]
+            .find(mooncakeIsVisibleElement) || null;
+        return {
+            itemNode,
+            itemHrid: itemNode ? extractItemHridFromElement(itemNode) : null,
+            enhancementLevel: itemNode ? (mooncakeParseEnhanceLevelFromPanel(itemNode) || 0) : 0
+        };
+    }
+
+    function mooncakeMarketplaceOrderBookMutationNeedsRefresh(mutation) {
+        const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
+        if (target?.closest(MOONCAKE_MARKET_INJECTED_SELECTOR)) return false;
+        const content = '[class*="MarketplacePanel_orderBooksContainer"], [class*="MarketplacePanel_currentItem"]';
+        const panel = '[class*="MarketplacePanel_marketplacePanel"]';
+        const touches = node => node instanceof Element &&
+            (node.matches(panel) || !!node.closest(content) || !!node.querySelector(content));
+        const changed = [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])];
+        const nativeChanges = changed.filter(node => !(node instanceof Element && node.matches(MOONCAKE_MARKET_INJECTED_SELECTOR)));
+        if (changed.length && !nativeChanges.length) return false;
+        if (mutation.type === 'attributes') return touches(target);
+        return !!target?.closest(content) || nativeChanges.some(touches);
+    }
+
+    function mooncakeObserveMarketplaceOrderBooks() {
+        const roots = new Set([
+            ...document.querySelectorAll('[class*="MarketplacePanel_marketplacePanel"]'),
+            ...[...document.querySelectorAll('[class*="MarketplacePanel_orderBooksContainer"]')]
+                .map(mooncakeGetMarketplaceOrderBookRoot)
+        ]);
+        for (const [root, state] of mooncakeOrderBookObservers) {
+            if (root.isConnected && roots.has(root)) continue;
+            state.observer.disconnect();
+            mooncakeOrderBookObservers.delete(root);
+        }
+        for (const root of roots) {
+            const ancestors = [];
+            for (let parent = root.parentElement; parent; parent = parent.parentElement) ancestors.push(parent);
+            const previous = mooncakeOrderBookObservers.get(root);
+            if (previous && previous.ancestors.length === ancestors.length &&
+                previous.ancestors.every((parent, index) => parent === ancestors[index])) continue;
+            previous?.observer.disconnect();
+            const observer = new MutationObserver(mutations => {
+                if (mutations.some(mooncakeMarketplaceOrderBookMutationNeedsRefresh)) {
+                    scheduleMarketplaceOrderBookHourlyWageRefresh({ force: true });
+                }
+            });
+            // Observe native text/SVG reuse locally, including hidden panels
+            // that React later reveals without inserting any new child nodes.
+            observer.observe(root, {
+                childList: true, characterData: true, subtree: true, attributes: true,
+                attributeFilter: ['href', 'xlink:href', 'class', 'style', 'hidden', 'aria-hidden']
+            });
+            ancestors.forEach(parent => observer.observe(parent, {
+                attributes: true, attributeFilter: ['class', 'style', 'hidden', 'aria-hidden']
+            }));
+            mooncakeOrderBookObservers.set(root, { observer, ancestors });
+        }
+    }
+
+    function mooncakeClearOrderBookRetry(container) {
+        const state = mooncakeOrderBookRetryStates.get(container);
+        if (state?.timer) clearTimeout(state.timer);
+        mooncakeOrderBookRetryStates.delete(container);
+    }
+
+    function mooncakeScheduleOrderBookRetry(container) {
+        let state = mooncakeOrderBookRetryStates.get(container);
+        if (!state) {
+            state = { timer: 0, attempt: 0 };
+            mooncakeOrderBookRetryStates.set(container, state);
+        }
+        if (state.timer || state.attempt >= MOONCAKE_ORDER_BOOK_RETRY_DELAYS.length) return;
+        state.timer = setTimeout(() => {
+            state.timer = 0;
+            if (!container.isConnected || mooncakeGetVisibleMarketplaceOrderBooks() !== container) return;
+            scheduleMarketplaceOrderBookHourlyWageRefresh({ force: true });
+        }, MOONCAKE_ORDER_BOOK_RETRY_DELAYS[state.attempt++]);
+    }
+
     function scheduleMarketplaceOrderBookHourlyWageRefresh(options = {}) {
         const force = options?.force === true;
+        if (mooncakeDeferVisibleRefresh('market-order-book', () => scheduleMarketplaceOrderBookHourlyWageRefresh({ force: true }))) return;
         if (!force && mooncakeMarketplacePricingSurfaceState === false) return;
         if (_pendingOrderBookRaf) return;
         _pendingOrderBookRaf = requestAnimationFrame(() => {
             _pendingOrderBookRaf = null;
+            if (mooncakeDeferVisibleRefresh('market-order-book', () => scheduleMarketplaceOrderBookHourlyWageRefresh({ force: true }))) return;
             try {
-                const orderBooksContainer = document.querySelector('[class*="MarketplacePanel_orderBooksContainer"]');
+                mooncakeObserveMarketplaceOrderBooks();
+                const orderBooksContainer = mooncakeGetVisibleMarketplaceOrderBooks();
                 const hasVisiblePricingSurface = mooncakeHasVisibleMarketplacePricingSurface();
                 mooncakeMarketplacePricingSurfaceState = hasVisiblePricingSurface;
                 if (!orderBooksContainer || !hasVisiblePricingSurface || !mooncakeIsVisibleElement(orderBooksContainer)) {
@@ -42304,17 +42541,21 @@
                 const askTable = orderBookTables[0] || null;
                 const bidTable = orderBookTables[1] || null;
                 const tables = [askTable, bidTable].filter(Boolean);
-                const itemNode = mooncakeFindCurrentMarketItemNode();
-                const itemHrid = itemNode ? extractItemHridFromElement(itemNode) : null;
-                const enhancementLevel = mooncakeGetCurrentMarketEnhanceLevel(0);
+                const { itemNode, itemHrid, enhancementLevel } = mooncakeGetMarketplaceOrderBookTarget(orderBooksContainer);
                 const rangedOwnsListingAge = mooncakeIsRangedListingAgeActive(orderBooksContainer);
 
-                if (mooncakeIsMarketListingAgeEnabled() && itemHrid && !rangedOwnsListingAge) {
+                if (mooncakeIsMarketListingAgeEnabled() && !rangedOwnsListingAge) {
                     if (askTable) mooncakeRenderMarketListingAge(askTable, itemHrid, enhancementLevel, 'sell');
                     if (bidTable) mooncakeRenderMarketListingAge(bidTable, itemHrid, enhancementLevel, 'buy');
                     mooncakeScheduleListingAgeMinuteTimer();
                 } else {
                     mooncakeClearMarketListingAge(orderBooksContainer);
+                }
+
+                if (!itemHrid || !tables.length || tables.some(table => !table.querySelector('thead tr') || !table.querySelector('tbody'))) {
+                    mooncakeScheduleOrderBookRetry(orderBooksContainer);
+                } else {
+                    mooncakeClearOrderBookRetry(orderBooksContainer);
                 }
 
                 if (!isMarketplaceHourlyWageEnabled() || !itemNode || !itemHrid || !mooncakeIsEnhanceableItem(itemHrid)) {
@@ -42340,10 +42581,12 @@
 
     function scheduleMarketplaceSummaryHourlyWageRefresh(options = {}) {
         const force = options?.force === true;
+        if (mooncakeDeferVisibleRefresh('market-summary', () => scheduleMarketplaceSummaryHourlyWageRefresh({ force: true }))) return;
         if (!force && mooncakeMarketplacePricingSurfaceState === false) return;
         if (_pendingSummaryRaf) return;
         _pendingSummaryRaf = requestAnimationFrame(() => {
             _pendingSummaryRaf = null;
+            if (mooncakeDeferVisibleRefresh('market-summary', () => scheduleMarketplaceSummaryHourlyWageRefresh({ force: true }))) return;
             try {
                 const itemSummaryTable = mooncakeGetVisibleMarketplaceSummaryTable();
                 mooncakeObserveMarketplaceSummaryPrices(itemSummaryTable);
@@ -42428,7 +42671,7 @@
 
         try {
             const handleMutations = (mutations) => {
-                let needOrderBook = false;
+                let needOrderBook = mutations.some(mooncakeMarketplaceOrderBookMutationNeedsRefresh);
                 let needSummary = mutations.some(mooncakeMarketplaceSummaryMutationNeedsRefresh);
                 let needMarketJumpHelpers = false;
                 let needEnhancementTabEnsure = false;
@@ -42809,7 +43052,7 @@
         const tbody = orderBookTable?.querySelector?.('tbody');
         if (!headerRow || !tbody) return;
         mooncakeEnsureListingAgeTooltipListeners();
-        const book = mooncakeGetMyListingsLiveOrderBook(itemHrid, enhancementLevel);
+        const book = itemHrid ? mooncakeGetMyListingsLiveOrderBook(itemHrid, enhancementLevel) : null;
         const listings = book?.[side === 'sell' ? 'asks' : 'bids'] || [];
         const allOrderBookIds = new Set(
             [...(book?.asks || []), ...(book?.bids || [])]
@@ -42818,7 +43061,7 @@
         );
         const rowListings = [
             ...listings,
-            ...mooncakeGetOwnOrderBookExtraListings(itemHrid, enhancementLevel, side, allOrderBookIds)
+            ...(itemHrid ? mooncakeGetOwnOrderBookExtraListings(itemHrid, enhancementLevel, side, allOrderBookIds) : [])
         ];
         let rowIndex = 0;
         const rows = Array.from(tbody.querySelectorAll('tr'));
