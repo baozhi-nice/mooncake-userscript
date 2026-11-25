@@ -87,9 +87,9 @@ assert.match(
     'left click must continue applying the current-item recommendation'
 );
 assert.match(
-    source,
-    /mooncakeMarketPricingRevision,\s*pricingContext\?\.dependencySignature/,
-    'market-plan rows must redraw when a market pricing revision changes the full route'
+    extractFunction('ensureMooncakeEnhanceMarketPlanColumn'),
+    /mooncakeGetItemPricingRevision\(itemHrid\),\s*pricingContext\?\.dependencySignature/,
+    'market-plan rows must redraw when a dependent quote changes the full route'
 );
 assert.match(
     source,
@@ -97,9 +97,9 @@ assert.match(
     'external market refreshes must schedule the visible enhancement reference to redraw'
 );
 assert.match(
-    source,
-    /if \(priceChanged\) \{[\s\S]{0,300}?scheduleMooncakeEnhanceProtectionBuyBox\(0\)/,
-    'live game order-book refreshes must schedule the visible enhancement reference to redraw'
+    extractFunction('updateMarketCacheFromWS'),
+    /mooncakeIsItemPricingAffected\(mooncakeEnhancePricingItemHrid, pricingChanges\)[\s\S]{0,100}?scheduleMooncakeEnhanceProtectionBuyBox\(0\)/,
+    'dependent live game quotes must schedule the visible enhancement reference to redraw'
 );
 
 console.log('Market hourly consistency checks passed.');

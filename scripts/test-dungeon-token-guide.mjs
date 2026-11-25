@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import vm from 'node:vm';
+import { marketPricingTestPrelude, marketPricingTestFunctions } from './lib/market-pricing-test-support.mjs';
 
 const source = await readFile(new URL('../src/mooncake.js', import.meta.url), 'utf8');
 function extract(name) {
@@ -47,6 +48,8 @@ function createFixture() {
     return data;
 }
 const shared = `
+    ${marketPricingTestPrelude()}
+    ${marketPricingTestFunctions(extract)}
     let data = (${createFixture.toString()})();
     let mooncakeDungeonTokenRedemptionIndex = null, mooncakeDungeonTokenRedemptionIndexSource = null;
     const getInitClientData = () => data;

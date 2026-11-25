@@ -6,6 +6,16 @@
     "build": "node scripts/build.mjs",
     "check": "node scripts/build.mjs --check",
     "test:performance-scheduling": "node scripts/test-performance-scheduling.mjs",
+    "test:enhancement-cache": "node scripts/test-enhancement-cache-dependencies.mjs",
+    "benchmark:enhancement-cache": "node scripts/benchmark-enhancement-cache.mjs",
+    "test:market-pricing-dependencies": "node scripts/test-market-pricing-dependencies.mjs",
+    "benchmark:market-pricing": "node scripts/benchmark-market-pricing.mjs",
+    "test:character-state": "node scripts/test-character-state-incremental.mjs",
+    "test:document-scheduling": "node scripts/test-document-mutation-scheduling.mjs",
+    "benchmark:character-state": "node scripts/benchmark-character-state.mjs",
+    "test:probability-queue": "node scripts/test-probability-task-queue.mjs",
+    "test:probability-consumers": "node scripts/test-probability-consumer-lifecycle.mjs",
+    "test:probability-browser": "node scripts/test-probability-browser.mjs",
     "test:anti-suicide": "node scripts/test-anti-suicide-system.mjs",
     "test:my-listing-types": "node scripts/test-my-listing-types.mjs",
     "test:my-listings-hourly": "node scripts/test-my-listings-hourly.mjs",
@@ -36,6 +46,7 @@
     "test:refinement-routes": "node scripts/test-refinement-route-selection.mjs"
   },
   "devDependencies": {
+    "mathjs": "10.6.4",
     "react": "17.0.2",
     "react-dom": "17.0.2",
     "terser": "5.50.0"

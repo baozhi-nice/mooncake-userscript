@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { createServer } from 'node:http';
 import { execFileSync } from 'node:child_process';
+import { marketPricingTestPrelude, marketPricingTestFunctions, settlePricingBrowserFrames } from './lib/market-pricing-test-support.mjs';
 
 const projectRoot = resolve(import.meta.dirname, '..');
 const source = await readFile(resolve(projectRoot, 'src', 'mooncake.js'), 'utf8');
@@ -97,6 +98,8 @@ if (process.argv.includes('--serve')) {
     ${templateNames.map(name => `const ${name}='${name}';`).join('\n')}
     const MOONCAKE_MOOKET_OVERLAY_ID='mooket',MOONCAKE_MIRROR_OUTPUT_MIN_LEVEL=13;
     ${constants}
+    ${marketPricingTestPrelude()}
+    ${marketPricingTestFunctions(extract)}
     let _pendingSummaryRaf=null,_summaryRenderGeneration=0,mooncakeMarketplacePricingSurfaceState=null;
     let mooncakeSummaryPriceObserver=null,mooncakeSummaryObservedTable=null,enhancementDetailTableObserver=null;
     let _pendingEnhancementDetailRefreshTimer=0,enhancementTabButton=null,enhancementTabPanel=null;
@@ -123,7 +126,7 @@ if (process.argv.includes('--serve')) {
     function subscribeDocumentMutations(name,callback){subscriptions.set(name,callback);return ()=>subscriptions.delete(name)}
     ${names.map(extract).join('\n')}
     function panel(hrid='equipment_a',rows=true){const element=document.createElement('div');element.className='MarketplacePanel_marketplacePanel__fixture';element.innerHTML='<table class="MarketplacePanel_itemSummaryTable__fixture"><thead><tr><th class="MarketplacePanel_item__fixture">物品</th><th class="MarketplacePanel_bestAskPrice__fixture">最佳出售价</th><th class="MarketplacePanel_bestBidPrice__fixture">最佳收购价</th><th class="MarketplacePanel_viewAll__fixture">查看全部</th></tr></thead><tbody>'+(rows?[7,8,10].map((level,index)=>'<tr><td class="MarketplacePanel_item__fixture"><svg><use href="#'+hrid+'"></use></svg><span class="Item_enhancementLevel__fixture">+'+level+'</span></td><td class="MarketplacePanel_bestAskPrice__fixture"><span class="MarketplacePanel_price__fixture">'+[122.5,165.5,362][index]+'M</span><br><button>购买</button></td><td class="MarketplacePanel_bestBidPrice__fixture"><span class="MarketplacePanel_price__fixture">140M</span><br><button>出售</button></td><td class="MarketplacePanel_viewAll__fixture"><button>查看全部</button></td></tr>').join(''):'')+'</tbody></table>';return element;}
-    const table=()=>stage.querySelector('#active table'),wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+    const table=()=>stage.querySelector('#active table'),wait=${settlePricingBrowserFrames.toString()};
     function mount(hrid='equipment_a',rows=true){const root=panel(hrid,rows);root.id='active';stage.append(root);return root.querySelector('table')}
     function addPreview(){const preview=document.createElement('div');preview.className='MarketplacePanel_currentItem__fixture';preview.innerHTML='<svg><use href="#equipment_a"></use></svg>';table().parentElement.prepend(preview);scheduleMarketplaceSummaryHourlyWageRefresh({force:true});}
     function expect(condition,message){if(!condition)throw Error(message)}
@@ -140,6 +143,10 @@ if (process.argv.includes('--serve')) {
       await check('行情延迟到达；保留表头并自动恢复',async()=>{available=false;mount();addPreview();await wait(90);expect(table().querySelectorAll('thead [data-mooncake-summary-hourly-cell]').length===2,'等待行情时表头消失');available=true;await wait(730);complete()});
       await check('原生表头和行重建',async()=>{mount();addPreview();await wait(180);complete();const replacement=panel().querySelector('table');table().replaceChildren(...replacement.childNodes);await wait(180);complete()});
       await check('空表先挂载，再出现等级行',async()=>{mount('equipment_a',false);await wait(90);table().querySelector('tbody').replaceChildren(...panel().querySelector('tbody').childNodes);await wait(180);complete()});
+      if(typeof mooncakeGetMarketPricingDependency==='function'){
+        await check('无关行情不重算，连续更新保留相关材料',async()=>{mount();await wait(200);complete();const entry=mooncakeGetMarketPricingDependency('/items/equipment_a');entry.complete=true;entry.dependencies.add('/items/material_a');const count=calls;scheduleMarketplaceSummaryHourlyWageRefresh({affectedItems:mooncakeInvalidateItemPricing('/items/unrelated')});await wait(100);expect(calls===count,'无关行情触发了工时计算');scheduleMarketplaceSummaryHourlyWageRefresh({affectedItems:mooncakeInvalidateItemPricing('/items/material_a')});scheduleMarketplaceSummaryHourlyWageRefresh({affectedItems:mooncakeInvalidateItemPricing('/items/unrelated')});await wait(200);complete();expect(calls>count,'合并时漏掉相关材料更新')});
+        await check('完整页面刷新覆盖已排队的局部刷新',async()=>{mount();await wait(180);complete();mooncakeGetMarketPricingDependency('/items/equipment_a').complete=true;table().querySelector('thead [data-mooncake-summary-hourly-cell]').remove();scheduleMarketplaceSummaryHourlyWageRefresh({affectedItems:new Set(['/items/unrelated'])});scheduleMarketplaceSummaryHourlyWageRefresh({force:true});await wait(180);complete()});
+      }
       await check('弹出市场优先于背景市场',async()=>{const background=panel('equipment_b');stage.append(background);const modal=document.createElement('div');modal.className='MainPanel_marketplaceModalContent__fixture';const inner=panel();inner.id='active';modal.append(inner);stage.append(modal);await wait(180);complete();expect(!background.querySelector('[data-mooncake-summary-hourly-cell]'),'后台市场抢占了显示')});
       await check('窄屏也独立于预览；不产生观察器循环',async()=>{compact=true;mount();await wait(220);expect(table().querySelectorAll('.mooncake-market-inline-hourly-wage').length===6,'窄屏内嵌工时缺失');const count=calls;await wait(180);expect(calls===count,'观察器反复计算');enabled=false;scheduleMarketplaceSummaryHourlyWageRefresh({force:true});await wait(90);expect(!table().querySelector('.mooncake-market-inline-hourly-wage'),'关闭工时未清理')});
       await clear();mount();await wait(180);result.textContent=(checks.some(line=>line.startsWith('FAIL'))?'FAILED\n':'PASS ALL\n')+checks.join('\n');

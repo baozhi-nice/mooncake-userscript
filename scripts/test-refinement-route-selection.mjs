@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import vm from 'node:vm';
+import { createMarketPricingTestGlobals, marketPricingTestFunctions } from './lib/market-pricing-test-support.mjs';
 
 const projectRoot = resolve(import.meta.dirname, '..');
 const source = await readFile(resolve(projectRoot, 'src', 'mooncake.js'), 'utf8');
@@ -41,8 +42,9 @@ assert.doesNotMatch(
     'ordinary-then-refine must not be a standalone protection-route candidate'
 );
 
-const sandbox = { calls: [] };
+const sandbox = { calls: [], marketDataCache: null, ...createMarketPricingTestGlobals() };
 vm.runInNewContext(`
+    ${marketPricingTestFunctions(extractFunction)}
     const MOONCAKE_MIRROR_OUTPUT_MIN_LEVEL = 13;
     function mooncakeGetEnhancementRouteSelectionMode(objective) { return objective || 'hourly'; }
     function mooncakeBuildLegacyTraditionalRoute() { calls.push('legacy'); return { routeType: 'legacy' }; }

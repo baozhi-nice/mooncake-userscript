@@ -14,6 +14,20 @@
 
 背包相关检查可运行 `pnpm test:warehouse-native-queue`、`pnpm test:warehouse-queue`、`pnpm test:warehouse-tabs`、`pnpm test:warehouse-performance` 和 `pnpm test:warehouse-relayout`。
 性能调度检查运行 `pnpm test:performance-scheduling`：验证相同强化参数的并发预热共享、部分重叠任务、超时和 Worker 失败后的回退，以及计算数值不变；同时检查挂牌页面变化的合并判断、隐藏时暂停显示任务和恢复时使用最新数据。后台 WebSocket、交易记录与行情缓存继续更新。
+强化概率缓存检查运行 `pnpm test:enhancement-cache`：使用与用户脚本相同版本的 mathjs，对照 1.6.259 的普通／精确等级和起始等级计算，并以解析公式验证修正后的精确 +1 标量情形。验证总技能变化及速度变化复用概率结果、有效概率参数隔离、完整重置和缓存容量。角色参数或虚拟配置变化仍刷新耗时、成本和路线；客户端静态数据替换保留完整清理。
+固定数据计算基线运行 `pnpm benchmark:enhancement-cache --baseline=4f73d9a`；可用 `--output=<JSON 路径>` 保存三轮对照结果。它统计实际矩阵求解与总技能读取次数，并比较所有数值；测量不包含游戏 DOM、网络或真实 Worker 调度，耗时只能用于该计算场景，不能当作整页 CPU 或帧率改善比例。mathjs 仅作为开发测试依赖，发布脚本继续使用现有 `@require`。
+
+行情依赖检查运行 `pnpm test:market-pricing-dependencies`，对照已发布版本完整失效后的计算结果，覆盖三种路线目标、递归制作、备用保护材料、镜子、精炼、缺报价恢复、缓存回收和扣扣目标筛选。单物品行情只失效依赖该报价的成本与路线；未建立完整依赖时保守刷新，公开行情整体替换和配置变化仍完整刷新。连续局部刷新合并影响物品，订单时长继续独立刷新。依赖记录限 256 个，路线和成本缓存保留各自容量上限。
+
+行情固定样本对照运行 `pnpm benchmark:market-pricing --baseline=4f73d9a --output=<JSON 路径>`，记录 12 次报价更新下的候选重建、路线选择、配方计算和三轮耗时中位数；该结果不包含实际游戏渲染。挂牌、汇总、时长与嵌套弹窗的 `--serve` 页面另测局部刷新、后到更新、完整刷新优先和未知依赖回退；检查等待实际渲染帧后断言 DOM，适用于后台浏览器页签。
+
+角色增量检查运行 `pnpm test:character-state`；固定状态样本对照运行 `pnpm benchmark:character-state --output=<JSON 路径>`，可加 `--baseline-file=<源码文件>` 比较分批检查点。完整消息直接维护技能、装备、库存和行动状态；经验和普通库存变化复用强化计算签名。初始化、缺失字段、周期校验及角色恢复保留全量读取，旧角色或没有角色标识的原生快照不能覆盖当前消息流。快照跳过相同内容，经验快照合并到两秒内写入，离开页面时补存。
+
+页面分派检查运行 `pnpm test:document-scheduling --serve`。共享观察器复用同批 DOM 变化的分类，市场模块在批内共享根节点发现；直接用户操作和后续帧重新读取当前 DOM。未知模块保留原通知，导航、设置面板、嵌套市场及移除事件仍通知相关入口。仓库和保护助手继续保留必要的局部兼容判断。
+
+冷计算检查运行 `pnpm test:probability-queue` 和 `pnpm test:probability-consumers`，验证共享任务、交互优先、公平处理历史任务、非零起始等级、Worker 错误回退、缓存回收及旧界面结果丢弃。Worker 每批最多八个任务；不可用时每轮最多一次主线程求解。隐藏页面暂停尚未分派的任务。聊天、掉落、合并分析、挂牌弹窗和强化参考等待预热后读取最新上下文；简单 +12 挂牌准备十一项普通任务。精确 +1 的 mathjs 标量行按数组归一化，保持既有精确模型并修复旧近似回退。
+
+真实浏览器计算对照运行 `pnpm test:probability-browser`，比较相同数据的同步参考、真实 Worker 和不可用回退，并核对数值。它展示主线程求解、≥50ms 长任务和定时器间隔；回退延长总等待以分散工作，这些固定样本指标不代表整页游戏 CPU 或帧率。
 浏览器交互检查使用 `pnpm test:warehouse-scroll <游戏官方 main.*.chunk.js 的本地路径>`，打开输出的本地地址，运行布局和队列交互检查。该页面提取官方物品组件，使用测试数据和操作回调，不连接游戏账号。React 开发依赖仅用于此测试页面，发布脚本复用游戏已加载的组件和渲染器。
 
 库存空格回归检查使用 `pnpm test:warehouse-visibility <游戏官方 main.*.chunk.js 的本地路径>`，覆盖连续强化、库存排序、分区归属与恢复原生布局；加 `--baseline=HEAD` 可与已提交版本对照。

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import vm from 'node:vm';
+import { createMarketPricingTestGlobals, marketPricingTestFunctions } from './lib/market-pricing-test-support.mjs';
 
 const projectRoot = resolve(import.meta.dirname, '..');
 const source = await readFile(resolve(projectRoot, 'src', 'mooncake.js'), 'utf8');
@@ -33,6 +34,7 @@ function extractFunction(name) {
 
 const orderBookScheduler = extractFunction('scheduleMarketplaceOrderBookHourlyWageRefresh');
 const orderBookSandbox = {
+    ...createMarketPricingTestGlobals(),
     document: { hidden: false, addEventListener() {} },
     mooncakeVisibleRefreshes: new Map(),
     mooncakeVisibleRefreshListenerStarted: false,
@@ -41,6 +43,7 @@ const orderBookSandbox = {
     scheduledFrames: 0
 };
 vm.runInNewContext(`
+    ${marketPricingTestFunctions(extractFunction)}
     globalThis.requestAnimationFrame = () => {
         globalThis.scheduledFrames += 1;
         return 1;

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import vm from 'node:vm';
+import { marketPricingTestPrelude, marketPricingTestFunctions } from './lib/market-pricing-test-support.mjs';
 
 const source = await readFile(new URL('../src/mooncake.js', import.meta.url), 'utf8');
 function extract(name) {
@@ -54,6 +55,8 @@ if (process.argv.includes('--serve')) {
     <script src="/react.js"></script><script src="/react-dom.js"></script><script>
     ${constants}
     ${globals}
+    ${marketPricingTestPrelude(['mooncakeMyListingsHourlyChanges'])}
+    ${marketPricingTestFunctions(extract)}
     const mooncakeVisibleRefreshes=new Map();let mooncakeVisibleRefreshListenerStarted=false;
     let fixtureHidden=false;Object.defineProperty(document,'hidden',{configurable:true,get:()=>fixtureHidden});
     function setHidden(value){fixtureHidden=value;document.dispatchEvent(new Event('visibilitychange'))}
@@ -73,7 +76,8 @@ if (process.argv.includes('--serve')) {
     const mooncakeIsVisibleElement=node=>!!node?.getClientRects().length;
     function format(value){return value>=1e6?(value/1e6)+'M':String(value)}
     function mooncakeFormatSignedHourlyWage(value){return (value>0?'+':'')+(value/1e6).toFixed(2)+'M'}
-    function mooncakeCalculateEnhancementRouteAtPrice(hrid,level,data,price){calls++;return {totalCost:cost,totalTimeHours:hours/profile,hourlyWage:(price*.96-cost)/(hours/profile),protectAt:6};}
+    const itemCosts=new Map();let duringCalculation=null;
+    function mooncakeCalculateEnhancementRouteAtPrice(hrid,level,data,price){calls++;if(duringCalculation)duringCalculation(hrid);const itemCost=itemCosts.get(hrid)??cost;return {totalCost:itemCost,totalTimeHours:hours/profile,hourlyWage:(price*.96-itemCost)/(hours/profile),protectAt:6};}
     const mooncakeResolveObjectiveRoutePair=()=>null;
     const mooncakeEvaluateEnhancementEconomics=route=>({combinedColor:route.hourlyWage<0?'#ff7777':'#9ed995'});
     const buildTooltipHtml=(level,metrics,price)=>'价格 '+format(price)+' / +'+level+' / 工时 '+mooncakeFormatSignedHourlyWage(metrics.hourlyWage)+'/h';
@@ -115,7 +119,7 @@ if (process.argv.includes('--serve')) {
         data[0].price=1562.5e6;render();await settled();expect(metric(1)?.textContent==='工时:0.00M','zero wage missing');
         data[0].price=2240e6;render();await settled();
         profile=2;mooncakeScheduleMyListingsHourlyWages();await settled();expect(metric(1)?.textContent==='工时:+130.08M','profile change did not refresh');
-        cost=1600e6;mooncakeMarketPricingRevision++;mooncakeScheduleMyListingsHourlyWages();await settled();expect(metric(1)?.textContent==='工时:+110.08M','material quote change did not refresh');
+        cost=1600e6;mooncakeMarketPricingRevision++;mooncakeResetMarketPricingDependencies();mooncakeScheduleMyListingsHourlyWages();await settled();expect(metric(1)?.textContent==='工时:+110.08M','material quote change did not refresh');
         pass('等级、无效价格、零工时、强化配置及成本行情更新');
         available=false;mooncakeScheduleMyListingsHourlyWages();await settled();expect(metric(1)?.textContent.includes('—'),'missing data presented as zero');
         available=true;mooncakeScheduleMyListingsHourlyWages();await settled();expect(!metric(1)?.textContent.includes('—'),'data recovery failed');
@@ -141,6 +145,20 @@ if (process.argv.includes('--serve')) {
         expect(metric(1)?.textContent==='工时:+80.40M','resume did not use the latest native price');
         expect(getRow(1).querySelectorAll('[data-mooncake-my-listing-hourly]').length===1,'resume duplicated the wage');
         pass('页面隐藏期间暂停计算，返回后使用最新价格且不重复渲染');
+        data=Array.from({length:10},(_,i)=>sample(30+i,2400e6,12,i<5?'/items/equipment_a':'/items/equipment_b'));render();await settled();
+        for(const suffix of ['a','b']){const entry=mooncakeGetMarketPricingDependency('/items/equipment_'+suffix);entry.complete=true;entry.dependencies.add('/items/material_'+suffix)}
+        const idle=calls;mooncakeScheduleMyListingsHourlyWages(mooncakeInvalidateItemPricing('/items/unrelated'));await settled();
+        expect(calls===idle,'unrelated quotes recalculated visible listing rows');
+        itemCosts.set('/items/equipment_a',1700e6);itemCosts.set('/items/equipment_b',1800e6);
+        mooncakeScheduleMyListingsHourlyWages(mooncakeInvalidateItemPricing('/items/material_a'));
+        mooncakeScheduleMyListingsHourlyWages(mooncakeInvalidateItemPricing('/items/material_b'));await settled();
+        expect(metric(30)?.textContent==='工时:+60.40M'&&metric(39)?.textContent==='工时:+50.40M','coalescing lost one changed item');
+        expect(calls-idle===10,'coalesced scopes recalculated rows more than once');
+        duringCalculation=()=>{duringCalculation=null;itemCosts.set('/items/equipment_b',2000e6);mooncakeScheduleMyListingsHourlyWages(mooncakeInvalidateItemPricing('/items/material_b'))};
+        itemCosts.set('/items/equipment_a',1900e6);mooncakeScheduleMyListingsHourlyWages(mooncakeInvalidateItemPricing('/items/material_a'));await settled();
+        expect(metric(30)?.textContent==='工时:+40.40M'&&metric(39)?.textContent==='工时:+30.40M','an update during a row batch was dropped');
+        pass('无关行情跳过计算；连续物品更新合并；分批渲染中的后到行情不丢失');
+        itemCosts.clear();mooncakeResetMarketPricingDependencies();data=examples();render();mooncakeScheduleMyListingsHourlyWages();await settled();
         document.getElementById('result').textContent='PASS\n'+checks.join('\n');
       } catch(error){document.getElementById('result').textContent='FAIL: '+error.message;console.error(error)}
     }

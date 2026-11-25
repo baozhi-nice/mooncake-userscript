@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { marketPricingTestPrelude, marketPricingTestFunctions, settlePricingBrowserFrames } from './lib/market-pricing-test-support.mjs';
 import { execFileSync } from 'node:child_process';
 
 const baseline = process.argv.find(arg => arg.startsWith('--baseline='))?.slice('--baseline='.length);
@@ -51,6 +52,8 @@ const html = String.raw`<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 body{background:#161923;color:#dfe7fb;font:15px system-ui;margin:20px}button{background:#4559a7;color:white;border:1px solid #7c8bbc;border-radius:4px;padding:7px 14px;cursor:pointer}#results{white-space:pre-wrap;min-height:40px}.market{background:#1c202c;border:1px solid #46506b;padding:16px;border-radius:6px}h2{margin:0 0 12px;text-align:center}.MarketFixture_header{opacity:.7}.order{width:470px;max-width:100%;box-sizing:border-box;margin:12px auto;padding:16px;background:#11141b;border:1px solid #a1a9c2;border-radius:7px}.MarketplacePanel_header__fixture{text-align:center;font-weight:700;margin-bottom:14px}.MarketplacePanel_itemContainer__fixture{margin:auto auto 16px;width:90px;background:#2c3048;text-align:center;padding:8px}.Item_enhancementLevel__fixture{color:#82c8ed}.MarketplacePanel_inputContainer__fixture{margin:12px 0;text-align:center}.MarketplacePanel_priceInputs__fixture,.MarketplacePanel_quantityInputs__fixture{display:flex;gap:5px;justify-content:center}input,.MarketplacePanel_priceDisplay__fixture{width:130px;background:#dce2f9;color:#151923;border:1px solid #6e83bd;border-radius:4px;padding:5px;text-align:center;font:inherit}.MarketplacePanel_label__fixture{margin-bottom:7px}.footer{text-align:center;margin-top:12px}#fixture .other{padding:8px;border:1px dashed #7182a2;margin:8px 0}svg{display:block;margin:auto}button:disabled{opacity:.5}
 </style><button id="run">运行弹窗检查</button> <span>${baseline ? '旧版 ' + baseline : '修复版'}</span><pre id="results" role="status">等待检查</pre><div id="fixture"></div>
 <script>(()=>{
+${marketPricingTestPrelude()}
+${source.includes('function mooncakeGetItemPricingRevision(') ? marketPricingTestFunctions(extract) : ''}
 const isZH=true, currentMarketItem={itemHrid:'/items/background'};
 let mooncakeMarketPricingRevision=1,mooncakeHourlyWageColorProfileRevision=1,calculations=0,posts=0;
 const MOONCAKE_MARKET_SELL_TAX_PERCENT=4,MOONCAKE_MARKET_SELL_NET_FACTOR=.96;
@@ -73,6 +76,7 @@ const mooncakeGetMarketNetSaleUnitPrice=price=>price*.96;
 function mooncakeCalculateEnhancementRouteAtPrice(hrid,level,data,price){calculations++;return {totalCost:hrid==='/items/background'?100e6:2e6,totalTimeHours:2,protectAt:6};}
 const mooncakeEvaluateEnhancementEconomics=()=>({combinedColor:'#a0e0c8'}),mooncakeResolveObjectiveRoutePair=()=>null;
 const mooncakeGetOrderModalTradeOffProtectSuffix=()=>'',mooncakeBuildOrderModalEconomicsTooltip=()=>'<b>测试工时明细</b>';
+const mooncakeEnsureEnhancementRoutePrewarm=()=>({ready:true});
 const hideTooltip=()=>{};
 const bindTooltip=(node,html)=>{node.title=html.replace(/<[^>]+>/g,'')};
 const formatMoney=value=>(value/1e6).toFixed(2)+'M',mooncakeFormatSignedHourlyWage=value=>(value>0?'+':'')+formatMoney(value);
@@ -82,7 +86,7 @@ ${constants}
 ${priceRules}
 ${functions}
 const host=document.getElementById('fixture'),result=document.getElementById('results');
-const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const pause=${settlePricingBrowserFrames.toString()};
 const failures=[];let passed=0;
 function expect(value,message){if(!value)throw Error(message);}
 function listing({title='购买挂牌',hrid='clock',level=7}={}){
@@ -116,6 +120,7 @@ function verifyGuide(content,label='最优兑换'){
 async function check(name,fn){host.replaceChildren();await pause(100);resetQuotes();try{await fn();passed++;result.textContent+='PASS '+name+'\n';}catch(error){failures.push(name+': '+error.message);result.textContent+='FAIL '+name+': '+error.message+'\n';}}
 async function run(){document.getElementById('run').disabled=true;result.textContent='';passed=0;failures.length=0;
  await check('普通市场购买挂牌',async()=>{const content=listing();host.append(wrap(content));await pause(350);verify(content);expect(content.querySelector('[data-mooncake-order-hourly]').textContent==='+1.16M','价格或物品错误');});
+ if(typeof mooncakeGetMarketPricingDependency==='function')await check('强化弹窗仅响应相关行情，未建立依赖时自动补算',async()=>{const content=listing();host.append(wrap(content));await pause(350);verify(content);const entry=mooncakeGetMarketPricingDependency('/items/clock');entry.complete=true;entry.dependencies.add('/items/material');const count=calculations;mooncakeRefreshOrderModalEconomics(mooncakeInvalidateItemPricing('/items/unrelated'));await pause(120);expect(calculations===count,'无关行情重复计算弹窗');mooncakeRefreshOrderModalEconomics(mooncakeInvalidateItemPricing('/items/material'));await pause(180);expect(calculations>count,'相关材料未更新弹窗');mooncakeResetMarketPricingDependencies();const updated=calculations;mooncakeRefreshOrderModalEconomics(new Set(['/items/unrelated']));await pause(180);expect(calculations>updated,'未知依赖被错误跳过');verify(content);});
  await check('原生双层市场与出售挂牌',async()=>{const content=listing({title:'出售挂牌'});host.append(market(content));await pause(350);verify(content,1);});
  await check('外层市场容器不读取或清理内层挂牌',async()=>{const content=listing();const outer=market(content,{generic:true,nativeWrapper:false});host.append(outer);await pause(350);verify(content);expect(!mooncakeFindOrderModalRoots().includes(outer),'错误识别为外层市场');});
  await check('其他弹窗不会遮蔽挂牌内容扫描',async()=>{const unrelated=wrap(document.createElement('h3'));unrelated.firstChild.textContent='物品详情';host.append(unrelated);const content=listing();host.append(market(content,{nativeWrapper:false}));await pause(350);verify(content);});

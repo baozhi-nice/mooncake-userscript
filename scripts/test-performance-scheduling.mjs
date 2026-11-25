@@ -15,122 +15,7 @@ function extract(name) {
 function install(context, names) {
     vm.runInContext(names.map(extract).join('\n'), context);
 }
-const params = {
-    enhancing_level: 156, laboratory_level: 8, enhancer_bonus: 8.4,
-    enhancers_top_speed: 15.02, enhancers_bottom_speed: 15.02, glove_bonus: 15.02,
-    necklace_speed: 10.68, chance_cape_speed: 20.358, drink_concentration_bonus: 15.7,
-    tea_ultra_enhancing: true, tea_blessed: true, champion_achievement: true,
-    community_enhancing_speed_bonus: 0
-};
-const successRates = [50, 45, 45, 40, 40, 40, 35, 35, 35, 35, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30];
-function workerHarness() {
-    const posts = [], timers = new Map();
-    let timerId = 0, worker;
-    const ctx = vm.createContext({
-        console, Blob: class {}, URL: { createObjectURL: () => 'fixture', revokeObjectURL() {} },
-        enhancelateWorker: null, enhancelateWorkerDisabled: false, enhancelateWorkerRequestId: 0,
-        enhancelateWorkerPending: new Map(), enhancelateWorkerInFlight: new Map(),
-        enhancelateCache: new Map(), mooncakeExactEnhancelateCache: new Map(),
-        mooncakeEnhancementRoutePrewarmState: new Map(), SUCCESS_RATE: successRates,
-        player: { ...params }, getBaseItemLevel: hrid => hrid?.includes('85') ? 85 : 90,
-        getEnhancelateTotalSkillLevel: () => 1874,
-        setTimeout: fn => { timers.set(++timerId, fn); return timerId; },
-        clearTimeout: id => timers.delete(id)
-    });
-    ctx.getPlayerEnhanceParams = () => ctx.player;
-    ctx.cacheEnhancelateResult = (key, value) => ctx.enhancelateCache.set(key, value);
-    ctx.cacheMooncakeExactEnhancelateResult = (key, value) => ctx.mooncakeExactEnhancelateCache.set(key, value);
-    ctx.Worker = class {
-        constructor() { worker = this; }
-        postMessage(message) {
-            if (this.failPost) throw Error('fixture postMessage failure');
-            posts.push(structuredClone(message));
-        }
-        terminate() { this.terminated = true; }
-    };
-    install(ctx, ['buildEnhancelateCacheKey', 'enhancelateWorkerMain', 'disableEnhancelateWorker',
-        'getEnhancelateWorker', 'prewarmEnhancelateLevels', 'mooncakeEnsureEnhancementRoutePrewarm',
-        'calcEnhancingSecondsPerAction']);
-    function deliver(index, error = false) {
-        const message = posts[index];
-        if (error) { worker.onmessage({ data: { requestId: message.requestId, error: 'fixture error' } }); return; }
-        const runner = vm.createContext({ self: { postMessage: data => worker.onmessage({ data }) } });
-        vm.runInContext(`${extract('enhancelateWorkerMain')}\nenhancelateWorkerMain();`, runner);
-        runner.self.onmessage({ data: message });
-    }
-    return { ctx, posts, timers, deliver, get worker() { return worker; } };
-}
-const close = (actual, expected, label) => assert(Math.abs(actual - expected) < 1e-7 * Math.max(1, Math.abs(expected)), label);
-
-// Same-level equipment shares probability results, including overlapping batches.
-{
-    const h = workerHarness(), c = h.ctx;
-    const first = c.mooncakeEnsureEnhancementRoutePrewarm('/items/first', 12);
-    const second = c.mooncakeEnsureEnhancementRoutePrewarm('/items/second', 12);
-    assert.equal(h.posts.length, 1, 'same-profile concurrent surfaces share the worker request');
-    assert.equal(h.posts[0].jobs.length, 134, 'only the 134 distinct +1..12 jobs are sent');
-    const higher = c.mooncakeEnsureEnhancementRoutePrewarm('/items/third', 14);
-    assert.equal(h.posts.length, 2);
-    assert.equal(h.posts[1].jobs.length, 50, 'overlapping prewarm submits only the missing +13/+14 jobs');
-    const allJobs = h.posts.flatMap(post => post.jobs);
-    assert.equal(new Set(allJobs.map(job => job.key)).size, allJobs.length);
-    h.deliver(1);
-    await Promise.resolve();
-    assert.equal(higher.ready, false, 'a partial reply cannot expose an unfinished shared batch');
-    h.deliver(0);
-    assert.deepEqual(await Promise.all([first.promise, second.promise, higher.promise]), [true, true, true]);
-    assert.equal(c.enhancelateWorkerInFlight.size, 0);
-    assert.equal(h.timers.size, 0);
-    const key = c.buildEnhancelateCacheKey('', 12, 7, 90, 1874, c.player);
-    const result = c.enhancelateCache.get(key);
-    close(result.actions, 6301.174414285177, 'ultra tea attempts stay unchanged');
-    close(result.protectCount, 59.48103203935401, 'ultra tea protections stay unchanged');
-    const seconds = c.calcEnhancingSecondsPerAction('/items/first');
-    const profit = 1960e6 * .96 - 380010723 - result.actions * 108803 - result.protectCount * 9e6;
-    close(profit / (result.actions * seconds / 3600), 35584880.47099592, 'the screenshot hourly result stays unchanged');
-    assert(c.mooncakeExactEnhancelateCache.get(`exact:${key}`).actions > result.actions,
-        'exact-target and overshoot-allowed results remain distinct');
-    await c.prewarmEnhancelateLevels('/items/first', [12], { includeExact: true });
-    assert.equal(h.posts.length, 2, 'completed cached results require no more worker work');
-}
-{
-    const h = workerHarness(), c = h.ctx;
-    const ordinary = c.prewarmEnhancelateLevels('/items/a', [12]);
-    const exact = c.prewarmEnhancelateLevels('/items/a', [12], { includeExact: true });
-    assert.equal(h.posts[0].jobs.length, 11);
-    assert.equal(h.posts[1].jobs.length, 11);
-    assert(h.posts[1].jobs.every(job => job.exact), 'adding exact targets does not repeat ordinary jobs');
-    c.player = { ...params, tea_ultra_enhancing: false, tea_super_enhancing: true };
-    const superTea = c.prewarmEnhancelateLevels('/items/a', [12]);
-    const differentItemLevel = c.prewarmEnhancelateLevels('/items/85', [12]);
-    assert.equal(h.posts.length, 4, 'different tea and item levels never share probability results');
-    h.deliver(3); h.deliver(2); h.deliver(1); h.deliver(0);
-    assert((await Promise.all([ordinary, exact, superTea, differentItemLevel])).every(Boolean));
-    const key = c.buildEnhancelateCacheKey('', 12, 7, 90, 1874, c.player);
-    close(c.enhancelateCache.get(key).actions, 6381.187242935053, 'super tea attempts stay unchanged');
-    close(c.enhancelateCache.get(key).protectCount, 59.78802863068613, 'super tea protections stay unchanged');
-}
-for (const failure of ['timeout', 'reply-error', 'worker-error', 'post-error']) {
-    const h = workerHarness(), c = h.ctx;
-    c.getEnhancelateWorker();
-    if (failure === 'post-error') h.worker.failPost = true;
-    const first = c.prewarmEnhancelateLevels('/items/a', [12]);
-    const second = c.prewarmEnhancelateLevels('/items/b', [12]);
-    if (failure === 'timeout') [...h.timers.values()].forEach(fn => fn());
-    if (failure === 'reply-error') h.deliver(0, true);
-    if (failure === 'worker-error') h.worker.onerror();
-    assert.deepEqual(await Promise.all([first, second]), [false, false], `${failure} releases every waiting caller`);
-    assert.equal(c.enhancelateWorkerInFlight.size, 0);
-    assert.equal(c.enhancelateWorkerPending.size, 0);
-    assert.equal(h.timers.size, 0);
-    if (failure === 'timeout') {
-        const retry = c.prewarmEnhancelateLevels('/items/a', [12]);
-        h.deliver(0);
-        assert.equal(c.enhancelateCache.size, 0, 'a timed-out reply cannot satisfy a replacement request');
-        h.deliver(1);
-        assert.equal(await retry, true);
-    }
-}
+await import('./test-probability-task-queue.mjs');
 
 // Real predicates: shared classification retains each feature's internal-node exclusions.
 {
@@ -215,7 +100,7 @@ function visibilityHarness() {
     Object.assign(c, {
         mooncakeChatBackfillTimers: new WeakMap(), mooncakeChatBackfillCursor: new WeakMap(),
         mooncakeChatQueue: [], mooncakeChatQueueTimer: 0, mooncakeChatComputeQueue: [], mooncakeChatComputeTimer: 0,
-        mooncakeChatSeqPending: [], mooncakeChatSeqBusy: false,
+        mooncakeChatSeqPending: [], mooncakeChatSeqBusy: false, mooncakeChatComputeGeneration: 0,
         MOONCAKE_CHAT_HISTORY_SELECTOR: '.history', MOONCAKE_CHAT_MESSAGE_SELECTOR: '.message',
         MOONCAKE_CHAT_BUBBLE_ATTR: 'bubble', MOONCAKE_CHAT_INJECTED_ATTR: 'injected',
         MOONCAKE_CHAT_COMPUTE_GAP_MS: 60, MOONCAKE_CHAT_BACKFILL_INTERVAL_MS: 3000,

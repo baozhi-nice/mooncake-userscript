@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import vm from 'node:vm';
+import { marketPricingTestPrelude, marketPricingTestFunctions, settlePricingBrowserFrames } from './lib/market-pricing-test-support.mjs';
 
 const source = await readFile(new URL('../src/mooncake.js', import.meta.url), 'utf8');
 const baseline = process.argv.find(arg => arg.startsWith('--baseline='))?.slice(11);
@@ -74,6 +75,8 @@ if (process.argv.includes('--serve')) {
     ${ids.map(name => `const ${name}=${JSON.stringify(name)};`).join('\n')}
     const isZH=true,MOONCAKE_MOOKET_OVERLAY_ID='mooket_safe_overlay',MOONCAKE_ENHANCEMENT_TAB_BUTTON_ATTR='tab-button',MOONCAKE_ENHANCEMENT_TAB_PANEL_ATTR='tab-panel';
     ${constants}
+    ${marketPricingTestPrelude()}
+    ${marketPricingTestFunctions(extract)}
     const MOONCAKE_LISTING_TIME_NODE_SELECTOR='.mooncake-listing-age-cell, .mooncake-market-inline-listing-age';
     const documentMutationSubscribers=new Map();let documentMutationObserver=null;
     const mooncakeVisibleRefreshes=new Map();let mooncakeVisibleRefreshListenerStarted=false;
@@ -95,7 +98,7 @@ if (process.argv.includes('--serve')) {
     const fixedNow=Date.now();
     function mooncakeGetMyListingsLiveOrderBook(itemHrid,level){bookCalls++;lastTarget={itemHrid,level};if(!dataAvailable)return null;const hours=itemHrid==='/items/milk'?2:1;const listing={listingId:'123',createdTimestamp:fixedNow-hours*3600000};return {asks:[listing],bids:[listing]};}
     ${names.map(name => extract(name)).filter(Boolean).join('\n')}
-    const stage=document.getElementById('stage'),result=document.getElementById('result'),wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+    const stage=document.getElementById('stage'),result=document.getElementById('result'),wait=${settlePricingBrowserFrames.toString()};
     const headers=root=>root.querySelectorAll('.mooncake-listing-age-header'),cells=root=>root.querySelectorAll('.mooncake-listing-age-cell');
     function preview(item='kraken_fang',level=0){const node=document.createElement('div');node.className='MarketplacePanel_currentItem__fixture';node.innerHTML='<svg><use href="#'+item+'"></use></svg><span class="Item_enhancementLevel__fixture">+'+level+'</span>';return node;}
     function panel({item='kraken_fang',level=0,withPreview=true,hidden=false,empty=false}={}){const root=document.createElement('div');root.className='MarketplacePanel_marketplacePanel__fixture';if(hidden)root.style.display='none';if(withPreview)root.append(preview(item,level));const books=document.createElement('div');books.className='MarketplacePanel_orderBooksContainer__fixture';books.innerHTML=['出售','收购'].map(side=>'<table><thead><tr><th>数量</th><th>'+side+'价</th><th>操作</th></tr></thead><tbody>'+(empty?'':'<tr><td>5</td><td class="MarketplacePanel_price__fixture">8040K</td><td><button>查看</button></td></tr>')+'</tbody></table>').join('');root.append(books);return root;}
@@ -114,6 +117,7 @@ if (process.argv.includes('--serve')) {
       await check('表头和行被原生页面替换后恢复',async()=>{const root=panel();stage.append(root);await wait(150);const replacement=panel();[...root.querySelectorAll('table')].forEach((table,i)=>table.replaceChildren(...replacement.querySelectorAll('table')[i].childNodes));await wait(180);complete(root);const count=bookCalls;await wait(200);expect(bookCalls===count,'出现观察器刷新循环')});
       await check('空表先加载，再补入订单行',async()=>{const root=panel({empty:true});stage.append(root);await wait(150);expect(headers(root).length===2,'空表没有保留表头');const replacement=panel();[...root.querySelectorAll('tbody')].forEach((body,i)=>body.replaceChildren(...replacement.querySelectorAll('tbody')[i].childNodes));await wait(180);complete(root)});
       await check('缺少挂单时间数据也不会删除整列',async()=>{dataAvailable=false;const root=panel();stage.append(root);await wait(150);complete(root,true);dataAvailable=true;scheduleMarketplaceOrderBookHourlyWageRefresh();await wait(150);complete(root)});
+      if(typeof mooncakeGetMarketPricingDependency==='function')await check('局部价格刷新不阻断订单时长恢复',async()=>{const root=panel();stage.append(root);await wait(150);complete(root);mooncakeGetMarketPricingDependency('/items/kraken_fang').complete=true;dataAvailable=false;scheduleMarketplaceOrderBookHourlyWageRefresh({affectedItems:new Set(['/items/unrelated'])});await wait(150);complete(root,true);dataAvailable=true;scheduleMarketplaceOrderBookHourlyWageRefresh({affectedItems:new Set(['/items/unrelated'])});await wait(150);complete(root)});
       await check('窄屏内嵌时长和桌面列互相切换',async()=>{compact=true;const root=panel();stage.append(root);await wait(150);expect(!headers(root).length&&root.querySelectorAll('.mooncake-market-inline-listing-age').length===2,'窄屏时长缺失');compact=false;scheduleMarketplaceOrderBookHourlyWageRefresh({force:true});await wait(150);complete(root);expect(!root.querySelector('.mooncake-market-inline-listing-age'),'窄屏残留')});
       await check('关闭功能和 Ranged 接管时不生成重复列',async()=>{const root=panel();stage.append(root);await wait(150);enabled=false;scheduleMarketplaceOrderBookHourlyWageRefresh();await wait(100);expect(!headers(root).length,'关闭未清理');enabled=true;window._rwivb={configs:{listingClass:{orderBooksInfo:{value:true},estimateListingCreateTimeByLifespan:{value:true}}}};scheduleMarketplaceOrderBookHourlyWageRefresh();await wait(100);expect(!headers(root).length,'重复接管时长');delete window._rwivb;scheduleMarketplaceOrderBookHourlyWageRefresh();await wait(120);complete(root)});
       await check('预览长时间缺失不无限轮询，后来仍可恢复',async()=>{const root=panel({withPreview:false});stage.append(root);await wait(2400);complete(root,true);const count=wageCalls.length;await wait(250);expect(wageCalls.length===count,'没有停止轮询');root.prepend(preview());await wait(160);complete(root)});
